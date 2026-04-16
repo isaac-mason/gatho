@@ -33,10 +33,12 @@ describe('join data', () => {
         const { waitForMessages, conn } = connectAndCollect(reservation.url);
 
         const msgs = await waitForMessages(1);
-        expect(msgs[0]).toEqual({
-            type: 'join-data',
-            data: { role: 'admin', level: 42 },
-        });
+        expect(msgs[0]).toBe(
+            JSON.stringify({
+                type: 'join-data',
+                data: { role: 'admin', level: 42 },
+            }),
+        );
 
         conn.close();
     });
@@ -62,10 +64,12 @@ describe('join data', () => {
         const { waitForMessages, conn } = connectAndCollect(reservation.url);
 
         const msgs = await waitForMessages(1);
-        expect(msgs[0]).toEqual({
-            type: 'join-data',
-            data: {},
-        });
+        expect(msgs[0]).toBe(
+            JSON.stringify({
+                type: 'join-data',
+                data: {},
+            }),
+        );
 
         conn.close();
     });
@@ -97,10 +101,12 @@ describe('join data', () => {
         const { waitForMessages, conn } = connectAndCollect(reservation.url);
 
         const msgs = await waitForMessages(1);
-        expect(msgs[0]).toEqual({
-            type: 'join-data',
-            data: nestedData,
-        });
+        expect(msgs[0]).toBe(
+            JSON.stringify({
+                type: 'join-data',
+                data: nestedData,
+            }),
+        );
 
         conn.close();
     });

@@ -249,9 +249,9 @@ test('server reliable buffer: messages sent during drop are delivered on reconne
         }).toPass({ timeout: 5000 });
 
         // send reliable messages while client is disconnected
-        room.send(joinedClient!, { buffered: 1 });
-        room.send(joinedClient!, { buffered: 2 });
-        room.send(joinedClient!, { buffered: 3 });
+        room.send(joinedClient!, JSON.stringify({ buffered: 1 }));
+        room.send(joinedClient!, JSON.stringify({ buffered: 2 }));
+        room.send(joinedClient!, JSON.stringify({ buffered: 3 }));
 
         // wait for client to reconnect and receive buffered messages
         await expect(async () => {
@@ -261,8 +261,12 @@ test('server reliable buffer: messages sent during drop are delivered on reconne
 
         const messages = await page.evaluate(() => (window as W).__messages);
         // the buffered messages should be in order
-        const buffered = messages.filter((m: Record<string, unknown>) => 'buffered' in m);
-        expect(buffered).toEqual([{ buffered: 1 }, { buffered: 2 }, { buffered: 3 }]);
+        const buffered = messages.filter((m: unknown) => typeof m === 'string' && m.includes('buffered'));
+        expect(buffered).toEqual([
+            JSON.stringify({ buffered: 1 }),
+            JSON.stringify({ buffered: 2 }),
+            JSON.stringify({ buffered: 3 }),
+        ]);
 
         await page.evaluate(() => (window as W).__conn.close());
     } finally {
@@ -315,8 +319,8 @@ test('client reliable buffer: messages sent during reconnecting are flushed on r
         // send reliable messages from client while disconnected
         await page.evaluate(() => {
             const conn = (window as W).__conn;
-            conn.send({ fromClient: 1 });
-            conn.send({ fromClient: 2 });
+            conn.send(JSON.stringify({ fromClient: 1 }));
+            conn.send(JSON.stringify({ fromClient: 2 }));
         });
 
         // unblock and let reconnection happen
@@ -333,8 +337,8 @@ test('client reliable buffer: messages sent during reconnecting are flushed on r
             expect(serverReceived.length).toBeGreaterThanOrEqual(2);
         }).toPass({ timeout: 5000 });
 
-        const fromClient = serverReceived.filter((m) => typeof m === 'object' && m !== null && 'fromClient' in m);
-        expect(fromClient).toEqual([{ fromClient: 1 }, { fromClient: 2 }]);
+        const fromClient = serverReceived.filter((m) => typeof m === 'string' && m.includes('fromClient'));
+        expect(fromClient).toEqual([JSON.stringify({ fromClient: 1 }), JSON.stringify({ fromClient: 2 })]);
 
         await page.evaluate(() => (window as W).__conn.close());
     } finally {
@@ -387,10 +391,10 @@ test('unreliable messages from client are dropped during reconnecting', async ({
         // send unreliable messages — should be silently dropped
         await page.evaluate(() => {
             const conn = (window as W).__conn;
-            conn.send({ unreliable: 1 }, { reliable: false });
-            conn.send({ unreliable: 2 }, { reliable: false });
+            conn.send(JSON.stringify({ unreliable: 1 }), { reliable: false });
+            conn.send(JSON.stringify({ unreliable: 2 }), { reliable: false });
             // also send one reliable for comparison
-            conn.send({ reliable: 1 });
+            conn.send(JSON.stringify({ reliable: 1 }));
         });
 
         // unblock and let reconnection happen
@@ -406,10 +410,10 @@ test('unreliable messages from client are dropped during reconnecting', async ({
         await new Promise((r) => setTimeout(r, 1000));
 
         // only the reliable message should have been received
-        const unreliable = serverReceived.filter((m) => typeof m === 'object' && m !== null && 'unreliable' in m);
-        const reliable = serverReceived.filter((m) => typeof m === 'object' && m !== null && 'reliable' in m);
+        const unreliable = serverReceived.filter((m) => typeof m === 'string' && m.includes('unreliable'));
+        const reliable = serverReceived.filter((m) => typeof m === 'string' && m.includes('"reliable"'));
         expect(unreliable).toEqual([]);
-        expect(reliable).toEqual([{ reliable: 1 }]);
+        expect(reliable).toEqual([JSON.stringify({ reliable: 1 })]);
 
         await page.evaluate(() => (window as W).__conn.close());
     } finally {
@@ -468,7 +472,7 @@ test('session token rotates after reconnect — old token rejected', async ({ pa
         // do a round-trip to prove the connection is live
         await page.evaluate(() => {
             const conn = (window as W).__conn;
-            conn.send({ ping: true });
+            conn.send(JSON.stringify({ ping: true }));
         });
 
         await page.evaluate(() => (window as W).__conn.close());
@@ -600,8 +604,8 @@ test('server buffer overflow evicts client when maxBufferBytes exceeded', async 
         // server uses Buffer.byteLength (utf8), so ASCII chars are 1 byte each.
         // JSON.stringify({ data: "x"*600 }) ≈ 614 bytes, two sends ≈ 1228 > 1024.
         const bigMsg = { data: 'x'.repeat(600) };
-        room.send(joinedClient!, bigMsg);
-        room.send(joinedClient!, bigMsg);
+        room.send(joinedClient!, JSON.stringify(bigMsg));
+        room.send(joinedClient!, JSON.stringify(bigMsg));
 
         // buffer overflow should have evicted the client
         await expect(async () => {
@@ -661,19 +665,19 @@ test('broadcast reliable buffers for disconnected clients, delivered on reconnec
         }).toPass({ timeout: 5000 });
 
         // broadcast reliable messages while client is disconnected
-        room.broadcast({ broadcast: 1 });
-        room.broadcast({ broadcast: 2 });
+        room.broadcast(JSON.stringify({ broadcast: 1 }));
+        room.broadcast(JSON.stringify({ broadcast: 2 }));
 
         // wait for reconnect and message delivery
         await expect(async () => {
             const msgs = await page.evaluate(() => (window as W).__messages);
-            const broadcasts = msgs.filter((m: Record<string, unknown>) => 'broadcast' in m);
+            const broadcasts = msgs.filter((m: unknown) => typeof m === 'string' && m.includes('broadcast'));
             expect(broadcasts.length).toBeGreaterThanOrEqual(2);
         }).toPass({ timeout: 15_000 });
 
         const messages = await page.evaluate(() => (window as W).__messages);
-        const broadcasts = messages.filter((m: Record<string, unknown>) => 'broadcast' in m);
-        expect(broadcasts).toEqual([{ broadcast: 1 }, { broadcast: 2 }]);
+        const broadcasts = messages.filter((m: unknown) => typeof m === 'string' && m.includes('broadcast'));
+        expect(broadcasts).toEqual([JSON.stringify({ broadcast: 1 }), JSON.stringify({ broadcast: 2 })]);
 
         await page.evaluate(() => (window as W).__conn.close());
     } finally {

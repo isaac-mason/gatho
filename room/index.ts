@@ -77,8 +77,8 @@ export type Room<ClientData = Record<string, unknown>> = {
     readonly serverId: string | undefined;
 
     // messaging
-    send(client: Client<ClientData>, message: unknown, options?: SendOptions): void;
-    broadcast(message: unknown, options?: SendOptions): void;
+    send(client: Client<ClientData>, message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
+    broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
 
     // clients
     readonly clients: ClientCollection<ClientData>;

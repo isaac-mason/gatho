@@ -7,6 +7,16 @@ import { connectToSocket } from './ipc';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
 import { wsTransport } from './transport/ws';
+import { unpackFrame, packProtocol, packUserText, packUserBinary } from '../common/protocol';
+
+// frame a user message for the wire. strings become [0x01, ...utf8],
+// binary becomes [0x02, ...raw bytes]. ArrayBufferView is normalized to Uint8Array.
+function frameUserMessage(msg: string | ArrayBuffer | ArrayBufferView): Uint8Array {
+    if (typeof msg === 'string') return packUserText(msg);
+    if (msg instanceof ArrayBuffer) return packUserBinary(msg);
+    // ArrayBufferView (Uint8Array, Float32Array, etc.)
+    return packUserBinary(new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength));
+}
 
 const HEARTBEAT_INTERVAL_MS = 3000;
 
@@ -34,9 +44,8 @@ type TrackedClient = {
 };
 
 type BufferedMessage = {
-    payload: string | ArrayBuffer | Uint8Array;
+    payload: Uint8Array;
     byteSize: number;
-    isBinary: boolean;
 };
 
 type RoomState = {
@@ -97,10 +106,8 @@ export type ServerConfig = {
  *  - `ClientData` — the data shape returned by `onAuth` via `auth.ok(data)`.
  *    inferred from the return type of `onAuth`.
  *  - `JoinData` — the data shape passed to `onAuth`. matches the `data` bag
- *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in.
- *  - `InMessage` — the expected shape of incoming websocket messages. annotate
- *    the `onMessage` message parameter to opt in. */
-export type StartOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>, InMessage = unknown> = {
+ *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in. */
+export type StartOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
     /** server-managed config. when provided, fields override `GATHO_*` env vars.
      *  when omitted, env vars are still checked — if `GATHO_SOCKET` is set
      *  in the environment, the room connects ipc automatically.
@@ -139,14 +146,11 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
     onJoin?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
 
     /** fires when a connected client sends a websocket message.
-     *  annotate the message parameter to get type inference:
-     *  ```ts
-     *  onMessage: (room, client, message: { text: string }) => { ... }
-     *  ``` */
+     *  text frames arrive as `string`, binary frames as `ArrayBuffer`. */
     onMessage?: (
         room: Room<NoInfer<ClientData>>,
         client: Client<NoInfer<ClientData>>,
-        message: InMessage,
+        message: string | ArrayBuffer,
     ) => void | Promise<void>;
 
     /** fires when a client permanently leaves the room (consented close,
@@ -239,14 +243,6 @@ function evictClient<ClientData>(
     state.ipc?.send({ type: 'client-disconnected', clientId: tracked.id });
 }
 
-// compute byte size of a serialized payload
-function payloadByteSize(payload: string | ArrayBuffer | Uint8Array): number {
-    if (typeof payload === 'string') {
-        return Buffer.byteLength(payload, 'utf8');
-    }
-    return payload.byteLength;
-}
-
 function createRoom<ClientData>(
     state: RoomState,
     maxBufferBytes: number,
@@ -259,9 +255,9 @@ function createRoom<ClientData>(
 
     // buffer a reliable message for a disconnected client.
     // if byte cap exceeded, evict the client.
-    function bufferForClient(tracked: TrackedClient, payload: string | ArrayBuffer | Uint8Array, isBinary: boolean): void {
-        const byteSize = payloadByteSize(payload);
-        tracked.reliableBuffer.push({ payload, byteSize, isBinary });
+    function bufferForClient(tracked: TrackedClient, payload: Uint8Array): void {
+        const byteSize = payload.byteLength;
+        tracked.reliableBuffer.push({ payload, byteSize });
         tracked.reliableBufferBytes += byteSize;
         if (tracked.reliableBufferBytes > maxBufferBytes) {
             evictClient(state, tracked, room, callbacks.onLeave);
@@ -278,40 +274,33 @@ function createRoom<ClientData>(
         get serverId() {
             return state.serverId;
         },
-        send(client: Client<ClientData>, message: unknown, options?: SendOptions) {
+        send(client: Client<ClientData>, message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions) {
             if (!state.alive) return;
             const tracked = state.clients.get(client.id);
             if (!tracked) return;
 
+            const framed = frameUserMessage(message);
             const reliable = options?.reliable !== false;
-            const isBinary = message instanceof Uint8Array || message instanceof ArrayBuffer;
-            const payload = isBinary ? message : JSON.stringify(message);
 
             if (tracked.socket) {
-                // connected — send immediately
-                tracked.socket.send(payload, isBinary);
+                tracked.socket.send(framed, true);
             } else if (reliable) {
-                // disconnected, reliable — buffer
-                bufferForClient(tracked, payload, isBinary);
+                bufferForClient(tracked, framed);
             }
-            // disconnected, unreliable — silently drop
         },
-        broadcast(message: unknown, options?: SendOptions) {
+        broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions) {
             if (!state.alive) return;
             if (!state.server) return;
 
+            const framed = frameUserMessage(message);
             const reliable = options?.reliable !== false;
-            const isBinary = message instanceof Uint8Array || message instanceof ArrayBuffer;
-            const payload = isBinary ? message : JSON.stringify(message);
 
-            // send to connected clients via pub/sub
-            state.server.publish(BROADCAST_TOPIC, payload, isBinary);
+            state.server.publish(BROADCAST_TOPIC, framed, true);
 
-            // if reliable, also buffer for disconnected clients
             if (reliable) {
                 for (const tracked of state.clients.values()) {
                     if (!tracked.socket) {
-                        bufferForClient(tracked, payload, isBinary);
+                        bufferForClient(tracked, framed);
                     }
                 }
             }
@@ -384,7 +373,7 @@ function startHeartbeat(state: RoomState): void {
 
 // --- ws server ---
 
-function startRoom<ClientData, JoinData extends Record<string, unknown>, InMessage>(
+function startRoom<ClientData, JoinData extends Record<string, unknown>>(
     state: RoomState,
     transport: Transport,
     options: {
@@ -392,7 +381,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>, InMessa
         maxBufferBytes: number;
         onAuth?: (joinData: JoinData, room: Room<unknown>) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
         onJoin?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
-        onMessage?: (room: Room<ClientData>, client: Client<ClientData>, message: InMessage) => void | Promise<void>;
+        onMessage?: (room: Room<ClientData>, client: Client<ClientData>, message: string | ArrayBuffer) => void | Promise<void>;
         onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
         onDrop?: (room: Room<ClientData>, client: Client<ClientData>, code: number) => void | Promise<void>;
         onReconnect?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
@@ -459,17 +448,19 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>, InMessa
             (async () => {
                 let result: AuthResult<ClientData>;
                 try {
-                    result = await Promise.resolve(options.onAuth ? options.onAuth(joinData as JoinData, room) : { ok: true, data: {} as ClientData });
+                    result = await Promise.resolve(
+                        options.onAuth ? options.onAuth(joinData as JoinData, room) : { ok: true, data: {} as ClientData },
+                    );
                 } catch (err) {
                     // onAuth threw — bug in user code
                     state.log.error('onAuth threw unexpectedly', { clientId, err });
-                    socket.send(JSON.stringify({ type: '__auth_error', error: 'internal error' }), false);
+                    socket.send(packProtocol({ type: 'auth_error', error: 'internal error' }), true);
                     socket.close(1011, 'internal error');
                     return;
                 }
 
                 if (!result.ok) {
-                    socket.send(JSON.stringify({ type: '__auth_error', error: result.error }), false);
+                    socket.send(packProtocol({ type: 'auth_error', error: String(result.error) }), true);
                     socket.close(4000, 'auth rejected');
                     return;
                 }
@@ -491,7 +482,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>, InMessa
                 state.clients.set(clientId, tracked);
 
                 // send session token to client
-                socket.send(JSON.stringify({ type: '__session', token: sessionToken }), false);
+                socket.send(packProtocol({ type: 'session', token: sessionToken }), true);
 
                 // notify server for driver bookkeeping (managed mode only)
                 state.ipc?.send({ type: 'client-connected', clientId });
@@ -505,38 +496,29 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>, InMessa
             });
         },
 
-        message(clientId: string, data: ArrayBuffer, isBinary: boolean) {
+        message(clientId: string, data: ArrayBuffer, _isBinary: boolean) {
             const tracked = state.clients.get(clientId);
             if (!tracked?.socket) return;
 
-            if (!isBinary) {
-                const text = new TextDecoder().decode(data);
-                const parsed: unknown = JSON.parse(text);
+            const frame = unpackFrame(data);
 
-                // intercept __leave protocol message — client wants a consented close
-                if (
-                    typeof parsed === 'object' &&
-                    parsed !== null &&
-                    'type' in parsed &&
-                    (parsed as Record<string, unknown>).type === '__leave'
-                ) {
+            if (frame.frame === 'protocol') {
+                if (frame.message.type === 'leave') {
                     tracked.socket.close(4000, 'consented leave');
-                    return;
-                }
-
-                if (options.onMessage) {
-                    safeCall(state.log, 'onMessage', () =>
-                        options.onMessage!(room, createClient<ClientData>(tracked), parsed as InMessage),
-                    );
                 }
                 return;
             }
 
             if (options.onMessage) {
-                const parsed = new Uint8Array(data);
-                safeCall(state.log, 'onMessage', () =>
-                    options.onMessage!(room, createClient<ClientData>(tracked), parsed as InMessage),
-                );
+                if (frame.frame === 'user_text') {
+                    safeCall(state.log, 'onMessage', () =>
+                        options.onMessage!(room, createClient<ClientData>(tracked), frame.text),
+                    );
+                } else {
+                    safeCall(state.log, 'onMessage', () =>
+                        options.onMessage!(room, createClient<ClientData>(tracked), frame.data),
+                    );
+                }
             }
         },
 
@@ -544,7 +526,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>, InMessa
             const tracked = state.clients.get(clientId);
             if (!tracked || tracked.socket !== null) {
                 // not a valid reconnection target — close
-                socket.send(JSON.stringify({ type: '__auth_error', error: 'invalid session' }), false);
+                socket.send(packProtocol({ type: 'auth_error', error: 'invalid session' }), true);
                 socket.close(4000, 'invalid session');
                 return;
             }
@@ -569,13 +551,13 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>, InMessa
 
             // flush reliable buffer to client (FIFO)
             for (const buffered of tracked.reliableBuffer) {
-                socket.send(buffered.payload, buffered.isBinary);
+                socket.send(buffered.payload, true);
             }
             tracked.reliableBuffer.length = 0;
             tracked.reliableBufferBytes = 0;
 
             // send new session token — this is the "reconnection handshake complete" signal
-            socket.send(JSON.stringify({ type: '__session', token: newToken }), false);
+            socket.send(packProtocol({ type: 'session', token: newToken }), true);
 
             // fire onReconnect
             if (options.onReconnect) {
@@ -694,8 +676,8 @@ async function stopRoom<ClientData>(
     state.ipc?.close();
 }
 
-export async function start<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>, InMessage = unknown>(
-    options: StartOptions<ClientData, JoinData, InMessage>,
+export async function start<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(
+    options: StartOptions<ClientData, JoinData>,
 ): Promise<Room<ClientData>> {
     // resolve config: server object > env vars > standalone defaults
     const server = options.server;
@@ -740,7 +722,7 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
 
     const transport = options.transport ?? wsTransport();
 
-    const { port, room } = await startRoom<ClientData, JoinData, InMessage>(state, transport, {
+    const { port, room } = await startRoom<ClientData, JoinData>(state, transport, {
         port: options.port,
         maxBufferBytes: options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES,
         onAuth: options.onAuth,

@@ -64,9 +64,9 @@ describe('client reconciliation via heartbeat', () => {
         await sleep(200);
 
         // verify the message round-trip works (ws is fine, only driver state drifted)
-        conn.send({ hello: 'world' });
+        conn.send(JSON.stringify({ hello: 'world' }));
         const msgs = await waitForMessages(1);
-        expect(msgs[0]).toEqual({ hello: 'world' });
+        expect(msgs[0]).toBe(JSON.stringify({ hello: 'world' }));
 
         // the client should still be 'reserved' in the driver because connectClient failed
         const roomInfoBefore = await driver._internal.getRoomInfo(room.roomId);
@@ -126,9 +126,9 @@ describe('client reconciliation via heartbeat', () => {
         await sleep(200);
 
         // verify connected
-        conn.send({ ping: true });
+        conn.send(JSON.stringify({ ping: true }));
         const msgs = await waitForMessages(1);
-        expect(msgs[0]).toEqual({ ping: true });
+        expect(msgs[0]).toBe(JSON.stringify({ ping: true }));
 
         // verify client is 'connected' in driver
         await waitUntil(async () => {
@@ -226,7 +226,7 @@ describe('client reconciliation via heartbeat', () => {
         await sleep(200);
 
         // verify connected
-        conn.send({ test: true });
+        conn.send(JSON.stringify({ test: true }));
         await waitForMessages(1);
 
         // wait for the client to be 'connected' in the driver

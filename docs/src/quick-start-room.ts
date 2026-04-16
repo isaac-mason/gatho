@@ -7,12 +7,14 @@ await start({
     onAuth: () => auth.ok(),
 
     onJoin: (room, client) => {
-        room.send(client, { type: 'count', count });
+        room.send(client, JSON.stringify({ type: 'count', count }));
     },
 
-    onMessage: (room, _client, message: { type: 'increment' | 'decrement' }) => {
-        if (message.type === 'increment') count++;
-        if (message.type === 'decrement') count--;
-        room.broadcast({ type: 'count', count });
+    onMessage: (room, _client, message) => {
+        if (typeof message !== 'string') return;
+        const parsed = JSON.parse(message) as { type: 'increment' | 'decrement' };
+        if (parsed.type === 'increment') count++;
+        if (parsed.type === 'decrement') count--;
+        room.broadcast(JSON.stringify({ type: 'count', count }));
     },
 });

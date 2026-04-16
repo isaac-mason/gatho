@@ -271,11 +271,11 @@ describe('reconnection lifecycle', () => {
                 r.allowReconnection(client, 5000);
 
                 // send unreliable messages while client is disconnected
-                r.send(client, { unreliable: 1 }, { reliable: false });
-                r.send(client, { unreliable: 2 }, { reliable: false });
+                r.send(client, JSON.stringify({ unreliable: 1 }), { reliable: false });
+                r.send(client, JSON.stringify({ unreliable: 2 }), { reliable: false });
 
                 // also send a reliable message for comparison
-                r.send(client, { reliable: 1 });
+                r.send(client, JSON.stringify({ reliable: 1 }));
             },
         });
 
@@ -303,7 +303,7 @@ describe('reconnection lifecycle', () => {
         await waitUntil(() => conn.state === 'open');
 
         // broadcast unreliable when all are connected — should work fine
-        room!.broadcast({ hello: 'world' }, { reliable: false });
+        room!.broadcast(JSON.stringify({ hello: 'world' }), { reliable: false });
         await sleep(100);
 
         conn.close();
@@ -375,11 +375,11 @@ describe('reconnection lifecycle', () => {
         await waitUntil(() => conn.state === 'reconnecting');
 
         // reliable send (default) should buffer, not throw
-        conn.send({ buffered: 1 });
-        conn.send({ buffered: 2 });
+        conn.send(JSON.stringify({ buffered: 1 }));
+        conn.send(JSON.stringify({ buffered: 2 }));
 
         // unreliable send should silently drop, not throw
-        conn.send({ dropped: 1 }, { reliable: false });
+        conn.send(JSON.stringify({ dropped: 1 }), { reliable: false });
 
         // client should still be in reconnecting state
         expect(conn.state).toBe('reconnecting');
@@ -411,7 +411,7 @@ describe('reconnection lifecycle', () => {
         // a 100kb string repeated ~6 times should exceed 1mb.
         const bigPayload = 'x'.repeat(100_000);
         for (let i = 0; i < 7; i++) {
-            conn.send({ data: bigPayload });
+            conn.send(JSON.stringify({ data: bigPayload }));
             if (conn.state === 'closed') break;
         }
 

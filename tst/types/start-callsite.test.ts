@@ -1,17 +1,16 @@
 // type-level tests for start() generic inference.
-// verifies that ClientData, JoinData, and InMessage are all correctly
-// inferred from callback annotations without explicit generics.
+// verifies that ClientData and JoinData are correctly inferred from callback annotations.
 import { describe, expectTypeOf, test } from 'vitest';
 import { auth, type StartOptions } from '../../room';
 
 // real function with the same generic signature as start().
 // avoids spinning up an actual server — we only care about types.
-function mockStart<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>, InMessage = unknown>(
-    _options: StartOptions<ClientData, JoinData, InMessage>,
+function mockStart<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(
+    _options: StartOptions<ClientData, JoinData>,
 ): void {}
 
 describe('start() generic inference', () => {
-    test('all three inferred: ClientData from auth.ok, JoinData and InMessage from annotations', () => {
+    test('ClientData from auth.ok, JoinData from annotation', () => {
         mockStart({
             onAuth: (joinData: { displayName?: string }) => {
                 return auth.ok({ username: joinData.displayName || 'anon' });
@@ -21,9 +20,9 @@ describe('start() generic inference', () => {
                 expectTypeOf(client.data).toEqualTypeOf<{ username: string }>();
             },
 
-            onMessage: (_room, client, message: { text: string }) => {
+            onMessage: (_room, client, message) => {
                 expectTypeOf(client.data).toEqualTypeOf<{ username: string }>();
-                expectTypeOf(message.text).toBeString();
+                expectTypeOf(message).toEqualTypeOf<string | ArrayBuffer>();
             },
 
             onLeave: (_room, client) => {
@@ -32,19 +31,19 @@ describe('start() generic inference', () => {
         });
     });
 
-    test('no annotations — defaults: joinData is Record<string, unknown>, message is unknown', () => {
+    test('no annotations — defaults: joinData is Record<string, unknown>, message is string | ArrayBuffer', () => {
         mockStart({
             onAuth: () => auth.ok({ level: 5 }),
             onJoin: (_room, client) => {
                 expectTypeOf(client.data).toEqualTypeOf<{ level: number }>();
             },
             onMessage: (_room, _client, message) => {
-                expectTypeOf(message).toBeUnknown();
+                expectTypeOf(message).toEqualTypeOf<string | ArrayBuffer>();
             },
         });
     });
 
-    test('only joinData annotated, no InMessage', () => {
+    test('only joinData annotated', () => {
         mockStart({
             onAuth: (joinData: { token: string }) => {
                 return auth.ok({ verified: true, token: joinData.token });

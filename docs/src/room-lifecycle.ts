@@ -9,12 +9,13 @@ await start({
 
     // client is authenticated and in the room
     onJoin: (room, client) => {
-        room.broadcast({ type: 'joined', id: client.id });
+        room.broadcast(JSON.stringify({ type: 'joined', id: client.id }));
     },
 
     // client sent a message
-    onMessage: (room, client, message: { type: string }) => {
-        room.broadcast({ type: 'echo', from: client.id, message });
+    onMessage: (room, client, message) => {
+        if (typeof message !== 'string') return;
+        room.broadcast(JSON.stringify({ type: 'echo', from: client.id, message }));
     },
 
     // non-consented disconnect — call allowReconnection to hold the seat
@@ -24,12 +25,12 @@ await start({
 
     // client reconnected within the window — buffered messages already flushed
     onReconnect: (room, client) => {
-        room.send(client, { type: 'welcome-back' });
+        room.send(client, JSON.stringify({ type: 'welcome-back' }));
     },
 
     // client permanently left — consented close, eviction, or window expired
     onLeave: (room, client) => {
-        room.broadcast({ type: 'left', id: client.id });
+        room.broadcast(JSON.stringify({ type: 'left', id: client.id }));
     },
 
     // SIGTERM or room.stop()

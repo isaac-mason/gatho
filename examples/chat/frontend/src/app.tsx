@@ -124,8 +124,9 @@ function Chat({ roomName, room, onLeave }: { roomName: string; room: RoomConnect
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        const onMessage = (msg: unknown) => {
-            setMessages((prev) => [...prev, msg as ChatMessage]);
+        const onMessage = (msg: string | ArrayBuffer) => {
+            if (typeof msg !== 'string') return;
+            setMessages((prev) => [...prev, JSON.parse(msg) as ChatMessage]);
             requestAnimationFrame(() => {
                 messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
             });
@@ -157,7 +158,7 @@ function Chat({ roomName, room, onLeave }: { roomName: string; room: RoomConnect
     const send = () => {
         const text = input.trim();
         if (!text || !connected) return;
-        room.send({ text });
+        room.send(JSON.stringify({ text }));
         setInput('');
     };
 

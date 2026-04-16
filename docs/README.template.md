@@ -79,7 +79,7 @@ On the server side, opt in to reconnection by calling `room.allowReconnection(cl
 
 ## Messages
 
-gatho is unopinionated about message format — `room.send()` accepts any JSON-serializable value or raw `Uint8Array`/`ArrayBuffer`, and `onMessage` receives whatever was sent.
+gatho is unopinionated about message format — `room.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` / `JSON.parse()` yourself — gatho stays out of the way.
 
 If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types — no code generation, no IDL files.
 

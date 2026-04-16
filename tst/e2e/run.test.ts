@@ -75,11 +75,11 @@ const scenarios: Scenario[] = [
             // wait for ws to open before sending
             await sleep(200);
 
-            conn.send({ hello: 'world' });
+            conn.send(JSON.stringify({ hello: 'world' }));
 
             // wait for the echo
             const msgs = await waitForMessages(1);
-            expect(msgs[0]).toEqual({ hello: 'world' });
+            expect(msgs[0]).toBe(JSON.stringify({ hello: 'world' }));
 
             conn.close();
         },

@@ -15,30 +15,39 @@ await start({
     },
 
     onJoin: (room, client) => {
-        room.broadcast({
-            type: 'join',
-            user: client.data.username,
-            ts: Date.now(),
-        });
+        room.broadcast(
+            JSON.stringify({
+                type: 'join',
+                user: client.data.username,
+                ts: Date.now(),
+            }),
+        );
     },
 
-    onMessage: (room, client, message: { type?: string }) => {
-        if (message.type === 'ping') {
+    onMessage: (room, client, message) => {
+        if (typeof message !== 'string') return;
+        const parsed = JSON.parse(message) as { type?: string };
+        if (parsed.type === 'ping') {
             pingCount++;
-            room.send(client, {
-                type: 'pong',
-                pingCount,
-                server: room.serverId,
-                ts: Date.now(),
-            });
+            room.send(
+                client,
+                JSON.stringify({
+                    type: 'pong',
+                    pingCount,
+                    server: room.serverId,
+                    ts: Date.now(),
+                }),
+            );
         }
     },
 
     onLeave: (room, client) => {
-        room.broadcast({
-            type: 'leave',
-            user: client.data.username,
-            ts: Date.now(),
-        });
+        room.broadcast(
+            JSON.stringify({
+                type: 'leave',
+                user: client.data.username,
+                ts: Date.now(),
+            }),
+        );
     },
 });

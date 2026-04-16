@@ -9,33 +9,41 @@ await start({
     },
 
     onJoin: (room, client) => {
-        room.broadcast({
-            type: 'join',
-            user: client.data.username,
-            timestamp: Date.now(),
-        });
+        room.broadcast(
+            JSON.stringify({
+                type: 'join',
+                user: client.data.username,
+                timestamp: Date.now(),
+            }),
+        );
     },
 
-    onMessage: (room, client, message: { text: string }) => {
+    onMessage: (room, client, message) => {
+        if (typeof message !== 'string') return;
+        const parsed = JSON.parse(message) as { text: string };
         const msg = {
             user: client.data.username,
-            text: message.text,
+            text: parsed.text,
             timestamp: Date.now(),
         };
 
         messages.push(msg);
 
-        room.broadcast({
-            type: 'message',
-            ...msg,
-        });
+        room.broadcast(
+            JSON.stringify({
+                type: 'message',
+                ...msg,
+            }),
+        );
     },
 
     onLeave: (room, client) => {
-        room.broadcast({
-            type: 'leave',
-            user: client.data.username,
-            timestamp: Date.now(),
-        });
+        room.broadcast(
+            JSON.stringify({
+                type: 'leave',
+                user: client.data.username,
+                timestamp: Date.now(),
+            }),
+        );
     },
 });

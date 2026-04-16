@@ -1,5 +1,5 @@
 node_modules
-examples/**/dist
+dist
 dist-typedoc
 llm
 tmp
@@ -8,6 +8,3 @@ AGENTS.md
 .planning
 .claude
 .opencode
-*.cpuprofile
-*.cpuprofile.md
-dist

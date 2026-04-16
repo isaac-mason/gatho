@@ -8,6 +8,6 @@ await start({
     },
 
     onReconnect: (room, client) => {
-        room.send(client, { type: 'welcome-back' });
+        room.send(client, JSON.stringify({ type: 'welcome-back' }));
     },
 });

@@ -1,30 +1,34 @@
-// connection state
+import { packProtocol, packUserBinary, packUserText, unpackFrame } from '../common/protocol';
+
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
-// options for send()
 export type SendOptions = { reliable?: boolean };
 
-// a message buffered for sending after reconnection, already serialized
+// outbound message — mirrors WebSocket.send() accepted types
+export type SendMessage = string | ArrayBuffer | ArrayBufferView | Blob;
+
+// inbound message — mirrors MessageEvent.data with binaryType 'arraybuffer'
+export type ReceiveMessage = string | ArrayBuffer;
+
 type BufferedMessage = {
-    payload: string | ArrayBuffer | Uint8Array;
+    payload: SendMessage;
     byteSize: number;
 };
 
-// connection to a room
 export type RoomConnection = {
     // current connection state
     readonly state: ConnectionState;
 
     // send a message to the server.
-    // if message is Uint8Array or ArrayBuffer, sends as binary, otherwise sends as JSON.
+    // if message is Uint8Array or ArrayBuffer, sends as binary, otherwise JSON-serialized.
     // reliable (default true): buffers during RECONNECTING and flushes on reconnect.
     // unreliable: drops if not OPEN.
-    send(message: unknown, options?: SendOptions): void;
+    send(message: SendMessage, options?: SendOptions): void;
 
     // register a listener for an event. returns an unsubscribe function.
     // multiple listeners can be registered for the same event.
     on(event: 'open', callback: () => void): () => void;
-    on(event: 'message', callback: (message: unknown) => void): () => void;
+    on(event: 'message', callback: (message: ReceiveMessage) => void): () => void;
     on(event: 'drop', callback: () => void): () => void;
     on(event: 'reconnect', callback: () => void): () => void;
     on(event: 'authError', callback: (error: unknown) => void): () => void;
@@ -33,7 +37,7 @@ export type RoomConnection = {
 
     // remove a previously registered listener by reference
     off(event: 'open', callback: () => void): void;
-    off(event: 'message', callback: (message: unknown) => void): void;
+    off(event: 'message', callback: (message: ReceiveMessage) => void): void;
     off(event: 'drop', callback: () => void): void;
     off(event: 'reconnect', callback: () => void): void;
     off(event: 'authError', callback: (error: unknown) => void): void;
@@ -48,7 +52,7 @@ export type RoomConnection = {
 
 type ListenerMap = {
     open: Set<() => void>;
-    message: Set<(message: unknown) => void>;
+    message: Set<(message: ReceiveMessage) => void>;
     drop: Set<() => void>;
     reconnect: Set<() => void>;
     authError: Set<(error: unknown) => void>;
@@ -109,24 +113,33 @@ export function connect(url: string): RoomConnection {
 
     // --- helpers ---
 
-    // compute byte size of a serialized payload
-    function payloadByteSize(payload: string | ArrayBuffer | Uint8Array): number {
-        if (typeof payload === 'string') return payload.length * 2;
-        return payload.byteLength;
+    // frame a user message for the wire. returns a Uint8Array ready to ws.send().
+    function frameUserMessage(message: SendMessage): Uint8Array<ArrayBuffer> {
+        if (typeof message === 'string') return packUserText(message);
+        if (message instanceof ArrayBuffer) return packUserBinary(message);
+        if (message instanceof Blob) {
+            // blob should have been converted before reaching here — this is a
+            // fallback that shouldn't happen in practice. callers should await
+            // blob.arrayBuffer() first.
+            throw new Error('Blob must be converted to ArrayBuffer before framing');
+        }
+        // ArrayBufferView (Uint8Array, Float32Array, etc.)
+        return packUserBinary(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
     }
 
-    // serialize a message for buffering or sending
-    function serializeMessage(message: unknown): { payload: string | ArrayBuffer | Uint8Array; isBinary: boolean } {
-        if (message instanceof Uint8Array || message instanceof ArrayBuffer) {
-            return { payload: message, isBinary: true };
-        }
-        return { payload: JSON.stringify(message), isBinary: false };
+    // estimate byte size of a message for buffer accounting
+    function estimateByteSize(message: SendMessage): number {
+        if (typeof message === 'string') return message.length * 2;
+        if (message instanceof Blob) return message.size;
+        if (message instanceof ArrayBuffer) return message.byteLength;
+        // ArrayBufferView (Uint8Array, Float32Array, etc.)
+        return message.byteLength;
     }
 
     // buffer a reliable message. if the buffer overflows, transition to CLOSED.
-    function bufferReliable(payload: string | ArrayBuffer | Uint8Array): void {
-        const byteSize = payloadByteSize(payload);
-        reliableBuffer.push({ payload, byteSize });
+    function bufferReliable(message: SendMessage): void {
+        const byteSize = estimateByteSize(message);
+        reliableBuffer.push({ payload: message, byteSize });
         reliableBufferBytes += byteSize;
         if (reliableBufferBytes > MAX_BUFFER_BYTES) {
             enterClosed(1009, 'outbound buffer overflow');
@@ -136,7 +149,7 @@ export function connect(url: string): RoomConnection {
     // flush the reliable buffer over the current websocket, then clear it
     function flushReliableBuffer(socket: WebSocket): void {
         for (const buffered of reliableBuffer) {
-            socket.send(buffered.payload);
+            socket.send(frameUserMessage(buffered.payload));
         }
         reliableBuffer.length = 0;
         reliableBufferBytes = 0;
@@ -163,11 +176,11 @@ export function connect(url: string): RoomConnection {
         }
     }
 
-    // send __leave protocol message before closing with code 4000 (consented).
+    // send leave protocol message before closing with code 4000 (consented).
     // this tells the server this is an intentional departure, not a network drop.
     function sendLeaveAndClose(socket: WebSocket): void {
         if (socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ type: '__leave' }));
+            socket.send(packProtocol({ type: 'leave' }));
             socket.close(4000, 'consented leave');
         } else {
             socket.close();
@@ -244,57 +257,59 @@ export function connect(url: string): RoomConnection {
         socket.onmessage = (event: MessageEvent) => {
             const { data } = event;
 
-            if (data instanceof ArrayBuffer) {
-                // binary message — wrap in Uint8Array
-                const msg = new Uint8Array(data);
-                emit('message', msg);
+            // all gatho frames are binary
+            if (!(data instanceof ArrayBuffer)) return;
+
+            const frame = unpackFrame(data);
+
+            if (frame.frame === 'protocol') {
+                const msg = frame.message;
+
+                if (msg.type === 'session') {
+                    sessionToken = msg.token;
+
+                    if (isReconnect && state === 'reconnecting') {
+                        // reconnection confirmed — server accepted our session
+                        state = 'open';
+                        openedAt = Date.now();
+
+                        // start minUptime timer
+                        uptimeTimer = setTimeout(() => {
+                            retryCount = 0;
+                        }, MIN_UPTIME);
+
+                        // flush outbound reliable buffer before notifying user code
+                        flushReliableBuffer(socket);
+
+                        emit('reconnect');
+                    }
+                    return;
+                }
+
+                if (msg.type === 'auth_error') {
+                    if (isReconnect && state === 'reconnecting') {
+                        // server rejected our session — give up permanently
+                        enterClosed(4000, 'session rejected');
+                        socket.close();
+                        return;
+                    }
+
+                    // initial connection auth error
+                    emit('authError', msg.error);
+                    return;
+                }
+
+                // unknown protocol message — ignore
                 return;
             }
 
-            if (typeof data === 'string') {
-                const parsed: unknown = JSON.parse(data);
+            if (frame.frame === 'user_text') {
+                emit('message', frame.text);
+                return;
+            }
 
-                if (typeof parsed === 'object' && parsed !== null && 'type' in parsed) {
-                    const msg = parsed as Record<string, unknown>;
-
-                    // intercept session token
-                    if (msg.type === '__session' && typeof msg.token === 'string') {
-                        sessionToken = msg.token;
-
-                        if (isReconnect && state === 'reconnecting') {
-                            // reconnection confirmed — server accepted our session
-                            state = 'open';
-                            openedAt = Date.now();
-
-                            // start minUptime timer
-                            uptimeTimer = setTimeout(() => {
-                                retryCount = 0;
-                            }, MIN_UPTIME);
-
-                            // flush outbound reliable buffer before notifying user code
-                            flushReliableBuffer(socket);
-
-                            emit('reconnect');
-                        }
-                        return;
-                    }
-
-                    // intercept auth error
-                    if (msg.type === '__auth_error') {
-                        if (isReconnect && state === 'reconnecting') {
-                            // server rejected our session — give up permanently
-                            enterClosed(4000, 'session rejected');
-                            socket.close();
-                            return;
-                        }
-
-                        // initial connection auth error
-                        emit('authError', msg.error);
-                        return;
-                    }
-                }
-
-                emit('message', parsed);
+            if (frame.frame === 'user_binary') {
+                emit('message', frame.data);
             }
         };
 
@@ -391,20 +406,18 @@ export function connect(url: string): RoomConnection {
             return state;
         },
 
-        send(message: unknown, options?: SendOptions): void {
+        send(message: SendMessage, options?: SendOptions): void {
             const reliable = options?.reliable !== false;
 
             if (state === 'open' && ws) {
-                // connected — send immediately
-                const { payload } = serializeMessage(message);
-                ws.send(payload);
+                // connected — frame and send immediately
+                ws.send(frameUserMessage(message));
                 return;
             }
 
             if (state === 'reconnecting' && reliable) {
-                // disconnected, reliable — serialize and buffer
-                const { payload } = serializeMessage(message);
-                bufferReliable(payload);
+                // disconnected, reliable — buffer
+                bufferReliable(message);
                 return;
             }
 

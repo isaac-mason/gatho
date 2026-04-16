@@ -152,7 +152,8 @@ function PingRoom({ roomId, conn, onLeave }: { roomId: string; conn: RoomConnect
 
     useEffect(() => {
         conn.on('message', (msg) => {
-            setMessages((prev) => [...prev, msg as RoomMessage]);
+            if (typeof msg !== 'string') return;
+            setMessages((prev) => [...prev, JSON.parse(msg) as RoomMessage]);
             requestAnimationFrame(() => {
                 messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
             });
@@ -170,7 +171,7 @@ function PingRoom({ roomId, conn, onLeave }: { roomId: string; conn: RoomConnect
 
     const sendPing = () => {
         if (!connected) return;
-        conn.send({ type: 'ping' });
+        conn.send(JSON.stringify({ type: 'ping' }));
         setPingSent((n) => n + 1);
     };
 

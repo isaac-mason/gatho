@@ -1,7 +1,7 @@
 // type-level tests for StartOptions generic structure.
 // verifies the shape of StartOptions at the type level.
 import { describe, expectTypeOf, test } from 'vitest';
-import { auth, type Client, type Room, type StartOptions } from '../../room';
+import type { Client, Room, StartOptions } from '../../room';
 
 describe('StartOptions type structure', () => {
     test('ClientData flows through Room and Client in callbacks', () => {
@@ -10,44 +10,31 @@ describe('StartOptions type structure', () => {
 
         type RoomArg = Parameters<OnJoin>[0];
         type ClientArg = Parameters<OnJoin>[1];
-        expectTypeOf<RoomArg>().toMatchTypeOf<Room<{ username: string }>>();
-        expectTypeOf<ClientArg>().toMatchTypeOf<Client<{ username: string }>>();
+        expectTypeOf<RoomArg>().toMatchObjectType<Room<{ username: string }>>();
+        expectTypeOf<ClientArg>().toMatchObjectType<Client<{ username: string }>>();
     });
 
     test('JoinData appears in onAuth parameter', () => {
         type Opts = StartOptions<{ username: string }, { displayName?: string }>;
-        type OnAuth = Opts['onAuth'];
+        type OnAuth = NonNullable<Opts['onAuth']>;
 
         type JoinDataArg = Parameters<OnAuth>[0];
         expectTypeOf<JoinDataArg>().toEqualTypeOf<{ displayName?: string }>();
     });
 
-    test('InMessage appears in onMessage parameter', () => {
-        type Opts = StartOptions<{ username: string }, Record<string, unknown>, { text: string }>;
+    test('onMessage receives string | ArrayBuffer', () => {
+        type Opts = StartOptions<{ username: string }>;
         type OnMessage = NonNullable<Opts['onMessage']>;
 
         type MessageArg = Parameters<OnMessage>[2];
-        expectTypeOf<MessageArg>().toEqualTypeOf<{ text: string }>();
+        expectTypeOf<MessageArg>().toEqualTypeOf<string | ArrayBuffer>();
     });
 
-    test('defaults: JoinData is Record<string, unknown>, InMessage is unknown', () => {
+    test('defaults: JoinData is Record<string, unknown>', () => {
         type Opts = StartOptions<{ username: string }>;
+        type OnAuth = NonNullable<Opts['onAuth']>;
 
-        type OnAuth = Opts['onAuth'];
         type JoinDataArg = Parameters<OnAuth>[0];
         expectTypeOf<JoinDataArg>().toEqualTypeOf<Record<string, unknown>>();
-
-        type OnMessage = NonNullable<Opts['onMessage']>;
-        type MessageArg = Parameters<OnMessage>[2];
-        expectTypeOf<MessageArg>().toEqualTypeOf<unknown>();
-    });
-
-    test('onAuth has no room parameter', () => {
-        type Opts = StartOptions<{ username: string }>;
-        type OnAuth = Opts['onAuth'];
-
-        // onAuth should only take 1 parameter (joinData)
-        type Params = Parameters<OnAuth>;
-        expectTypeOf<Params['length']>().toEqualTypeOf<1>();
     });
 });

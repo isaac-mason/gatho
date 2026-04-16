@@ -60,9 +60,9 @@ describe('standalone room', () => {
         const { conn, waitFor } = collectMessages('ws://127.0.0.1:19876');
         await sleep(200);
 
-        conn.send({ ping: true });
+        conn.send(JSON.stringify({ ping: true }));
         const msgs = await waitFor(1);
-        expect(msgs[0]).toEqual({ ping: true });
+        expect(msgs[0]).toBe(JSON.stringify({ ping: true }));
 
         conn.close();
     });
@@ -77,12 +77,12 @@ describe('standalone room', () => {
         const { conn, waitFor } = collectMessages('ws://127.0.0.1:19877');
         await sleep(200);
 
-        conn.send({ hello: 'world' });
-        conn.send({ count: 42 });
+        conn.send(JSON.stringify({ hello: 'world' }));
+        conn.send(JSON.stringify({ count: 42 }));
 
         const msgs = await waitFor(2);
-        expect(msgs[0]).toEqual({ hello: 'world' });
-        expect(msgs[1]).toEqual({ count: 42 });
+        expect(msgs[0]).toBe(JSON.stringify({ hello: 'world' }));
+        expect(msgs[1]).toBe(JSON.stringify({ count: 42 }));
 
         conn.close();
     });
@@ -99,13 +99,13 @@ describe('standalone room', () => {
         await sleep(300);
 
         // send from c1, both should receive
-        c1.conn.send({ from: 'c1' });
+        c1.conn.send(JSON.stringify({ from: 'c1' }));
 
         const [m1] = await c1.waitFor(1);
         const [m2] = await c2.waitFor(1);
 
-        expect(m1).toEqual({ from: 'c1' });
-        expect(m2).toEqual({ from: 'c1' });
+        expect(m1).toBe(JSON.stringify({ from: 'c1' }));
+        expect(m2).toBe(JSON.stringify({ from: 'c1' }));
 
         c1.conn.close();
         c2.conn.close();
@@ -121,11 +121,11 @@ describe('standalone room', () => {
             onJoin: (r) => {
                 joinedCount++;
                 // send current client count to all
-                r.broadcast({ clients: r.clients.count() });
+                r.broadcast(JSON.stringify({ clients: r.clients.count() }));
             },
             onLeave: (r) => {
                 leftCount++;
-                r.broadcast({ clients: r.clients.count() });
+                r.broadcast(JSON.stringify({ clients: r.clients.count() }));
             },
         });
 
@@ -145,8 +145,8 @@ describe('standalone room', () => {
         // first: { clients: 1 } (when c1 joined)
         // second: { clients: 2 } (when c2 joined)
         const c1Msgs = await c1.waitFor(2);
-        expect(c1Msgs[0]).toEqual({ clients: 1 });
-        expect(c1Msgs[1]).toEqual({ clients: 2 });
+        expect(c1Msgs[0]).toBe(JSON.stringify({ clients: 1 }));
+        expect(c1Msgs[1]).toBe(JSON.stringify({ clients: 2 }));
 
         // disconnect c2
         c2.conn.close();
@@ -249,12 +249,12 @@ describe('standalone room', () => {
         conn.on('message', (msg) => b.push(msg));
 
         await sleep(200);
-        conn.send({ x: 1 });
+        conn.send(JSON.stringify({ x: 1 }));
         await sleep(200);
 
         // both listeners should have received the message
-        expect(a).toEqual([{ x: 1 }]);
-        expect(b).toEqual([{ x: 1 }]);
+        expect(a).toEqual([JSON.stringify({ x: 1 })]);
+        expect(b).toEqual([JSON.stringify({ x: 1 })]);
 
         conn.close();
     });
@@ -274,22 +274,22 @@ describe('standalone room', () => {
         conn.on('message', (msg) => b.push(msg));
 
         await sleep(200);
-        conn.send({ x: 1 });
+        conn.send(JSON.stringify({ x: 1 }));
         await sleep(200);
 
         // both received first message
-        expect(a).toEqual([{ x: 1 }]);
-        expect(b).toEqual([{ x: 1 }]);
+        expect(a).toEqual([JSON.stringify({ x: 1 })]);
+        expect(b).toEqual([JSON.stringify({ x: 1 })]);
 
         // unsubscribe first listener
         unsub();
 
-        conn.send({ x: 2 });
+        conn.send(JSON.stringify({ x: 2 }));
         await sleep(200);
 
         // only b should have received the second message
-        expect(a).toEqual([{ x: 1 }]);
-        expect(b).toEqual([{ x: 1 }, { x: 2 }]);
+        expect(a).toEqual([JSON.stringify({ x: 1 })]);
+        expect(b).toEqual([JSON.stringify({ x: 1 }), JSON.stringify({ x: 2 })]);
 
         conn.close();
     });
@@ -308,18 +308,18 @@ describe('standalone room', () => {
         conn.on('message', handler);
 
         await sleep(200);
-        conn.send({ x: 1 });
+        conn.send(JSON.stringify({ x: 1 }));
         await sleep(200);
 
-        expect(a).toEqual([{ x: 1 }]);
+        expect(a).toEqual([JSON.stringify({ x: 1 })]);
 
         conn.off('message', handler);
 
-        conn.send({ x: 2 });
+        conn.send(JSON.stringify({ x: 2 }));
         await sleep(200);
 
         // should not have received the second message
-        expect(a).toEqual([{ x: 1 }]);
+        expect(a).toEqual([JSON.stringify({ x: 1 })]);
 
         conn.close();
     });

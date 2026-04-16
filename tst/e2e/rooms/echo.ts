@@ -3,5 +3,5 @@ import { auth, start } from '../../../room';
 
 await start({
     onAuth: () => auth.ok({}),
-    onMessage: (room, client, _message: unknown) => room.send(client, _message),
+    onMessage: (room, client, message) => room.send(client, message),
 });
