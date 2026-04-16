@@ -98,10 +98,10 @@ describe('createFrameReader', () => {
 
     it('delivers a single complete frame', () => {
         const received: RoomMessage[] = [];
-        const reader = createFrameReader((msg) => received.push(msg));
+        const push = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'ready', port: 3000 };
-        reader.push(buildFrame(msg));
+        push(buildFrame(msg));
 
         expect(received).toHaveLength(1);
         expect(received[0]).toEqual(msg);
@@ -109,7 +109,7 @@ describe('createFrameReader', () => {
 
     it('delivers multiple frames from a single chunk', () => {
         const received: RoomMessage[] = [];
-        const reader = createFrameReader((msg) => received.push(msg));
+        const push = createFrameReader((msg) => received.push(msg));
 
         const msgs: RoomMessage[] = [
             { type: 'ready', port: 3000 },
@@ -118,7 +118,7 @@ describe('createFrameReader', () => {
         ];
 
         const combined = Buffer.concat(msgs.map(buildFrame));
-        reader.push(combined);
+        push(combined);
 
         expect(received).toHaveLength(3);
         for (let i = 0; i < msgs.length; i++) {
@@ -128,30 +128,30 @@ describe('createFrameReader', () => {
 
     it('handles partial frames across multiple pushes', () => {
         const received: RoomMessage[] = [];
-        const reader = createFrameReader((msg) => received.push(msg));
+        const push = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'client-connected', clientId: 'test-user-123' };
         const frame = buildFrame(msg);
 
         // split at an arbitrary point in the middle
         const mid = Math.floor(frame.byteLength / 2);
-        reader.push(frame.subarray(0, mid));
+        push(frame.subarray(0, mid));
         expect(received).toHaveLength(0);
 
-        reader.push(frame.subarray(mid));
+        push(frame.subarray(mid));
         expect(received).toHaveLength(1);
         expect(received[0]).toEqual(msg);
     });
 
     it('handles byte-at-a-time delivery', () => {
         const received: RoomMessage[] = [];
-        const reader = createFrameReader((msg) => received.push(msg));
+        const push = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'stopped' };
         const frame = buildFrame(msg);
 
         for (let i = 0; i < frame.byteLength; i++) {
-            reader.push(frame.subarray(i, i + 1));
+            push(frame.subarray(i, i + 1));
         }
 
         expect(received).toHaveLength(1);
@@ -160,23 +160,23 @@ describe('createFrameReader', () => {
 
     it('handles split across header boundary', () => {
         const received: RoomMessage[] = [];
-        const reader = createFrameReader((msg) => received.push(msg));
+        const push = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'error', message: 'uh oh' };
         const frame = buildFrame(msg);
 
         // push only 2 of 4 header bytes first
-        reader.push(frame.subarray(0, 2));
+        push(frame.subarray(0, 2));
         expect(received).toHaveLength(0);
 
-        reader.push(frame.subarray(2));
+        push(frame.subarray(2));
         expect(received).toHaveLength(1);
         expect(received[0]).toEqual(msg);
     });
 
     it('interleaves partial and complete frames', () => {
         const received: RoomMessage[] = [];
-        const reader = createFrameReader((msg) => received.push(msg));
+        const push = createFrameReader((msg) => received.push(msg));
 
         const msg1: RoomMessage = { type: 'ready', port: 9000 };
         const msg2: RoomMessage = { type: 'client-disconnected', clientId: 'x' };
@@ -185,10 +185,10 @@ describe('createFrameReader', () => {
 
         // send tail of frame1 + all of frame2 in one chunk
         const mid = Math.floor(frame1.byteLength / 2);
-        reader.push(frame1.subarray(0, mid));
+        push(frame1.subarray(0, mid));
         expect(received).toHaveLength(0);
 
-        reader.push(Buffer.concat([frame1.subarray(mid), frame2]));
+        push(Buffer.concat([frame1.subarray(mid), frame2]));
         expect(received).toHaveLength(2);
         expect(received[0]).toEqual(msg1);
         expect(received[1]).toEqual(msg2);

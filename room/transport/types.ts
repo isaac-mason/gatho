@@ -1,6 +1,6 @@
 /*
  * transport abstraction layer.
- * may in future support swapping out ws for webtransport 
+ * may in future support swapping out ws for webtransport
  */
 
 export type ClientSocket = {
