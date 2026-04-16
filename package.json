@@ -50,7 +50,10 @@
         "build": "rm -rf ./dist && rollup --config rollup.config.mjs",
         "format": "biome format --write src/. tst/.",
         "lint": "biome lint --write src/. tst/.",
-        "test": "vitest ./src ./tst",
+        "test": "./tst/release.sh",
+        "test:unit": "vitest ./tst",
+        "test:browser": "cd tst && ./browser-test.sh",
+        "test:e2e": "cd tst && ./e2e.sh",
         "typecheck-docs": "tsc --project docs/tsconfig.json --noEmit",
         "docs": "(cd docs && node ./build.js)",
         "typedoc": "typedoc --tsconfig ./tsconfig.json --name \"gatho docs\" --out ./dist-typedoc ./sdk/index.ts ./room/index.ts ./server/index.ts ./driver/index.ts ./client/index.ts ./common/index.ts"
