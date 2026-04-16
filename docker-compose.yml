@@ -1,0 +1,18 @@
+# test infrastructure — redis + postgres for e2e tests
+# start with: docker compose up -d
+# stop with: docker compose down
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "16379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: gatho
+      POSTGRES_PASSWORD: gatho
+      POSTGRES_DB: gatho

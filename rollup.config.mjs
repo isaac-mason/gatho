@@ -1,0 +1,42 @@
+import path from 'node:path';
+import { nodeResolve } from '@rollup/plugin-node-resolve';
+import typescript from '@rollup/plugin-typescript';
+import filesize from 'rollup-plugin-filesize';
+
+const baseDir = import.meta.dirname;
+
+function bundle(input, output, external = []) {
+    return {
+        input,
+        external,
+        output: [
+            {
+                file: output,
+                format: 'es',
+                sourcemap: true,
+                exports: 'named',
+            },
+        ],
+        plugins: [
+            nodeResolve(),
+            typescript({
+                tsconfig: path.resolve(baseDir, './tsconfig.json'),
+                compilerOptions: {
+                    noEmit: false,
+                    declaration: true,
+                    declarationDir: path.resolve(baseDir, 'dist'),
+                },
+            }),
+            filesize(),
+        ],
+    };
+}
+
+export default [
+    bundle('./common/index.ts', 'dist/common.js', []),
+    bundle('./server/index.ts', 'dist/server.js', []),
+    bundle('./client/index.ts', 'dist/client.js', []),
+    bundle('./room/index.ts', 'dist/room.js', ['ws']),
+    bundle('./sdk/index.ts', 'dist/sdk.js', []),
+    bundle('./driver/index.ts', 'dist/driver.js', ['postgres', 'ioredis']),
+];

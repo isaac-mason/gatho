@@ -1,0 +1,11 @@
+{
+    "name": "gatho-example-ha-rooms",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "start": "bun src/server.ts"
+    },
+    "dependencies": {
+        "gatho": "workspace:*"
+    }
+}

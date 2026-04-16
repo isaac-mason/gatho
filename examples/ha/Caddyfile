@@ -1,0 +1,23 @@
+# caddy reverse proxy for gatho ha example
+#
+# each gatho server instance gets its own caddy in front of it.
+# rooms spawn on os-assigned ephemeral ports. clients connect through
+# caddy using the port number as a path prefix:
+#
+#   ws://localhost:{caddy_port}/{room_port}?token=...
+#
+# caddy extracts the port from the path, strips it, and reverse-proxies
+# to the host machine at that port. websocket upgrades are handled automatically.
+#
+# env vars:
+#   CADDY_PORT      — the port caddy listens on
+#   UPSTREAM_HOST   — the host to proxy to (host.docker.internal on mac, localhost on linux)
+
+:{$CADDY_PORT}
+
+# path is always /{port} or /{port}/ — we just need to strip the port prefix.
+# the room's ws server listens on /* so rewriting to / is always correct.
+@room path_regexp room ^/(\d+)
+reverse_proxy @room {$UPSTREAM_HOST}:{re.room.1} {
+	rewrite /
+}

@@ -1,0 +1,50 @@
+# ha example infrastructure
+#
+# redis — shared state between gatho server instances
+# caddy-1/2/3 — reverse proxies, one per gatho server
+#
+# each caddy instance proxies ws connections to room subprocesses
+# running on the host machine. the room port is encoded in the url path:
+#   ws://localhost:{caddy_port}/{room_port}?token=...
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  caddy-1:
+    image: caddy:2-alpine
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      CADDY_PORT: 8001
+      UPSTREAM_HOST: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  caddy-2:
+    image: caddy:2-alpine
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      CADDY_PORT: 8002
+      UPSTREAM_HOST: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  caddy-3:
+    image: caddy:2-alpine
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      CADDY_PORT: 8003
+      UPSTREAM_HOST: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

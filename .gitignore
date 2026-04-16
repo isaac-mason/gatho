@@ -1,0 +1,13 @@
+node_modules
+examples/**/dist
+dist-typedoc
+llm
+tmp
+AGENTS.md
+.gatho
+.planning
+.claude
+.opencode
+*.cpuprofile
+*.cpuprofile.md
+dist
