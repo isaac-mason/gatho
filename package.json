@@ -48,8 +48,8 @@
     ],
     "scripts": {
         "build": "rm -rf ./dist && rollup --config rollup.config.mjs",
-        "format": "biome format --write server/. room/. driver/. common/. client/. sdk/. tst/. docs/src/.",
-        "lint": "biome lint --write server/. room/. driver/. common/. client/. sdk/. tst/. docs/src/.",
+        "format": "biome format --write src/. docs/src/.",
+        "lint": "biome lint --write src/. docs/src/.",
         "test": "./tst/release.sh",
         "test:unit": "cd tst && ./unit.sh",
         "test:integration": "cd tst && ./integration.sh",
