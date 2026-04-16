@@ -70,9 +70,15 @@ await start({
 
     onMessage: (room, _client, message) => {
         if (typeof message !== 'string') return;
+
         const parsed = JSON.parse(message) as { type: 'increment' | 'decrement' };
-        if (parsed.type === 'increment') count++;
-        if (parsed.type === 'decrement') count--;
+
+        if (parsed.type === 'increment') {
+            count++;
+        } else if (parsed.type === 'decrement') {
+            count--;
+        }
+
         room.broadcast(JSON.stringify({ type: 'count', count }));
     },
 });
