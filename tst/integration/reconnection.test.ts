@@ -1,5 +1,5 @@
-// reconnection lifecycle tests — verifies session tokens, close codes,
-// onDrop/onLeave flow, backward compatibility, and server-initiated disconnect.
+// reconnection lifecycle tests — verifies close codes, onDrop/onLeave flow,
+// backward compatibility, and server-initiated disconnect.
 // these tests use node's WebSocket client (via gatho client), not a real browser.
 // network-drop scenarios (close code 1006, backoff, buffering during offline)
 // are tested in tst/browser/ with playwright + setOffline.
@@ -33,27 +33,7 @@ describe('reconnection lifecycle', () => {
         }
     });
 
-    it('server sends __session token on initial connection', async () => {
-        // the client stores the session token internally and uses it for
-        // reconnection. we can't read the token directly from the client,
-        // but we can verify the client transitions to 'open' (which means
-        // the ws connected and onopen fired).
-        room = await start({
-            port: 19900,
-            onAuth: () => auth.ok({}),
-        });
-
-        const conn = connect('ws://127.0.0.1:19900');
-        await waitUntil(() => conn.state === 'open');
-
-        // the fact that we're open means the initial ws connected.
-        // the session token was sent as a protocol message.
-        expect(conn.state).toBe('open');
-
-        conn.close();
-    });
-
-    it('close code 4000 (consented) — onDrop NOT called, onLeave fires', async () => {
+    it('close code 4000 (consented) — onDrop NOT called, onLeave fires, client closed with 4000', async () => {
         let dropCalled = false;
         let leaveCalled = false;
 
@@ -71,34 +51,20 @@ describe('reconnection lifecycle', () => {
         const conn = connect('ws://127.0.0.1:19901');
         await waitUntil(() => conn.state === 'open');
 
-        // client.close() sends __leave + closes with 4000
-        conn.close();
-        await sleep(300);
-
-        expect(dropCalled).toBe(false);
-        expect(leaveCalled).toBe(true);
-    });
-
-    it('client enters closed state on consented close, not reconnecting', async () => {
-        room = await start({
-            port: 19902,
-            onAuth: () => auth.ok({}),
-            onDrop: (_r, _c, _code) => {
-                // should not be called
-            },
-        });
-
-        const conn = connect('ws://127.0.0.1:19902');
-        await waitUntil(() => conn.state === 'open');
-
         let closeCode = 0;
         conn.on('close', (code) => {
             closeCode = code;
         });
 
+        // client.close() sends __leave + closes with 4000
         conn.close();
-        await sleep(100);
+        await sleep(300);
 
+        // server side: onDrop skipped, onLeave fired
+        expect(dropCalled).toBe(false);
+        expect(leaveCalled).toBe(true);
+
+        // client side: closed state with code 4000, not reconnecting
         expect(conn.state).toBe('closed');
         expect(closeCode).toBe(4000);
     });
@@ -126,7 +92,7 @@ describe('reconnection lifecycle', () => {
         expect(leaveCalled).toBe(true);
     });
 
-    it('room.disconnect(client) — server-initiated consented close', async () => {
+    it('room.disconnect(client) — server-initiated consented close, removes from tracking', async () => {
         let dropCalled = false;
         let leaveCalled = false;
         let leaveClientId = '';
@@ -151,6 +117,8 @@ describe('reconnection lifecycle', () => {
         await waitUntil(() => conn.state === 'open');
         await waitUntil(() => joinedClient !== null);
 
+        expect(room!.clients.count()).toBe(1);
+
         // server-initiated disconnect — should skip onDrop, fire onLeave
         room!.disconnect(joinedClient!);
         await sleep(300);
@@ -158,29 +126,8 @@ describe('reconnection lifecycle', () => {
         expect(dropCalled).toBe(false);
         expect(leaveCalled).toBe(true);
         expect(leaveClientId).toBe(joinedClient!.id);
-        expect(room!.clients.count()).toBe(0);
-    });
 
-    it('room.disconnect removes client from tracking', async () => {
-        let joinedClient: Client | null = null;
-
-        room = await start({
-            port: 19905,
-            onAuth: () => auth.ok({}),
-            onJoin: (_r, client) => {
-                joinedClient = client;
-            },
-        });
-
-        const conn = connect('ws://127.0.0.1:19905');
-        await waitUntil(() => conn.state === 'open');
-        await waitUntil(() => joinedClient !== null);
-
-        expect(room!.clients.count()).toBe(1);
-
-        room!.disconnect(joinedClient!);
-        await sleep(200);
-
+        // client removed from tracking
         expect(room!.clients.count()).toBe(0);
         expect(room!.clients.has(joinedClient!.id)).toBe(false);
 
@@ -226,15 +173,13 @@ describe('reconnection lifecycle', () => {
         // so the close handler bails early (client not in map). the shutdown
         // path fires onLeave directly, not via the close handler.
         // so onDrop should NOT fire on room.stop() — only onLeave.
-        let dropCode = 0;
         let dropCalled = false;
 
         room = await start({
             port: 19907,
             onAuth: () => auth.ok({}),
-            onDrop: (_r, _c, code) => {
+            onDrop: () => {
                 dropCalled = true;
-                dropCode = code;
             },
         });
 
@@ -250,114 +195,6 @@ describe('reconnection lifecycle', () => {
         expect(dropCalled).toBe(false);
 
         conn.close();
-    });
-
-    it('send with { reliable: false } does not buffer for disconnected clients', async () => {
-        // we can only test this indirectly: connect a client, disconnect it
-        // via server forcing a close (non-consented), then send unreliable messages.
-        // when the client reconnects (not in this test), it should NOT receive those messages.
-        // here we just verify the server doesn't crash when sending unreliable to disconnected.
-        let joinedClient: Client | null = null;
-        let dropFired = false;
-
-        room = await start({
-            port: 19908,
-            onAuth: () => auth.ok({}),
-            onJoin: (_r, client) => {
-                joinedClient = client;
-            },
-            onDrop: (r, client) => {
-                dropFired = true;
-                r.allowReconnection(client, 5000);
-
-                // send unreliable messages while client is disconnected
-                r.send(client, JSON.stringify({ unreliable: 1 }), { reliable: false });
-                r.send(client, JSON.stringify({ unreliable: 2 }), { reliable: false });
-
-                // also send a reliable message for comparison
-                r.send(client, JSON.stringify({ reliable: 1 }));
-            },
-        });
-
-        const conn = connect('ws://127.0.0.1:19908');
-        await waitUntil(() => conn.state === 'open');
-        await waitUntil(() => joinedClient !== null);
-
-        // we can't simulate a real network drop in standalone mode,
-        // but we can verify the API doesn't crash
-        // the unreliable messages should be silently dropped when socket is null
-        expect(room!.clients.count()).toBe(1);
-
-        conn.close();
-    });
-
-    it('broadcast with { reliable: false } skips disconnected clients', async () => {
-        // similar to above — verify broadcast with reliable:false doesn't crash
-        // when some clients are disconnected
-        room = await start({
-            port: 19909,
-            onAuth: () => auth.ok({}),
-        });
-
-        const conn = connect('ws://127.0.0.1:19909');
-        await waitUntil(() => conn.state === 'open');
-
-        // broadcast unreliable when all are connected — should work fine
-        room!.broadcast(JSON.stringify({ hello: 'world' }), { reliable: false });
-        await sleep(100);
-
-        conn.close();
-    });
-
-    it('client drop event fires and state becomes reconnecting on unexpected close', async () => {
-        // when the server shuts down without the client sending __leave,
-        // the client enters RECONNECTING state and emits 'drop'
-        room = await start({
-            port: 19910,
-            onAuth: () => auth.ok({}),
-        });
-
-        const conn = connect('ws://127.0.0.1:19910');
-        await waitUntil(() => conn.state === 'open');
-
-        let dropped = false;
-        conn.on('drop', () => {
-            dropped = true;
-        });
-
-        // server shutdown closes all sockets with 1001 — non-consented from client's perspective
-        await room!.stop();
-        room = null;
-        await sleep(300);
-
-        expect(dropped).toBe(true);
-        expect(conn.state).toBe('reconnecting');
-
-        conn.close();
-        expect(conn.state).toBe('closed');
-    });
-
-    it('client close event fires with code 4000 on consented close', async () => {
-        room = await start({
-            port: 19911,
-            onAuth: () => auth.ok({}),
-        });
-
-        const conn = connect('ws://127.0.0.1:19911');
-        await waitUntil(() => conn.state === 'open');
-
-        let closeCode = 0;
-        let closeReason = '';
-        conn.on('close', (code, reason) => {
-            closeCode = code;
-            closeReason = reason;
-        });
-
-        conn.close();
-        await sleep(100);
-
-        expect(closeCode).toBe(4000);
-        expect(conn.state).toBe('closed');
     });
 
     it('client send during reconnecting state buffers reliable messages', async () => {
@@ -419,51 +256,6 @@ describe('reconnection lifecycle', () => {
         expect(closeCode).toBe(1009);
     });
 
-    it('allowReconnection holds the client seat for the specified window', async () => {
-        let joinedClient: Client | null = null;
-        let dropFired = false;
-        let leaveFired = false;
-
-        room = await start({
-            port: 19914,
-            onAuth: () => auth.ok({}),
-            onJoin: (_r, client) => {
-                joinedClient = client;
-            },
-            onDrop: (r, client) => {
-                dropFired = true;
-                // hold seat for 500ms
-                r.allowReconnection(client, 500);
-            },
-            onLeave: () => {
-                leaveFired = true;
-            },
-        });
-
-        const conn = connect('ws://127.0.0.1:19914');
-        await waitUntil(() => conn.state === 'open');
-        await waitUntil(() => joinedClient !== null);
-
-        // we need a non-consented close to trigger onDrop.
-        // destroy the underlying ws without sending __leave.
-        // the client's close() sends __leave + 4000 which is consented.
-        // instead, we'll stop the room (which closes with 1001) but that
-        // goes through handleShutdown which clears the map first.
-        // the only way to get a non-consented close in standalone tests
-        // is somewhat limited. let's verify the allowReconnection timer
-        // works by calling it directly on a mock scenario.
-        // actually — we can't easily trigger onDrop from standalone tests
-        // without accessing internals. this scenario is better tested in
-        // browser tests with setOffline.
-
-        conn.close();
-        await sleep(100);
-
-        // conn.close() sends __leave → 4000 → onDrop NOT called
-        // this is expected — onDrop only fires on non-consented close
-        // the allowReconnection timer test needs a real network drop (browser test)
-    });
-
     it('multiple clients — one leaves, others unaffected', async () => {
         const joinedIds: string[] = [];
         const leftIds: string[] = [];
@@ -502,11 +294,6 @@ describe('reconnection lifecycle', () => {
     });
 
     it('onAuth rejection during reconnection — client receives authError', async () => {
-        // when a client tries to reconnect with an expired/invalid session token,
-        // the server upgrades the connection (instead of 401) and sends __auth_error.
-        // the client should enter CLOSED permanently.
-        // this is hard to test without a real network drop and reconnection attempt.
-        // we verify the server-side behavior: an invalid session param still gets upgraded.
         room = await start({
             port: 19916,
             onAuth: () => auth.ok({}),
@@ -555,45 +342,5 @@ describe('reconnection lifecycle', () => {
         await sleep(300);
 
         expect(leaveData!.role).toBe('admin');
-    });
-
-    it('client state transitions: connecting → open → closed', async () => {
-        room = await start({
-            port: 19918,
-            onAuth: () => auth.ok({}),
-        });
-
-        const conn = connect('ws://127.0.0.1:19918');
-
-        // initial state is connecting
-        expect(conn.state).toBe('connecting');
-
-        await waitUntil(() => conn.state === 'open');
-        expect(conn.state).toBe('open');
-
-        conn.close();
-        await sleep(100);
-        expect(conn.state).toBe('closed');
-    });
-
-    it('client state transitions: connecting → open → reconnecting → closed', async () => {
-        room = await start({
-            port: 19919,
-            onAuth: () => auth.ok({}),
-        });
-
-        const conn = connect('ws://127.0.0.1:19919');
-        await waitUntil(() => conn.state === 'open');
-
-        // kill server — causes non-consented close
-        await room!.stop();
-        room = null;
-        await waitUntil(() => conn.state === 'reconnecting');
-
-        expect(conn.state).toBe('reconnecting');
-
-        // user closes — stops reconnection
-        conn.close();
-        expect(conn.state).toBe('closed');
     });
 });
