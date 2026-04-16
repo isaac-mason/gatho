@@ -52,7 +52,7 @@
         "lint": "biome lint --write src/. tst/.",
         "test": "./tst/release.sh",
         "test:unit": "vitest ./tst",
-        "test:browser": "cd tst && ./browser-test.sh",
+        "test:browser": "cd tst && ./browser.sh",
         "test:e2e": "cd tst && ./e2e.sh",
         "typecheck-docs": "tsc --project docs/tsconfig.json --noEmit",
         "docs": "(cd docs && node ./build.js)",

@@ -597,9 +597,9 @@ test('server buffer overflow evicts client when maxBufferBytes exceeded', async 
         }).toPass({ timeout: 5000 });
 
         // send enough data to overflow the 1kb server buffer.
-        // payloadByteSize uses string.length * 2, so a 300-char JSON string is ~600 bytes.
-        // two of those should exceed 1024.
-        const bigMsg = { data: 'x'.repeat(300) };
+        // server uses Buffer.byteLength (utf8), so ASCII chars are 1 byte each.
+        // JSON.stringify({ data: "x"*600 }) ≈ 614 bytes, two sends ≈ 1228 > 1024.
+        const bigMsg = { data: 'x'.repeat(600) };
         room.send(joinedClient!, bigMsg);
         room.send(joinedClient!, bigMsg);
 
