@@ -36,8 +36,9 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 
 - [Concepts](#concepts)
 - [Quick Start](#quick-start)
+- [Client](#client)
+- [Messages](#messages)
 - [Room Lifecycle](#room-lifecycle)
-- [Reconnection](#reconnection)
 - [Drivers](#drivers)
 
 ## Concepts
@@ -46,7 +47,7 @@ A **room** (`gatho/room`) is a shared multiplayer session — a game match, a lo
 
 A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — by default `subprocess()` spawns each room as its own process, but you can run rooms in the same process, in a container, or anywhere else. Rooms report their health and status back to the server over a Unix domain socket. Running multiple servers gives you horizontal scale.
 
-Your backend uses the **SDK** (`gatho/sdk`) to manage rooms — create, query, and destroy them, tag them for filtering, and call `join()` to mint a short-lived token URL you hand to your client. Tags and client data make it flexible enough to build whatever matchmaking logic you need. Gatho tries to stay out of this and instead offers a "CRUD API" for javascript rooms that handles the hard parts for you. 
+Your backend uses the **SDK** (`gatho/sdk`) to manage rooms — create, query, and destroy them, tag them for filtering, and call `join()` to mint a short-lived token URL you hand to your client. Tags and client data make it flexible enough to build whatever matchmaking logic you need.
 
 The **driver** (`gatho/driver`) is the shared state store — Redis, Postgres, or in-memory — that lets multiple server instances coordinate.
 
@@ -55,7 +56,7 @@ The **driver** (`gatho/driver`) is the shared state store — Redis, Postgres, o
 First, write a simple room that counts connections and messages:
 
 ```ts
-// room.ts
+// counter-room.ts
 import { auth, start } from 'gatho/room';
 
 let count = 0;
@@ -99,7 +100,7 @@ await server.start();
 Then you can start rooms using the `gatho/sdk`:
 
 ```ts
-// backend.ts
+// my-backend.ts
 import { createRedisDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
 
@@ -114,8 +115,12 @@ if (servers.length === 0) {
 const room = await gatho.createRoom({
     type: 'counter',
     serverId: servers[0].serverId,
-    data: { /* any custom data you want to start the room with */ },
-    tags: { /* any tags you want to give the room */ },
+    data: {
+        /* any custom data you want to start the room with */
+    },
+    tags: {
+        /* any tags you want to give the room */
+    },
 });
 
 const seat = await gatho.join({ roomId: room.roomId, ttl: 30_000 });
@@ -138,6 +143,101 @@ room.on('message', (msg) => {
 });
 
 room.send({ type: 'increment' });
+```
+
+## Client
+
+`gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself:
+
+- **Automatic reconnection** — on unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter.
+- **Reliable messaging** — messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. Future features around backpressure and handling and WebTransport will build on this.
+- **Session continuity** — the server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off.
+- **Clean close** — `close()` sends a protocol-level leave message so the server knows the disconnect was intentional and skips the reconnection window.
+
+On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
+
+```ts
+import { auth, start } from 'gatho/room';
+
+await start({
+    onAuth: () => auth.ok(),
+
+    onDrop: (room, client) => {
+        room.allowReconnection(client, 30_000); // hold seat for 30s
+    },
+
+    onReconnect: (room, client) => {
+        room.send(client, { type: 'welcome-back' });
+    },
+});
+```
+
+## Messages
+
+gatho is unopinionated about your message format or protocol. The `room.send()` API accepts any JSON-serializable value or raw `Uint8Array`/`ArrayBuffer`, and `onMessage` receives whatever was sent.
+
+If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types — no code generation, no IDL files.
+
+```ts
+// shared/protocol.ts
+
+// define your message schemas once, use them on both client and server
+
+import * as p from 'packcat';
+
+// client → server
+const PlayerInput = p.object({
+    type: p.literal('input'),
+    movement: p.list(p.float32()),
+});
+
+// server → client
+const GameState = p.object({
+    type: p.literal('snapshot'),
+    tick: p.varuint(),
+    players: p.list(
+        p.object({
+            id: p.varuint(),
+            position: p.list(p.float32(), 2), // [x, y]
+        }),
+    ),
+});
+
+const ServerMessage = p.union('type', [GameState]);
+const ClientMessage = p.union('type', [PlayerInput]);
+
+export type ServerMessage = p.SchemaType<typeof ServerMessage>;
+// { type: 'snapshot', tick: number, players: { id: number, position: [number, number] }[] }
+
+export type ClientMessage = p.SchemaType<typeof ClientMessage>;
+// { type: 'input', movement: [number, number] }
+
+const ServerMessageSerDes = p.build(ServerMessage);
+const ClientMessageSerDes = p.build(ClientMessage);
+
+const exampleServerMessage: Uint8Array<ArrayBufferLike> = ServerMessageSerDes.pack({
+    type: 'snapshot',
+    tick: 123,
+    players: [
+        { id: 1, position: [10, 20] },
+        { id: 2, position: [30, 40] },
+    ],
+});
+
+console.log('packed server message:', exampleServerMessage);
+
+const unpackedServerMessage: ServerMessage = ServerMessageSerDes.unpack(exampleServerMessage);
+console.log('unpacked server message:', unpackedServerMessage.tick, unpackedServerMessage.players);
+
+const exampleClientMessage: Uint8Array<ArrayBufferLike> = ClientMessageSerDes.pack({
+    type: 'input',
+    movement: [1, 0],
+});
+
+console.log('packed client message:', exampleClientMessage);
+
+const unpackedClientMessage: ClientMessage = ClientMessageSerDes.unpack(exampleClientMessage);
+console.log('unpacked client message:', unpackedClientMessage.movement);
 ```
 
 ## Room Lifecycle
@@ -180,26 +280,6 @@ await start({
     // SIGTERM or room.stop()
     onShutdown: () => {
         console.log('shutting down');
-    },
-});
-```
-
-## Reconnection
-
-Call `room.allowReconnection(client, windowMs)` inside `onDrop` to hold a client's seat while they're disconnected. Reliable messages sent during the window are buffered (up to 1MB per client) and flushed automatically on reconnect. Exceeding the buffer limit or window causes the client to be dropped.
-
-```ts
-import { auth, start } from 'gatho/room';
-
-await start({
-    onAuth: () => auth.ok(),
-
-    onDrop: (room, client) => {
-        room.allowReconnection(client, 30_000); // hold seat for 30s
-    },
-
-    onReconnect: (room, client) => {
-        room.send(client, { type: 'welcome-back' });
     },
 });
 ```

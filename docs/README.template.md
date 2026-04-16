@@ -64,15 +64,30 @@ And you can connect to URLs returned by `join()` with `gatho/client`:
 
 <Snippet source="./src/quick-start-client.ts" />
 
+## Client
+
+`gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself:
+
+- **Automatic reconnection** — on unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter.
+- **Reliable messaging** — messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. Future features around backpressure and handling and WebTransport will build on this.
+- **Session continuity** — the server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off.
+- **Clean close** — `close()` sends a protocol-level leave message so the server knows the disconnect was intentional and skips the reconnection window.
+
+On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
+
+<Snippet source="./src/reconnection.ts" />
+
+## Messages
+
+gatho is unopinionated about message format — `room.send()` accepts any JSON-serializable value or raw `Uint8Array`/`ArrayBuffer`, and `onMessage` receives whatever was sent.
+
+If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types — no code generation, no IDL files.
+
+<Snippet source="./src/binary-messages.ts" />
+
 ## Room Lifecycle
 
 <Snippet source="./src/room-lifecycle.ts" />
-
-## Reconnection
-
-Call `room.allowReconnection(client, windowMs)` inside `onDrop` to hold a client's seat while they're disconnected. Reliable messages sent during the window are buffered (up to 1MB per client) and flushed automatically on reconnect. Exceeding the buffer limit or window causes the client to be dropped.
-
-<Snippet source="./src/reconnection.ts" />
 
 ## Drivers
 

@@ -11,9 +11,6 @@ importers:
       ioredis:
         specifier: ^5.10.0
         version: 5.10.0
-      packcat:
-        specifier: 0.3.0
-        version: 0.3.0
       postgres:
         specifier: ^3.4.8
         version: 3.4.8
@@ -42,6 +39,9 @@ importers:
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
+      packcat:
+        specifier: 0.3.0
+        version: 0.3.0
       rollup:
         specifier: ^4.46.2
         version: 4.46.2
@@ -2918,7 +2918,7 @@ packages:
 
   /packcat@0.3.0:
     resolution: {integrity: sha512-5LfyKTxoyCIFuRIjF9+sr0JtJtLYviQj1NbBlz+EsZli+t12dY1Dx18hHwDM3/9ry39F4lIhUlfuSncPNYQ8Ig==}
-    dev: false
+    dev: true
 
   /pacote@15.2.0:
     resolution: {integrity: sha512-rJVZeIwHTUta23sIZgEIM62WYwbmGbThdbnkt81ravBplQv+HjyroqnLRNH2+sLJHcGZmLRmhPwACqhfTcOmnA==}
