@@ -82,29 +82,25 @@ export function sendMessage(socket: Socket, msg: RoomMessage): void {
     socket.write(frame);
 }
 
-// streaming frame reader — handles partial reads and buffering across data events
-export class FrameReader {
-    private buffer: Buffer = Buffer.alloc(0);
-    private onMessage: (msg: RoomMessage) => void;
+// streaming frame reader — handles partial reads and buffering across data events.
+// returns a push function that accepts raw chunks from the socket.
+export function createFrameReader(onMessage: (msg: RoomMessage) => void): (data: Buffer | Uint8Array) => void {
+    let buffer = Buffer.alloc(0) as Buffer;
 
-    constructor(onMessage: (msg: RoomMessage) => void) {
-        this.onMessage = onMessage;
-    }
-
-    push(data: Buffer | Uint8Array): void {
+    return (data: Buffer | Uint8Array) => {
         const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        this.buffer = this.buffer.byteLength === 0 ? buf : Buffer.concat([this.buffer, buf]);
+        buffer = buffer.byteLength === 0 ? buf : Buffer.concat([buffer, buf]);
 
-        while (this.buffer.byteLength >= HEADER_SIZE) {
-            const payloadLength = this.buffer.readUInt32BE(0);
+        while (buffer.byteLength >= HEADER_SIZE) {
+            const payloadLength = buffer.readUInt32BE(0);
             const totalFrameSize = HEADER_SIZE + payloadLength;
 
-            if (this.buffer.byteLength < totalFrameSize) break;
+            if (buffer.byteLength < totalFrameSize) break;
 
-            const payload = this.buffer.subarray(HEADER_SIZE, totalFrameSize);
-            this.buffer = this.buffer.subarray(totalFrameSize);
+            const payload = buffer.subarray(HEADER_SIZE, totalFrameSize);
+            buffer = buffer.subarray(totalFrameSize);
 
-            this.onMessage(ipcCodec.unpack(payload));
+            onMessage(ipcCodec.unpack(payload));
         }
-    }
+    };
 }

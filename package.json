@@ -51,6 +51,8 @@
         "format": "biome format --write src/. tst/.",
         "lint": "biome lint --write src/. tst/.",
         "test": "./tst/release.sh",
+        "test:unit": "cd tst && ./unit.sh",
+        "test:integration": "cd tst && ./integration.sh",
         "test:types": "cd tst && ./types.sh",
         "test:browser": "cd tst && ./browser.sh",
         "test:e2e": "cd tst && ./e2e.sh",

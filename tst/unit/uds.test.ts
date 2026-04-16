@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ipcCodec, FrameReader, type RoomMessage } from '../../common/uds';
+import { ipcCodec, createFrameReader, type RoomMessage } from '../../common/uds';
 
 describe('uds ipc codec', () => {
     // round-trip every message variant through pack/unpack
@@ -86,7 +86,7 @@ describe('uds ipc codec', () => {
     });
 });
 
-describe('FrameReader', () => {
+describe('createFrameReader', () => {
     // helper: build a raw length-prefixed frame from a RoomMessage
     function buildFrame(msg: RoomMessage): Buffer {
         const payload = ipcCodec.pack(msg);
@@ -98,7 +98,7 @@ describe('FrameReader', () => {
 
     it('delivers a single complete frame', () => {
         const received: RoomMessage[] = [];
-        const reader = new FrameReader((msg) => received.push(msg));
+        const reader = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'ready', port: 3000 };
         reader.push(buildFrame(msg));
@@ -109,7 +109,7 @@ describe('FrameReader', () => {
 
     it('delivers multiple frames from a single chunk', () => {
         const received: RoomMessage[] = [];
-        const reader = new FrameReader((msg) => received.push(msg));
+        const reader = createFrameReader((msg) => received.push(msg));
 
         const msgs: RoomMessage[] = [
             { type: 'ready', port: 3000 },
@@ -128,7 +128,7 @@ describe('FrameReader', () => {
 
     it('handles partial frames across multiple pushes', () => {
         const received: RoomMessage[] = [];
-        const reader = new FrameReader((msg) => received.push(msg));
+        const reader = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'client-connected', clientId: 'test-user-123' };
         const frame = buildFrame(msg);
@@ -145,7 +145,7 @@ describe('FrameReader', () => {
 
     it('handles byte-at-a-time delivery', () => {
         const received: RoomMessage[] = [];
-        const reader = new FrameReader((msg) => received.push(msg));
+        const reader = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'stopped' };
         const frame = buildFrame(msg);
@@ -160,7 +160,7 @@ describe('FrameReader', () => {
 
     it('handles split across header boundary', () => {
         const received: RoomMessage[] = [];
-        const reader = new FrameReader((msg) => received.push(msg));
+        const reader = createFrameReader((msg) => received.push(msg));
 
         const msg: RoomMessage = { type: 'error', message: 'uh oh' };
         const frame = buildFrame(msg);
@@ -176,7 +176,7 @@ describe('FrameReader', () => {
 
     it('interleaves partial and complete frames', () => {
         const received: RoomMessage[] = [];
-        const reader = new FrameReader((msg) => received.push(msg));
+        const reader = createFrameReader((msg) => received.push(msg));
 
         const msg1: RoomMessage = { type: 'ready', port: 9000 };
         const msg2: RoomMessage = { type: 'client-disconnected', clientId: 'x' };

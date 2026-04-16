@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname } from 'node:path';
-import { FrameReader, type RoomMessage, type UdsConnection } from '../../common/uds';
+import { createFrameReader, type RoomMessage, type UdsConnection } from '../../common/uds';
 
 export function listenOnSocket(
     socketPath: string,
@@ -38,10 +38,10 @@ export function listenOnSocket(
 
             server.close();
 
-            const reader = new FrameReader(onMessage);
+            const push = createFrameReader(onMessage);
             const onClose = options?.onClose;
 
-            socket.on('data', (chunk) => reader.push(chunk));
+            socket.on('data', (chunk) => push(chunk));
             socket.on('close', () => onClose?.());
 
             resolve({
