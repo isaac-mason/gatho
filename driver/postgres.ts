@@ -84,399 +84,413 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
         };
     }
 
-    const driver: Driver = {
-        _internal: {
-            // room lifecycle
+    async function registerRoom(
+        roomId: string,
+        roomType: string,
+        serverId: string,
+        data: RoomData,
+        tags: Record<string, string>,
+    ): Promise<void> {
+        validateTags(tags);
 
-            async registerRoom(
-                roomId: string,
-                roomType: string,
-                serverId: string,
-                data: RoomData,
-                tags: Record<string, string>,
-            ): Promise<void> {
-                validateTags(tags);
+        // verify server exists
+        const servers = await db`
+            select 1 from ${db.unsafe(t.servers)} where server_id = ${serverId} limit 1
+        `;
+        if (servers.length === 0) throw new ServerNotFoundError(serverId);
 
-                // verify server exists
-                const servers = await db`
-                select 1 from ${db.unsafe(t.servers)} where server_id = ${serverId} limit 1
-            `;
-                if (servers.length === 0) throw new ServerNotFoundError(serverId);
+        const now = Date.now();
+        await db`
+            insert into ${db.unsafe(t.rooms)} (room_id, room_type, server_id, status, data, tags, created_at)
+            values (${roomId}, ${roomType}, ${serverId}, 'requested', ${JSON.stringify(data)}::jsonb, ${JSON.stringify(tags)}::jsonb, ${now})
+        `;
 
-                const now = Date.now();
-                await db`
-                insert into ${db.unsafe(t.rooms)} (room_id, room_type, server_id, status, data, tags, created_at)
-                values (${roomId}, ${roomType}, ${serverId}, 'requested', ${JSON.stringify(data)}::jsonb, ${JSON.stringify(tags)}::jsonb, ${now})
-            `;
+        // notify the server immediately — no waiting for reconciler poll.
+        // note: pg_notify payloads are limited to ~8000 bytes. RoomData
+        // should stay small (it's Record<string, string|number|boolean>).
+        // if the payload exceeds the limit, pg will throw and the sdk-side
+        // waitForRoom timeout + retry handles the missed notification.
+        const payload = JSON.stringify({ roomId, roomType, data });
+        await db`select pg_notify(${t.schema + ':room-assigned:' + serverId}, ${payload})`;
+    }
 
-                // notify the server immediately — no waiting for reconciler poll.
-                // note: pg_notify payloads are limited to ~8000 bytes. RoomData
-                // should stay small (it's Record<string, string|number|boolean>).
-                // if the payload exceeds the limit, pg will throw and the sdk-side
-                // waitForRoom timeout + retry handles the missed notification.
-                const payload = JSON.stringify({ roomId, roomType, data });
-                await db`select pg_notify(${t.schema + ':room-assigned:' + serverId}, ${payload})`;
-            },
+    async function unregisterRoom(roomId: string): Promise<void> {
+        // cascade deletes clients via FK
+        await db`delete from ${db.unsafe(t.rooms)} where room_id = ${roomId}`;
+    }
 
-            async unregisterRoom(roomId: string): Promise<void> {
-                // cascade deletes clients via FK
-                await db`delete from ${db.unsafe(t.rooms)} where room_id = ${roomId}`;
-            },
+    async function roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<void> {
+        await db`
+            update ${db.unsafe(t.rooms)}
+            set status = 'running', endpoint = ${endpoint}, room_secret = ${roomSecret}
+            where room_id = ${roomId}
+        `;
+        // notify waiters via NOTIFY
+        await db`select pg_notify(${t.schema + ':room-ready:' + roomId}, ${roomId})`;
+    }
 
-            async roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<void> {
-                await db`
-                update ${db.unsafe(t.rooms)}
-                set status = 'running', endpoint = ${endpoint}, room_secret = ${roomSecret}
-                where room_id = ${roomId}
-            `;
-                // notify waiters via NOTIFY
-                await db`select pg_notify(${t.schema + ':room-ready:' + roomId}, ${roomId})`;
-            },
+    async function roomFailure(roomId: string, _reason: string): Promise<void> {
+        await unregisterRoom(roomId);
+    }
 
-            async roomFailure(roomId: string, _reason: string): Promise<void> {
-                await driver._internal.unregisterRoom(roomId);
-            },
+    async function waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo> {
+        // check if already running
+        const existing = await getRoomInfo(roomId);
+        if (existing && existing.status === 'running') return existing;
 
-            async waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo> {
-                // check if already running
-                const existing = await driver._internal.getRoomInfo(roomId);
-                if (existing && existing.status === 'running') return existing;
+        return new Promise<RoomInfo>((resolve, reject) => {
+            let settled = false;
+            const channel = t.schema + ':room-ready:' + roomId;
 
-                return new Promise<RoomInfo>((resolve, reject) => {
-                    let settled = false;
-                    const channel = t.schema + ':room-ready:' + roomId;
+            const cleanup = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                // unlisten is fire-and-forget
+                listenHandle.then((h) => h.unlisten()).catch(() => {});
+            };
 
-                    const cleanup = () => {
-                        if (settled) return;
-                        settled = true;
-                        clearTimeout(timer);
-                        // unlisten is fire-and-forget
-                        listenHandle.then((h) => h.unlisten()).catch(() => {});
-                    };
+            const timer = setTimeout(() => {
+                cleanup();
+                reject(new RoomTimeoutError(roomId, timeoutMs));
+            }, timeoutMs);
 
-                    const timer = setTimeout(() => {
-                        cleanup();
-                        reject(new RoomTimeoutError(roomId, timeoutMs));
-                    }, timeoutMs);
+            const listenHandle = db.listen(channel, (_payload) => {
+                cleanup();
+                getRoomInfo(roomId)
+                    .then((info) => {
+                        if (info) {
+                            resolve(info);
+                        } else {
+                            reject(new RoomStartError(roomId));
+                        }
+                    })
+                    .catch(reject);
+            });
 
-                    const listenHandle = db.listen(channel, (_payload) => {
-                        cleanup();
-                        driver._internal
-                            .getRoomInfo(roomId)
-                            .then((info) => {
-                                if (info) {
-                                    resolve(info);
-                                } else {
-                                    reject(new RoomStartError(roomId));
-                                }
-                            })
-                            .catch(reject);
-                    });
+            // handle listen errors
+            listenHandle.catch((err) => {
+                cleanup();
+                reject(err);
+            });
 
-                    // handle listen errors
-                    listenHandle.catch((err) => {
-                        cleanup();
-                        reject(err);
-                    });
-
-                    // re-check after subscribing in case we missed it
-                    listenHandle
-                        .then(() => {
-                            if (settled) return;
-                            driver._internal
-                                .getRoomInfo(roomId)
-                                .then((info) => {
-                                    if (info && info.status === 'running' && !settled) {
-                                        cleanup();
-                                        resolve(info);
-                                    }
-                                })
-                                .catch(() => {});
+            // re-check after subscribing in case we missed it
+            listenHandle
+                .then(() => {
+                    if (settled) return;
+                    getRoomInfo(roomId)
+                        .then((info) => {
+                            if (info && info.status === 'running' && !settled) {
+                                cleanup();
+                                resolve(info);
+                            }
                         })
                         .catch(() => {});
-                });
-            },
+                })
+                .catch(() => {});
+        });
+    }
 
-            async getRoomInfo(roomId: string): Promise<RoomInfo | null> {
-                const rows = await db<RoomRow[]>`
-                select room_id, room_type, server_id, status, endpoint, data, tags, created_at
-                from ${db.unsafe(t.rooms)} where room_id = ${roomId}
-            `;
-                if (rows.length === 0) return null;
-                return rowToRoomInfo(db, rows[0]);
-            },
+    async function getRoomInfo(roomId: string): Promise<RoomInfo | null> {
+        const rows = await db<RoomRow[]>`
+            select room_id, room_type, server_id, status, endpoint, data, tags, created_at
+            from ${db.unsafe(t.rooms)} where room_id = ${roomId}
+        `;
+        if (rows.length === 0) return null;
+        return rowToRoomInfo(db, rows[0]);
+    }
 
-            async listRooms(filter?: ListRoomsFilter): Promise<RoomInfo[]> {
-                // build dynamic WHERE conditions
-                const conditions: Fragment[] = [];
+    async function listRooms(filter?: ListRoomsFilter): Promise<RoomInfo[]> {
+        // build dynamic WHERE conditions
+        const conditions: Fragment[] = [];
 
-                if (filter?.type) {
-                    conditions.push(db`room_type = ${filter.type}`);
-                }
-                if (filter?.status) {
-                    conditions.push(db`status = ${filter.status}`);
-                }
-                if (filter?.serverId) {
-                    conditions.push(db`server_id = ${filter.serverId}`);
-                }
-                conditions.push(...buildTagFilters(db, filter?.tags, 'tags'));
+        if (filter?.type) {
+            conditions.push(db`room_type = ${filter.type}`);
+        }
+        if (filter?.status) {
+            conditions.push(db`status = ${filter.status}`);
+        }
+        if (filter?.serverId) {
+            conditions.push(db`server_id = ${filter.serverId}`);
+        }
+        conditions.push(...buildTagFilters(db, filter?.tags, 'tags'));
 
-                const where =
-                    conditions.length > 0
-                        ? db`where ${conditions.reduce((acc, cond, i) => (i === 0 ? cond : db`${acc} and ${cond}`))}`
-                        : db``;
+        const where =
+            conditions.length > 0
+                ? db`where ${conditions.reduce((acc, cond, i) => (i === 0 ? cond : db`${acc} and ${cond}`))}`
+                : db``;
 
-                const rows = await db<RoomRow[]>`
-                select room_id, room_type, server_id, status, endpoint, data, tags, created_at
-                from ${db.unsafe(t.rooms)} ${where}
-            `;
+        const rows = await db<RoomRow[]>`
+            select room_id, room_type, server_id, status, endpoint, data, tags, created_at
+            from ${db.unsafe(t.rooms)} ${where}
+        `;
 
-                return Promise.all(rows.map((r) => rowToRoomInfo(db, r)));
-            },
+        return Promise.all(rows.map((r) => rowToRoomInfo(db, r)));
+    }
 
-            async addRoomTags(roomId: string, tags: Record<string, string>): Promise<void> {
-                validateTags(tags);
+    async function addRoomTags(roomId: string, tags: Record<string, string>): Promise<void> {
+        validateTags(tags);
 
-                // jsonb || jsonb merges, with right side winning on conflicts
-                const result = await db`
-                update ${db.unsafe(t.rooms)}
-                set tags = tags || ${JSON.stringify(tags)}::jsonb
-                where room_id = ${roomId}
-            `;
-                if (result.count === 0) throw new RoomNotFoundError(roomId);
-            },
+        // jsonb || jsonb merges, with right side winning on conflicts
+        const result = await db`
+            update ${db.unsafe(t.rooms)}
+            set tags = tags || ${JSON.stringify(tags)}::jsonb
+            where room_id = ${roomId}
+        `;
+        if (result.count === 0) throw new RoomNotFoundError(roomId);
+    }
 
-            async removeRoomTags(roomId: string, tagKeys: string[]): Promise<void> {
-                if (tagKeys.length === 0) return;
+    async function removeRoomTags(roomId: string, tagKeys: string[]): Promise<void> {
+        if (tagKeys.length === 0) return;
 
-                // remove multiple keys from jsonb in a single statement
-                const result = await db`
-                update ${db.unsafe(t.rooms)}
-                set tags = tags - ${db.array(tagKeys)}::text[]
-                where room_id = ${roomId}
-            `;
-                if (result.count === 0) throw new RoomNotFoundError(roomId);
-            },
+        // remove multiple keys from jsonb in a single statement
+        const result = await db`
+            update ${db.unsafe(t.rooms)}
+            set tags = tags - ${db.array(tagKeys)}::text[]
+            where room_id = ${roomId}
+        `;
+        if (result.count === 0) throw new RoomNotFoundError(roomId);
+    }
 
-            async getDesiredState(serverId: string): Promise<DesiredRoom[]> {
-                const rows = await db`
-                select room_id, room_type, data
-                from ${db.unsafe(t.rooms)} where server_id = ${serverId}
-            `;
-                return rows.map((r) => ({
-                    roomId: r.room_id as string,
-                    roomType: r.room_type as string,
-                    data: r.data as RoomData,
-                }));
-            },
+    async function getDesiredState(serverId: string): Promise<DesiredRoom[]> {
+        const rows = await db`
+            select room_id, room_type, data
+            from ${db.unsafe(t.rooms)} where server_id = ${serverId}
+        `;
+        return rows.map((r) => ({
+            roomId: r.room_id as string,
+            roomType: r.room_type as string,
+            data: r.data as RoomData,
+        }));
+    }
 
-            // client lifecycle
+    async function reserveClient(
+        roomId: string,
+        ttl: number,
+        data?: Record<string, unknown>,
+        tags?: Record<string, string>,
+    ): Promise<ClientReservation> {
+        const rooms = await db<{ room_id: string; status: string; room_secret: string | null; endpoint: string | null }[]>`
+            select room_id, status, room_secret, endpoint
+            from ${db.unsafe(t.rooms)} where room_id = ${roomId}
+        `;
+        if (rooms.length === 0) throw new RoomNotFoundError(roomId);
+        const room = rooms[0];
+        if (room.status !== 'running' || !room.room_secret || !room.endpoint) throw new RoomNotRunningError(roomId);
 
-            async reserveClient(
-                roomId: string,
-                ttl: number,
-                data?: Record<string, unknown>,
-                tags?: Record<string, string>,
-            ): Promise<ClientReservation> {
-                const rooms = await db<
-                    { room_id: string; status: string; room_secret: string | null; endpoint: string | null }[]
-                >`
-                select room_id, status, room_secret, endpoint
-                from ${db.unsafe(t.rooms)} where room_id = ${roomId}
-            `;
-                if (rooms.length === 0) throw new RoomNotFoundError(roomId);
-                const room = rooms[0];
-                if (room.status !== 'running' || !room.room_secret || !room.endpoint) throw new RoomNotRunningError(roomId);
+        const clientTags = tags ?? {};
+        validateTags(clientTags);
 
-                const clientTags = tags ?? {};
-                validateTags(clientTags);
+        const clientId = crypto.randomUUID();
+        const expiresAt = Date.now() + ttl;
 
-                const clientId = crypto.randomUUID();
-                const expiresAt = Date.now() + ttl;
+        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, room.room_secret);
 
-                const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, room.room_secret);
+        await db`
+            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
+            values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)})
+        `;
 
-                await db`
-                insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
-                values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)})
-            `;
+        const url = new URL(room.endpoint);
+        url.searchParams.set('token', token);
 
-                const url = new URL(room.endpoint);
-                url.searchParams.set('token', token);
+        return { clientId, url: url.toString(), roomId, expiresAt };
+    }
 
-                return { clientId, url: url.toString(), roomId, expiresAt };
-            },
+    async function connectClient(clientId: string): Promise<void> {
+        await db`
+            update ${db.unsafe(t.clients)}
+            set status = 'connected', expires_at = 0
+            where client_id = ${clientId}
+        `;
+    }
 
-            async connectClient(clientId: string): Promise<void> {
-                await db`
-                update ${db.unsafe(t.clients)}
-                set status = 'connected', expires_at = 0
-                where client_id = ${clientId}
-            `;
-            },
+    async function disconnectClient(clientId: string): Promise<void> {
+        await db`delete from ${db.unsafe(t.clients)} where client_id = ${clientId}`;
+    }
 
-            async disconnectClient(clientId: string): Promise<void> {
-                await db`delete from ${db.unsafe(t.clients)} where client_id = ${clientId}`;
-            },
+    async function registerServer(opts: RegisterServerOptions): Promise<void> {
+        validateTags(opts.tags);
 
-            // server registry
+        // evict any existing server with the same endpoint (stale from previous run)
+        await db`
+            delete from ${db.unsafe(t.servers)}
+            where endpoint = ${opts.endpoint} and server_id != ${opts.serverId}
+        `;
 
-            async registerServer(opts: RegisterServerOptions): Promise<void> {
-                validateTags(opts.tags);
+        const now = Date.now();
+        await db`
+            insert into ${db.unsafe(t.servers)} (server_id, endpoint, tags, room_types, last_heartbeat)
+            values (${opts.serverId}, ${opts.endpoint}, ${JSON.stringify(opts.tags)}::jsonb, ${opts.roomTypes}, ${now})
+            on conflict (server_id) do update set
+                endpoint = excluded.endpoint,
+                tags = excluded.tags,
+                room_types = excluded.room_types,
+                last_heartbeat = excluded.last_heartbeat
+        `;
+    }
 
-                // evict any existing server with the same endpoint (stale from previous run)
-                await db`
-                delete from ${db.unsafe(t.servers)}
-                where endpoint = ${opts.endpoint} and server_id != ${opts.serverId}
-            `;
+    async function heartbeat(serverId: string): Promise<void> {
+        const now = Date.now();
+        await db`
+            update ${db.unsafe(t.servers)} set last_heartbeat = ${now}
+            where server_id = ${serverId}
+        `;
+    }
 
-                const now = Date.now();
-                await db`
-                insert into ${db.unsafe(t.servers)} (server_id, endpoint, tags, room_types, last_heartbeat)
-                values (${opts.serverId}, ${opts.endpoint}, ${JSON.stringify(opts.tags)}::jsonb, ${opts.roomTypes}, ${now})
-                on conflict (server_id) do update set
-                    endpoint = excluded.endpoint,
-                    tags = excluded.tags,
-                    room_types = excluded.room_types,
-                    last_heartbeat = excluded.last_heartbeat
-            `;
-            },
+    async function unregisterServer(serverId: string): Promise<void> {
+        // cascade deletes rooms -> clients via FK
+        await db`delete from ${db.unsafe(t.servers)} where server_id = ${serverId}`;
+    }
 
-            async heartbeat(serverId: string): Promise<void> {
-                const now = Date.now();
-                await db`
-                update ${db.unsafe(t.servers)} set last_heartbeat = ${now}
-                where server_id = ${serverId}
-            `;
-            },
+    async function addServerTags(serverId: string, tags: Record<string, string>): Promise<void> {
+        validateTags(tags);
 
-            async unregisterServer(serverId: string): Promise<void> {
-                // cascade deletes rooms -> clients via FK
-                await db`delete from ${db.unsafe(t.servers)} where server_id = ${serverId}`;
-            },
+        const result = await db`
+            update ${db.unsafe(t.servers)}
+            set tags = tags || ${JSON.stringify(tags)}::jsonb
+            where server_id = ${serverId}
+        `;
+        if (result.count === 0) throw new ServerNotFoundError(serverId);
+    }
 
-            async addServerTags(serverId: string, tags: Record<string, string>): Promise<void> {
-                validateTags(tags);
+    async function removeServerTags(serverId: string, tagKeys: string[]): Promise<void> {
+        if (tagKeys.length === 0) return;
 
-                const result = await db`
-                update ${db.unsafe(t.servers)}
-                set tags = tags || ${JSON.stringify(tags)}::jsonb
-                where server_id = ${serverId}
-            `;
-                if (result.count === 0) throw new ServerNotFoundError(serverId);
-            },
+        const result = await db`
+            update ${db.unsafe(t.servers)}
+            set tags = tags - ${db.array(tagKeys)}::text[]
+            where server_id = ${serverId}
+        `;
+        if (result.count === 0) throw new ServerNotFoundError(serverId);
+    }
 
-            async removeServerTags(serverId: string, tagKeys: string[]): Promise<void> {
-                if (tagKeys.length === 0) return;
+    async function listServers(filter?: ListServersFilter): Promise<ServerInfo[]> {
+        const cutoff = Date.now() - STALE_MS;
 
-                const result = await db`
-                update ${db.unsafe(t.servers)}
-                set tags = tags - ${db.array(tagKeys)}::text[]
-                where server_id = ${serverId}
-            `;
-                if (result.count === 0) throw new ServerNotFoundError(serverId);
-            },
+        const conditions: Fragment[] = [db`last_heartbeat >= ${cutoff}`];
 
-            async listServers(filter?: ListServersFilter): Promise<ServerInfo[]> {
-                const cutoff = Date.now() - STALE_MS;
+        if (filter?.roomTypes) {
+            // server must support ALL specified room types
+            // text[] @> ARRAY[...] checks containment
+            conditions.push(db`room_types @> ${filter.roomTypes}`);
+        }
+        conditions.push(...buildTagFilters(db, filter?.tags, 'tags'));
 
-                const conditions: Fragment[] = [db`last_heartbeat >= ${cutoff}`];
+        const where = db`where ${conditions.reduce((acc, cond, i) => (i === 0 ? cond : db`${acc} and ${cond}`))}`;
 
-                if (filter?.roomTypes) {
-                    // server must support ALL specified room types
-                    // text[] @> ARRAY[...] checks containment
-                    conditions.push(db`room_types @> ${filter.roomTypes}`);
-                }
-                conditions.push(...buildTagFilters(db, filter?.tags, 'tags'));
+        const rows = await db<ServerRow[]>`
+            select server_id, endpoint, last_heartbeat, tags, room_types
+            from ${db.unsafe(t.servers)} ${where}
+        `;
 
-                const where = db`where ${conditions.reduce((acc, cond, i) => (i === 0 ? cond : db`${acc} and ${cond}`))}`;
+        return Promise.all(rows.map((r) => rowToServerInfo(db, r)));
+    }
 
-                const rows = await db<ServerRow[]>`
-                select server_id, endpoint, last_heartbeat, tags, room_types
-                from ${db.unsafe(t.servers)} ${where}
-            `;
+    async function listStaleServers(): Promise<ServerInfo[]> {
+        const cutoff = Date.now() - STALE_MS;
+        const rows = await db<ServerRow[]>`
+            select server_id, endpoint, last_heartbeat, tags, room_types
+            from ${db.unsafe(t.servers)} where last_heartbeat < ${cutoff}
+        `;
+        return Promise.all(rows.map((r) => rowToServerInfo(db, r)));
+    }
 
-                return Promise.all(rows.map((r) => rowToServerInfo(db, r)));
-            },
+    async function getServer(serverId: string): Promise<ServerInfo | null> {
+        const rows = await db<ServerRow[]>`
+            select server_id, endpoint, last_heartbeat, tags, room_types
+            from ${db.unsafe(t.servers)} where server_id = ${serverId}
+        `;
+        if (rows.length === 0) return null;
+        return rowToServerInfo(db, rows[0]);
+    }
 
-            async listStaleServers(): Promise<ServerInfo[]> {
-                const cutoff = Date.now() - STALE_MS;
-                const rows = await db<ServerRow[]>`
-                select server_id, endpoint, last_heartbeat, tags, room_types
-                from ${db.unsafe(t.servers)} where last_heartbeat < ${cutoff}
-            `;
-                return Promise.all(rows.map((r) => rowToServerInfo(db, r)));
-            },
+    async function subscribeRoomAssignments(serverId: string, callback: (room: DesiredRoom) => void): Promise<() => void> {
+        const channel = t.schema + ':room-assigned:' + serverId;
+        const handle = await db.listen(channel, (payload) => {
+            let parsed: DesiredRoom;
+            try {
+                parsed = JSON.parse(payload) as DesiredRoom;
+            } catch {
+                console.error('[gatho] malformed room-assigned payload, discarding', { channel, payload });
+                return;
+            }
+            callback(parsed);
+        });
+        return () => {
+            handle.unlisten().catch(() => {});
+        };
+    }
 
-            async getServer(serverId: string): Promise<ServerInfo | null> {
-                const rows = await db<ServerRow[]>`
-                select server_id, endpoint, last_heartbeat, tags, room_types
-                from ${db.unsafe(t.servers)} where server_id = ${serverId}
-            `;
-                if (rows.length === 0) return null;
-                return rowToServerInfo(db, rows[0]);
-            },
+    // leader election — row-level lock in the leader table.
+    // tryAcquireLeader inserts if empty or takes over if expired.
+    // renewLeader extends the lock if we still own it.
+    // releaseLeader deletes our row.
 
-            async subscribeRoomAssignments(serverId: string, callback: (room: DesiredRoom) => void): Promise<() => void> {
-                const channel = t.schema + ':room-assigned:' + serverId;
-                const handle = await db.listen(channel, (payload) => {
-                    let parsed: DesiredRoom;
-                    try {
-                        parsed = JSON.parse(payload) as DesiredRoom;
-                    } catch {
-                        console.error('[gatho] malformed room-assigned payload, discarding', { channel, payload });
-                        return;
-                    }
-                    callback(parsed);
-                });
-                return () => {
-                    handle.unlisten().catch(() => {});
-                };
-            },
+    async function tryAcquireLeader(serverId: string): Promise<boolean> {
+        const now = Date.now();
 
-            // leader election — row-level lock in the leader table.
-            // tryAcquireLeader inserts if empty or takes over if expired.
-            // renewLeader extends the lock if we still own it.
-            // releaseLeader deletes our row.
+        // try to insert (empty table) or take over expired lock.
+        // the ON CONFLICT WHERE clause references the existing row via
+        // the schema-qualified table name for unambiguous column access.
+        const result = await db`
+            insert into ${db.unsafe(t.leader)} (id, server_id, renewed_at)
+            values (1, ${serverId}, ${now})
+            on conflict (id) do update set
+                server_id = ${serverId},
+                renewed_at = ${now}
+            where ${db.unsafe(t.leader)}.server_id = ${serverId}
+               or ${db.unsafe(t.leader)}.renewed_at < ${now - LEADER_LOCK_TTL_MS}
+        `;
+        return result.count > 0;
+    }
 
-            async tryAcquireLeader(serverId: string): Promise<boolean> {
-                const now = Date.now();
+    async function renewLeader(serverId: string): Promise<boolean> {
+        const now = Date.now();
+        const result = await db`
+            update ${db.unsafe(t.leader)}
+            set renewed_at = ${now}
+            where id = 1 and server_id = ${serverId}
+        `;
+        return result.count > 0;
+    }
 
-                // try to insert (empty table) or take over expired lock.
-                // the ON CONFLICT WHERE clause references the existing row via
-                // the schema-qualified table name for unambiguous column access.
-                const result = await db`
-                insert into ${db.unsafe(t.leader)} (id, server_id, renewed_at)
-                values (1, ${serverId}, ${now})
-                on conflict (id) do update set
-                    server_id = ${serverId},
-                    renewed_at = ${now}
-                where ${db.unsafe(t.leader)}.server_id = ${serverId}
-                   or ${db.unsafe(t.leader)}.renewed_at < ${now - LEADER_LOCK_TTL_MS}
-            `;
-                return result.count > 0;
-            },
+    async function releaseLeader(serverId: string): Promise<void> {
+        await db`
+            delete from ${db.unsafe(t.leader)}
+            where id = 1 and server_id = ${serverId}
+        `;
+    }
 
-            async renewLeader(serverId: string): Promise<boolean> {
-                const now = Date.now();
-                const result = await db`
-                update ${db.unsafe(t.leader)}
-                set renewed_at = ${now}
-                where id = 1 and server_id = ${serverId}
-            `;
-                return result.count > 0;
-            },
-
-            async releaseLeader(serverId: string): Promise<void> {
-                await db`
-                delete from ${db.unsafe(t.leader)}
-                where id = 1 and server_id = ${serverId}
-            `;
-            },
+    return {
+        _internal: {
+            registerRoom,
+            unregisterRoom,
+            roomReady,
+            roomFailure,
+            waitForRoom,
+            getRoomInfo,
+            listRooms,
+            addRoomTags,
+            removeRoomTags,
+            getDesiredState,
+            reserveClient,
+            connectClient,
+            disconnectClient,
+            registerServer,
+            heartbeat,
+            unregisterServer,
+            addServerTags,
+            removeServerTags,
+            listServers,
+            listStaleServers,
+            getServer,
+            subscribeRoomAssignments,
+            tryAcquireLeader,
+            renewLeader,
+            releaseLeader,
         },
     };
-
-    return driver;
 }
 
 // row shapes for typed queries

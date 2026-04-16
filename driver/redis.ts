@@ -172,468 +172,484 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         };
     }
 
-    const driver: Driver = {
-        _internal: {
-            // room lifecycle
+    async function registerRoom(
+        roomId: string,
+        roomType: string,
+        serverId: string,
+        data: RoomData,
+        tags: Record<string, string>,
+    ): Promise<void> {
+        validateTags(tags);
 
-            async registerRoom(
-                roomId: string,
-                roomType: string,
-                serverId: string,
-                data: RoomData,
-                tags: Record<string, string>,
-            ): Promise<void> {
-                validateTags(tags);
+        // verify server exists
+        const serverData = await client.hgetall(keys.server(serverId));
+        if (!serverData || !serverData.endpoint) {
+            throw new ServerNotFoundError(serverId);
+        }
 
-                // verify server exists
-                const serverData = await client.hgetall(keys.server(serverId));
-                if (!serverData || !serverData.endpoint) {
-                    throw new ServerNotFoundError(serverId);
-                }
+        const key = keys.room(roomId);
+        const now = Date.now();
 
-                const key = keys.room(roomId);
-                const now = Date.now();
+        await client.hset(key, {
+            roomId,
+            roomType,
+            serverId,
+            status: 'requested',
+            data: JSON.stringify(data),
+            tags: JSON.stringify(tags),
+            createdAt: String(now),
+        });
 
-                await client.hset(key, {
-                    roomId,
-                    roomType,
-                    serverId,
-                    status: 'requested',
-                    data: JSON.stringify(data),
-                    tags: JSON.stringify(tags),
-                    createdAt: String(now),
-                });
+        // auto-expire the room hash if the worker never becomes ready
+        await client.pexpire(key, REQUESTED_ROOM_TTL_MS);
 
-                // auto-expire the room hash if the worker never becomes ready
-                await client.pexpire(key, REQUESTED_ROOM_TTL_MS);
+        await client.sadd(keys.rooms, roomId);
+        await client.sadd(keys.roomsByServerId(serverId), roomId);
 
-                await client.sadd(keys.rooms, roomId);
-                await client.sadd(keys.roomsByServerId(serverId), roomId);
+        // notify the server immediately — no waiting for reconciler poll
+        await client.publish(keys.roomAssigned(serverId), JSON.stringify({ roomId, roomType, data }));
+    }
 
-                // notify the server immediately — no waiting for reconciler poll
-                await client.publish(keys.roomAssigned(serverId), JSON.stringify({ roomId, roomType, data }));
-            },
+    async function unregisterRoom(roomId: string): Promise<void> {
+        const data = await client.hgetall(keys.room(roomId));
+        if (data.serverId) {
+            await client.srem(keys.roomsByServerId(data.serverId), roomId);
+        }
 
-            async unregisterRoom(roomId: string): Promise<void> {
-                const data = await client.hgetall(keys.room(roomId));
-                if (data.serverId) {
-                    await client.srem(keys.roomsByServerId(data.serverId), roomId);
-                }
+        // clean up all clients for this room
+        const clientIds = await client.smembers(keys.clientsByRoom(roomId));
+        for (const clientId of clientIds) {
+            await client.del(keys.client(clientId));
+        }
+        await client.del(keys.clientsByRoom(roomId));
 
-                // clean up all clients for this room
-                const clientIds = await client.smembers(keys.clientsByRoom(roomId));
-                for (const clientId of clientIds) {
-                    await client.del(keys.client(clientId));
-                }
-                await client.del(keys.clientsByRoom(roomId));
+        await client.del(keys.room(roomId));
+        await client.srem(keys.rooms, roomId);
+    }
 
-                await client.del(keys.room(roomId));
-                await client.srem(keys.rooms, roomId);
-            },
+    async function roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<void> {
+        await client.hset(keys.room(roomId), {
+            status: 'running',
+            endpoint,
+            roomSecret,
+        });
+        // remove ttl — running rooms persist until explicitly unregistered
+        await client.persist(keys.room(roomId));
+        // notify waiters via pub/sub
+        await client.publish(keys.roomReady(roomId), roomId);
+    }
 
-            async roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<void> {
-                await client.hset(keys.room(roomId), {
-                    status: 'running',
-                    endpoint,
-                    roomSecret,
-                });
-                // remove ttl — running rooms persist until explicitly unregistered
-                await client.persist(keys.room(roomId));
-                // notify waiters via pub/sub
-                await client.publish(keys.roomReady(roomId), roomId);
-            },
+    async function roomFailure(roomId: string, _reason: string): Promise<void> {
+        await unregisterRoom(roomId);
+    }
 
-            async roomFailure(roomId: string, _reason: string): Promise<void> {
-                await driver._internal.unregisterRoom(roomId);
-            },
+    async function waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo> {
+        // check if already running before subscribing
+        const existing = await getRoomInfo(roomId);
+        if (existing && existing.status === 'running') return existing;
 
-            async waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo> {
-                // check if already running before subscribing
-                const existing = await driver._internal.getRoomInfo(roomId);
-                if (existing && existing.status === 'running') return existing;
+        const channel = keys.roomReady(roomId);
 
-                const channel = keys.roomReady(roomId);
+        return new Promise<RoomInfo>((resolve, reject) => {
+            let settled = false;
+            let unsub: (() => void) | null = null;
 
-                return new Promise<RoomInfo>((resolve, reject) => {
-                    let settled = false;
-                    let unsub: (() => void) | null = null;
+            const cleanup = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (unsub) unsub();
+            };
 
-                    const cleanup = () => {
-                        if (settled) return;
-                        settled = true;
-                        clearTimeout(timer);
-                        if (unsub) unsub();
-                    };
+            const timer = setTimeout(() => {
+                cleanup();
+                reject(new RoomTimeoutError(roomId, timeoutMs));
+            }, timeoutMs);
 
-                    const timer = setTimeout(() => {
-                        cleanup();
-                        reject(new RoomTimeoutError(roomId, timeoutMs));
-                    }, timeoutMs);
-
-                    const listener = (_ch: string, _msg: string) => {
-                        cleanup();
-                        // fetch full room info
-                        driver._internal
-                            .getRoomInfo(roomId)
-                            .then((info) => {
-                                if (info) {
-                                    resolve(info);
-                                } else {
-                                    reject(new RoomStartError(roomId));
-                                }
-                            })
-                            .catch(reject);
-                    };
-
-                    subscribeChannel(channel, listener)
-                        .then((unsubFn) => {
-                            unsub = unsubFn;
-
-                            // if we settled while awaiting subscribe (timeout fired), clean up
-                            if (settled) {
-                                unsubFn();
-                                return;
-                            }
-
-                            // re-check after subscribing — the room might have become
-                            // ready between our initial check and the subscribe completing
-                            driver._internal
-                                .getRoomInfo(roomId)
-                                .then((info) => {
-                                    if (info && info.status === 'running' && !settled) {
-                                        cleanup();
-                                        resolve(info);
-                                    }
-                                })
-                                .catch(() => {});
-                        })
-                        .catch((err) => {
-                            cleanup();
-                            reject(err);
-                        });
-                });
-            },
-
-            async getRoomInfo(roomId: string): Promise<RoomInfo | null> {
-                const data = await client.hgetall(keys.room(roomId));
-                return hashToRoomInfo(data);
-            },
-
-            async listRooms(filter?: ListRoomsFilter): Promise<RoomInfo[]> {
-                const roomIds = await client.smembers(keys.rooms);
-                if (roomIds.length === 0) return [];
-
-                const rooms = await Promise.all(roomIds.map((roomId) => driver._internal.getRoomInfo(roomId)));
-                let result = rooms.filter((r): r is RoomInfo => r !== null);
-
-                if (filter?.type) {
-                    result = result.filter((r) => r.roomType === filter.type);
-                }
-                if (filter?.status) {
-                    result = result.filter((r) => r.status === filter.status);
-                }
-                if (filter?.serverId) {
-                    result = result.filter((r) => r.serverId === filter.serverId);
-                }
-                if (filter?.tags?.eq) {
-                    for (const [k, v] of Object.entries(filter.tags.eq)) {
-                        result = result.filter((r) => r.tags[k] === v);
-                    }
-                }
-                if (filter?.tags?.neq) {
-                    for (const [k, v] of Object.entries(filter.tags.neq)) {
-                        result = result.filter((r) => r.tags[k] !== v);
-                    }
-                }
-
-                return result;
-            },
-
-            async addRoomTags(roomId: string, tags: Record<string, string>): Promise<void> {
-                validateTags(tags);
-                const data = await client.hgetall(keys.room(roomId));
-                if (!data || !data.roomId) throw new RoomNotFoundError(roomId);
-                const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
-                const merged = { ...existing, ...tags };
-                await client.hset(keys.room(roomId), { tags: JSON.stringify(merged) });
-            },
-
-            async removeRoomTags(roomId: string, tagKeys: string[]): Promise<void> {
-                const data = await client.hgetall(keys.room(roomId));
-                if (!data || !data.roomId) throw new RoomNotFoundError(roomId);
-                const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
-                for (const key of tagKeys) {
-                    delete existing[key];
-                }
-                await client.hset(keys.room(roomId), { tags: JSON.stringify(existing) });
-            },
-
-            async getDesiredState(serverId: string): Promise<DesiredRoom[]> {
-                const roomIds = await client.smembers(keys.roomsByServerId(serverId));
-                if (roomIds.length === 0) return [];
-
-                const rooms = await Promise.all(
-                    roomIds.map(async (roomId) => {
-                        const data = await client.hgetall(keys.room(roomId));
-                        if (!data || !data.roomId) {
-                            // stale index entry
-                            await client.srem(keys.roomsByServerId(serverId), roomId);
-                            return null;
+            const listener = (_ch: string, _msg: string) => {
+                cleanup();
+                // fetch full room info
+                getRoomInfo(roomId)
+                    .then((info) => {
+                        if (info) {
+                            resolve(info);
+                        } else {
+                            reject(new RoomStartError(roomId));
                         }
-                        return {
-                            roomId: data.roomId,
-                            roomType: data.roomType,
-                            data: JSON.parse(data.data || '{}') as RoomData,
-                        };
-                    }),
-                );
+                    })
+                    .catch(reject);
+            };
 
-                return rooms.filter((r): r is DesiredRoom => r !== null);
-            },
+            subscribeChannel(channel, listener)
+                .then((unsubFn) => {
+                    unsub = unsubFn;
 
-            // unified client lifecycle
-
-            async reserveClient(
-                roomId: string,
-                ttl: number,
-                data?: Record<string, unknown>,
-                tags?: Record<string, string>,
-            ): Promise<ClientReservation> {
-                // look up room to get endpoint and roomSecret for jwt minting
-                const roomData = await client.hgetall(keys.room(roomId));
-                if (!roomData || !roomData.roomId) {
-                    throw new RoomNotFoundError(roomId);
-                }
-                if (roomData.status !== 'running' || !roomData.roomSecret || !roomData.endpoint) {
-                    throw new RoomNotRunningError(roomId);
-                }
-
-                const clientTags = tags ?? {};
-                validateTags(clientTags);
-
-                const clientId = crypto.randomUUID();
-                const expiresAt = Date.now() + ttl;
-
-                // mint jwt signed with the room's secret — room verifies locally, zero ipc
-                const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, roomData.roomSecret);
-
-                // store client record
-                await client.hset(keys.client(clientId), {
-                    clientId,
-                    roomId,
-                    status: 'reserved',
-                    expiresAt: String(expiresAt),
-                    tags: JSON.stringify(clientTags),
-                });
-
-                // set TTL on the client key — auto-expires if never connected
-                await client.pexpire(keys.client(clientId), ttl);
-
-                // add to room's client set
-                await client.sadd(keys.clientsByRoom(roomId), clientId);
-
-                return {
-                    clientId,
-                    url: (() => {
-                        const u = new URL(roomData.endpoint);
-                        u.searchParams.set('token', token);
-                        return u.toString();
-                    })(),
-                    roomId,
-                    expiresAt,
-                };
-            },
-
-            async connectClient(clientId: string): Promise<void> {
-                // update status to connected and remove TTL (connected clients persist until disconnect)
-                await client.hset(keys.client(clientId), {
-                    status: 'connected',
-                    expiresAt: '0',
-                });
-
-                // remove TTL — connected clients don't expire
-                await client.persist(keys.client(clientId));
-            },
-
-            async disconnectClient(clientId: string): Promise<void> {
-                const clientData = await client.hgetall(keys.client(clientId));
-                if (clientData.roomId) {
-                    await client.srem(keys.clientsByRoom(clientData.roomId), clientId);
-                }
-                await client.del(keys.client(clientId));
-            },
-
-            // server registry
-
-            async registerServer(options: RegisterServerOptions): Promise<void> {
-                validateTags(options.tags);
-
-                // ensure redis data matches our schema — flushes all prefixed keys on mismatch
-                await ensureSchemaVersion();
-
-                await client.hset(keys.server(options.serverId), {
-                    serverId: options.serverId,
-                    endpoint: options.endpoint,
-                    tags: JSON.stringify(options.tags),
-                    roomTypes: JSON.stringify(options.roomTypes),
-                    lastHeartbeat: String(Date.now()),
-                });
-
-                await client.sadd(keys.servers, options.serverId);
-            },
-
-            async heartbeat(serverId: string): Promise<void> {
-                await client.hset(keys.server(serverId), {
-                    lastHeartbeat: String(Date.now()),
-                });
-            },
-
-            async unregisterServer(serverId: string): Promise<void> {
-                // clean up all rooms owned by this server
-                const roomIds = await client.smembers(keys.roomsByServerId(serverId));
-                for (const roomId of roomIds) {
-                    await driver._internal.unregisterRoom(roomId);
-                }
-                await client.del(keys.roomsByServerId(serverId));
-
-                await client.del(keys.server(serverId));
-                await client.srem(keys.servers, serverId);
-            },
-
-            async addServerTags(serverId: string, tags: Record<string, string>): Promise<void> {
-                validateTags(tags);
-                const data = await client.hgetall(keys.server(serverId));
-                if (!data || !data.serverId) throw new ServerNotFoundError(serverId);
-                const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
-                const merged = { ...existing, ...tags };
-                await client.hset(keys.server(serverId), { tags: JSON.stringify(merged) });
-            },
-
-            async removeServerTags(serverId: string, tagKeys: string[]): Promise<void> {
-                const data = await client.hgetall(keys.server(serverId));
-                if (!data || !data.serverId) throw new ServerNotFoundError(serverId);
-                const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
-                for (const key of tagKeys) {
-                    delete existing[key];
-                }
-                await client.hset(keys.server(serverId), { tags: JSON.stringify(existing) });
-            },
-
-            async listServers(filter?: ListServersFilter): Promise<ServerInfo[]> {
-                const cutoff = Date.now() - STALE_MS;
-                const serverIds = await client.smembers(keys.servers);
-                if (serverIds.length === 0) return [];
-
-                const servers = await Promise.all(
-                    serverIds.map(async (serverId) => {
-                        const data = await client.hgetall(keys.server(serverId));
-                        if (!data || !data.serverId) {
-                            await client.srem(keys.servers, serverId);
-                            return null;
-                        }
-
-                        const lastHeartbeat = Number(data.lastHeartbeat);
-                        if (lastHeartbeat < cutoff) return null;
-
-                        return hashToServerInfo(data);
-                    }),
-                );
-
-                let result = servers.filter((s): s is ServerInfo => s !== null);
-
-                if (filter?.roomTypes) {
-                    const required = filter.roomTypes;
-                    result = result.filter((s) => required.every((rt) => s.roomTypes.includes(rt)));
-                }
-                if (filter?.tags?.eq) {
-                    for (const [k, v] of Object.entries(filter.tags.eq)) {
-                        result = result.filter((s) => s.tags[k] === v);
-                    }
-                }
-                if (filter?.tags?.neq) {
-                    for (const [k, v] of Object.entries(filter.tags.neq)) {
-                        result = result.filter((s) => s.tags[k] !== v);
-                    }
-                }
-
-                return result;
-            },
-
-            async listStaleServers(): Promise<ServerInfo[]> {
-                const cutoff = Date.now() - STALE_MS;
-                const serverIds = await client.smembers(keys.servers);
-                if (serverIds.length === 0) return [];
-
-                const servers = await Promise.all(
-                    serverIds.map(async (serverId) => {
-                        const data = await client.hgetall(keys.server(serverId));
-                        if (!data || !data.serverId) {
-                            await client.srem(keys.servers, serverId);
-                            return null;
-                        }
-
-                        const lastHeartbeat = Number(data.lastHeartbeat);
-                        // only include servers whose heartbeat IS older than cutoff
-                        if (lastHeartbeat >= cutoff) return null;
-
-                        return hashToServerInfo(data);
-                    }),
-                );
-
-                return servers.filter((s): s is ServerInfo => s !== null);
-            },
-
-            async getServer(serverId: string): Promise<ServerInfo | null> {
-                const data = await client.hgetall(keys.server(serverId));
-                return hashToServerInfo(data);
-            },
-
-            async subscribeRoomAssignments(serverId: string, callback: (room: DesiredRoom) => void): Promise<() => void> {
-                const channel = keys.roomAssigned(serverId);
-                const listener = (_ch: string, msg: string) => {
-                    let parsed: DesiredRoom;
-                    try {
-                        parsed = JSON.parse(msg) as DesiredRoom;
-                    } catch {
-                        console.error('[gatho] malformed room-assigned message, discarding', { channel, msg });
+                    // if we settled while awaiting subscribe (timeout fired), clean up
+                    if (settled) {
+                        unsubFn();
                         return;
                     }
-                    callback(parsed);
+
+                    // re-check after subscribing — the room might have become
+                    // ready between our initial check and the subscribe completing
+                    getRoomInfo(roomId)
+                        .then((info) => {
+                            if (info && info.status === 'running' && !settled) {
+                                cleanup();
+                                resolve(info);
+                            }
+                        })
+                        .catch(() => {});
+                })
+                .catch((err) => {
+                    cleanup();
+                    reject(err);
+                });
+        });
+    }
+
+    async function getRoomInfo(roomId: string): Promise<RoomInfo | null> {
+        const data = await client.hgetall(keys.room(roomId));
+        return hashToRoomInfo(data);
+    }
+
+    async function listRooms(filter?: ListRoomsFilter): Promise<RoomInfo[]> {
+        const roomIds = await client.smembers(keys.rooms);
+        if (roomIds.length === 0) return [];
+
+        const rooms = await Promise.all(roomIds.map((roomId) => getRoomInfo(roomId)));
+        let result = rooms.filter((r): r is RoomInfo => r !== null);
+
+        if (filter?.type) {
+            result = result.filter((r) => r.roomType === filter.type);
+        }
+        if (filter?.status) {
+            result = result.filter((r) => r.status === filter.status);
+        }
+        if (filter?.serverId) {
+            result = result.filter((r) => r.serverId === filter.serverId);
+        }
+        if (filter?.tags?.eq) {
+            for (const [k, v] of Object.entries(filter.tags.eq)) {
+                result = result.filter((r) => r.tags[k] === v);
+            }
+        }
+        if (filter?.tags?.neq) {
+            for (const [k, v] of Object.entries(filter.tags.neq)) {
+                result = result.filter((r) => r.tags[k] !== v);
+            }
+        }
+
+        return result;
+    }
+
+    async function addRoomTags(roomId: string, tags: Record<string, string>): Promise<void> {
+        validateTags(tags);
+        const data = await client.hgetall(keys.room(roomId));
+        if (!data || !data.roomId) throw new RoomNotFoundError(roomId);
+        const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
+        const merged = { ...existing, ...tags };
+        await client.hset(keys.room(roomId), { tags: JSON.stringify(merged) });
+    }
+
+    async function removeRoomTags(roomId: string, tagKeys: string[]): Promise<void> {
+        const data = await client.hgetall(keys.room(roomId));
+        if (!data || !data.roomId) throw new RoomNotFoundError(roomId);
+        const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
+        for (const key of tagKeys) {
+            delete existing[key];
+        }
+        await client.hset(keys.room(roomId), { tags: JSON.stringify(existing) });
+    }
+
+    async function getDesiredState(serverId: string): Promise<DesiredRoom[]> {
+        const roomIds = await client.smembers(keys.roomsByServerId(serverId));
+        if (roomIds.length === 0) return [];
+
+        const rooms = await Promise.all(
+            roomIds.map(async (roomId) => {
+                const data = await client.hgetall(keys.room(roomId));
+                if (!data || !data.roomId) {
+                    // stale index entry
+                    await client.srem(keys.roomsByServerId(serverId), roomId);
+                    return null;
+                }
+                return {
+                    roomId: data.roomId,
+                    roomType: data.roomType,
+                    data: JSON.parse(data.data || '{}') as RoomData,
                 };
-                return subscribeChannel(channel, listener);
-            },
+            }),
+        );
 
-            async tryAcquireLeader(serverId: string): Promise<boolean> {
-                // SET NX PX — atomic acquire, only succeeds if key doesn't exist
-                const result = await client.set(keys.leader, serverId, 'PX', LEADER_LOCK_TTL_MS, 'NX');
-                return result === 'OK';
-            },
+        return rooms.filter((r): r is DesiredRoom => r !== null);
+    }
 
-            async renewLeader(serverId: string): Promise<boolean> {
-                // compare-and-swap: only extend if we still own the lock
-                const result = await client.eval(
-                    `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("PEXPIRE", KEYS[1], ARGV[2]) else return 0 end`,
-                    1,
-                    keys.leader,
-                    serverId,
-                    String(LEADER_LOCK_TTL_MS),
-                );
-                return result === 1;
-            },
+    async function reserveClient(
+        roomId: string,
+        ttl: number,
+        data?: Record<string, unknown>,
+        tags?: Record<string, string>,
+    ): Promise<ClientReservation> {
+        // look up room to get endpoint and roomSecret for jwt minting
+        const roomData = await client.hgetall(keys.room(roomId));
+        if (!roomData || !roomData.roomId) {
+            throw new RoomNotFoundError(roomId);
+        }
+        if (roomData.status !== 'running' || !roomData.roomSecret || !roomData.endpoint) {
+            throw new RoomNotRunningError(roomId);
+        }
 
-            async releaseLeader(serverId: string): Promise<void> {
-                // compare-and-swap: only delete if we still own the lock
-                await client.eval(
-                    `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`,
-                    1,
-                    keys.leader,
-                    serverId,
-                );
-            },
+        const clientTags = tags ?? {};
+        validateTags(clientTags);
+
+        const clientId = crypto.randomUUID();
+        const expiresAt = Date.now() + ttl;
+
+        // mint jwt signed with the room's secret — room verifies locally, zero ipc
+        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, roomData.roomSecret);
+
+        // store client record
+        await client.hset(keys.client(clientId), {
+            clientId,
+            roomId,
+            status: 'reserved',
+            expiresAt: String(expiresAt),
+            tags: JSON.stringify(clientTags),
+        });
+
+        // set TTL on the client key — auto-expires if never connected
+        await client.pexpire(keys.client(clientId), ttl);
+
+        // add to room's client set
+        await client.sadd(keys.clientsByRoom(roomId), clientId);
+
+        return {
+            clientId,
+            url: (() => {
+                const u = new URL(roomData.endpoint);
+                u.searchParams.set('token', token);
+                return u.toString();
+            })(),
+            roomId,
+            expiresAt,
+        };
+    }
+
+    async function connectClient(clientId: string): Promise<void> {
+        // update status to connected and remove TTL (connected clients persist until disconnect)
+        await client.hset(keys.client(clientId), {
+            status: 'connected',
+            expiresAt: '0',
+        });
+
+        // remove TTL — connected clients don't expire
+        await client.persist(keys.client(clientId));
+    }
+
+    async function disconnectClient(clientId: string): Promise<void> {
+        const clientData = await client.hgetall(keys.client(clientId));
+        if (clientData.roomId) {
+            await client.srem(keys.clientsByRoom(clientData.roomId), clientId);
+        }
+        await client.del(keys.client(clientId));
+    }
+
+    async function registerServer(options: RegisterServerOptions): Promise<void> {
+        validateTags(options.tags);
+
+        // ensure redis data matches our schema — flushes all prefixed keys on mismatch
+        await ensureSchemaVersion();
+
+        await client.hset(keys.server(options.serverId), {
+            serverId: options.serverId,
+            endpoint: options.endpoint,
+            tags: JSON.stringify(options.tags),
+            roomTypes: JSON.stringify(options.roomTypes),
+            lastHeartbeat: String(Date.now()),
+        });
+
+        await client.sadd(keys.servers, options.serverId);
+    }
+
+    async function heartbeat(serverId: string): Promise<void> {
+        await client.hset(keys.server(serverId), {
+            lastHeartbeat: String(Date.now()),
+        });
+    }
+
+    async function unregisterServer(serverId: string): Promise<void> {
+        // clean up all rooms owned by this server
+        const roomIds = await client.smembers(keys.roomsByServerId(serverId));
+        for (const roomId of roomIds) {
+            await unregisterRoom(roomId);
+        }
+        await client.del(keys.roomsByServerId(serverId));
+
+        await client.del(keys.server(serverId));
+        await client.srem(keys.servers, serverId);
+    }
+
+    async function addServerTags(serverId: string, tags: Record<string, string>): Promise<void> {
+        validateTags(tags);
+        const data = await client.hgetall(keys.server(serverId));
+        if (!data || !data.serverId) throw new ServerNotFoundError(serverId);
+        const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
+        const merged = { ...existing, ...tags };
+        await client.hset(keys.server(serverId), { tags: JSON.stringify(merged) });
+    }
+
+    async function removeServerTags(serverId: string, tagKeys: string[]): Promise<void> {
+        const data = await client.hgetall(keys.server(serverId));
+        if (!data || !data.serverId) throw new ServerNotFoundError(serverId);
+        const existing = JSON.parse(data.tags || '{}') as Record<string, string>;
+        for (const key of tagKeys) {
+            delete existing[key];
+        }
+        await client.hset(keys.server(serverId), { tags: JSON.stringify(existing) });
+    }
+
+    async function listServers(filter?: ListServersFilter): Promise<ServerInfo[]> {
+        const cutoff = Date.now() - STALE_MS;
+        const serverIds = await client.smembers(keys.servers);
+        if (serverIds.length === 0) return [];
+
+        const servers = await Promise.all(
+            serverIds.map(async (serverId) => {
+                const data = await client.hgetall(keys.server(serverId));
+                if (!data || !data.serverId) {
+                    await client.srem(keys.servers, serverId);
+                    return null;
+                }
+
+                const lastHeartbeat = Number(data.lastHeartbeat);
+                if (lastHeartbeat < cutoff) return null;
+
+                return hashToServerInfo(data);
+            }),
+        );
+
+        let result = servers.filter((s): s is ServerInfo => s !== null);
+
+        if (filter?.roomTypes) {
+            const required = filter.roomTypes;
+            result = result.filter((s) => required.every((rt) => s.roomTypes.includes(rt)));
+        }
+        if (filter?.tags?.eq) {
+            for (const [k, v] of Object.entries(filter.tags.eq)) {
+                result = result.filter((s) => s.tags[k] === v);
+            }
+        }
+        if (filter?.tags?.neq) {
+            for (const [k, v] of Object.entries(filter.tags.neq)) {
+                result = result.filter((s) => s.tags[k] !== v);
+            }
+        }
+
+        return result;
+    }
+
+    async function listStaleServers(): Promise<ServerInfo[]> {
+        const cutoff = Date.now() - STALE_MS;
+        const serverIds = await client.smembers(keys.servers);
+        if (serverIds.length === 0) return [];
+
+        const servers = await Promise.all(
+            serverIds.map(async (serverId) => {
+                const data = await client.hgetall(keys.server(serverId));
+                if (!data || !data.serverId) {
+                    await client.srem(keys.servers, serverId);
+                    return null;
+                }
+
+                const lastHeartbeat = Number(data.lastHeartbeat);
+                // only include servers whose heartbeat IS older than cutoff
+                if (lastHeartbeat >= cutoff) return null;
+
+                return hashToServerInfo(data);
+            }),
+        );
+
+        return servers.filter((s): s is ServerInfo => s !== null);
+    }
+
+    async function getServer(serverId: string): Promise<ServerInfo | null> {
+        const data = await client.hgetall(keys.server(serverId));
+        return hashToServerInfo(data);
+    }
+
+    async function subscribeRoomAssignments(serverId: string, callback: (room: DesiredRoom) => void): Promise<() => void> {
+        const channel = keys.roomAssigned(serverId);
+        const listener = (_ch: string, msg: string) => {
+            let parsed: DesiredRoom;
+            try {
+                parsed = JSON.parse(msg) as DesiredRoom;
+            } catch {
+                console.error('[gatho] malformed room-assigned message, discarding', { channel, msg });
+                return;
+            }
+            callback(parsed);
+        };
+        return subscribeChannel(channel, listener);
+    }
+
+    async function tryAcquireLeader(serverId: string): Promise<boolean> {
+        // SET NX PX — atomic acquire, only succeeds if key doesn't exist
+        const result = await client.set(keys.leader, serverId, 'PX', LEADER_LOCK_TTL_MS, 'NX');
+        return result === 'OK';
+    }
+
+    async function renewLeader(serverId: string): Promise<boolean> {
+        // compare-and-swap: only extend if we still own the lock
+        const result = await client.eval(
+            `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("PEXPIRE", KEYS[1], ARGV[2]) else return 0 end`,
+            1,
+            keys.leader,
+            serverId,
+            String(LEADER_LOCK_TTL_MS),
+        );
+        return result === 1;
+    }
+
+    async function releaseLeader(serverId: string): Promise<void> {
+        // compare-and-swap: only delete if we still own the lock
+        await client.eval(
+            `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`,
+            1,
+            keys.leader,
+            serverId,
+        );
+    }
+
+    return {
+        _internal: {
+            registerRoom,
+            unregisterRoom,
+            roomReady,
+            roomFailure,
+            waitForRoom,
+            getRoomInfo,
+            listRooms,
+            addRoomTags,
+            removeRoomTags,
+            getDesiredState,
+            reserveClient,
+            connectClient,
+            disconnectClient,
+            registerServer,
+            heartbeat,
+            unregisterServer,
+            addServerTags,
+            removeServerTags,
+            listServers,
+            listStaleServers,
+            getServer,
+            subscribeRoomAssignments,
+            tryAcquireLeader,
+            renewLeader,
+            releaseLeader,
         },
     };
-
-    return driver;
 }
 
 /** options for creating a redis driver */
