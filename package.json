@@ -18,27 +18,27 @@
     "exports": {
         "./server": {
             "import": "./dist/server.js",
-            "types": "./dist/src/server/index.d.ts"
+            "types": "./dist/server/index.d.ts"
         },
         "./room": {
             "import": "./dist/room.js",
-            "types": "./dist/src/room/index.d.ts"
+            "types": "./dist/room/index.d.ts"
         },
         "./driver": {
             "import": "./dist/driver.js",
-            "types": "./dist/src/driver/index.d.ts"
+            "types": "./dist/driver/index.d.ts"
         },
         "./common": {
             "import": "./dist/common.js",
-            "types": "./dist/src/common/index.d.ts"
+            "types": "./dist/common/index.d.ts"
         },
         "./client": {
             "import": "./dist/client.js",
-            "types": "./dist/src/client/index.d.ts"
+            "types": "./dist/client/index.d.ts"
         },
         "./sdk": {
             "import": "./dist/sdk.js",
-            "types": "./dist/src/sdk/index.d.ts"
+            "types": "./dist/sdk/index.d.ts"
         }
     },
     "files": [
@@ -58,7 +58,7 @@
         "test:e2e": "cd tst && ./e2e.sh",
         "typecheck-docs": "tsc --project docs/tsconfig.json --noEmit",
         "docs": "(cd docs && node ./build.js)",
-        "typedoc": "typedoc --tsconfig ./tsconfig.json --name \"gatho docs\" --out ./dist-typedoc ./sdk/index.ts ./room/index.ts ./server/index.ts ./driver/index.ts ./client/index.ts ./common/index.ts"
+        "typedoc": "typedoc --tsconfig ./tsconfig.json --name \"gatho docs\" --out ./dist-typedoc ./src/sdk/index.ts ./src/room/index.ts ./src/server/index.ts ./src/driver/index.ts ./src/client/index.ts ./src/common/index.ts"
     },
     "packageManager": "pnpm@8.15.2+sha1.798034f615aa211c6c2ae00010cc20be5fc102ee",
     "dependencies": {

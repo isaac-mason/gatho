@@ -25,6 +25,7 @@ function bundle(input, output, external = []) {
                     noEmit: false,
                     declaration: true,
                     declarationDir: path.resolve(baseDir, 'dist'),
+                    rootDir: path.resolve(baseDir, 'src'),
                 },
             }),
             filesize(),
