@@ -65,13 +65,15 @@ await start({
     onAuth: () => auth.ok(),
 
     onJoin: (room, client) => {
-        room.send(client, { type: 'count', count });
+        room.send(client, JSON.stringify({ type: 'count', count }));
     },
 
-    onMessage: (room, _client, message: { type: 'increment' | 'decrement' }) => {
-        if (message.type === 'increment') count++;
-        if (message.type === 'decrement') count--;
-        room.broadcast({ type: 'count', count });
+    onMessage: (room, _client, message) => {
+        if (typeof message !== 'string') return;
+        const parsed = JSON.parse(message) as { type: 'increment' | 'decrement' };
+        if (parsed.type === 'increment') count++;
+        if (parsed.type === 'decrement') count--;
+        room.broadcast(JSON.stringify({ type: 'count', count }));
     },
 });
 ```
@@ -138,11 +140,12 @@ const url = new URLSearchParams(window.location.search).get('url')!;
 const room = connect(url);
 
 room.on('message', (msg) => {
-    const { count } = msg as { count: number };
+    if (typeof msg !== 'string') return;
+    const { count } = JSON.parse(msg) as { count: number };
     console.log('count:', count);
 });
 
-room.send({ type: 'increment' });
+room.send(JSON.stringify({ type: 'increment' }));
 ```
 
 ## Client
@@ -167,14 +170,14 @@ await start({
     },
 
     onReconnect: (room, client) => {
-        room.send(client, { type: 'welcome-back' });
+        room.send(client, JSON.stringify({ type: 'welcome-back' }));
     },
 });
 ```
 
 ## Messages
 
-gatho is unopinionated about your message format or protocol. The `room.send()` API accepts any JSON-serializable value or raw `Uint8Array`/`ArrayBuffer`, and `onMessage` receives whatever was sent.
+gatho is unopinionated about message format — `room.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` / `JSON.parse()` yourself — gatho stays out of the way.
 
 If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types — no code generation, no IDL files.
 
@@ -247,19 +250,20 @@ import { auth, start } from 'gatho/room';
 
 await start({
     // return auth.ok(data) to accept, auth.fail(reason) to reject
-    onAuth: (joinData: { displayName: string }, room) => {
+    onAuth: (room, joinData: { displayName: string }) => {
         if (room.clients.count() >= 10) return auth.fail('room is full');
         return auth.ok({ displayName: joinData.displayName });
     },
 
     // client is authenticated and in the room
     onJoin: (room, client) => {
-        room.broadcast({ type: 'joined', id: client.id });
+        room.broadcast(JSON.stringify({ type: 'joined', id: client.id }));
     },
 
     // client sent a message
-    onMessage: (room, client, message: { type: string }) => {
-        room.broadcast({ type: 'echo', from: client.id, message });
+    onMessage: (room, client, message) => {
+        if (typeof message !== 'string') return;
+        room.broadcast(JSON.stringify({ type: 'echo', from: client.id, message }));
     },
 
     // non-consented disconnect — call allowReconnection to hold the seat
@@ -269,12 +273,12 @@ await start({
 
     // client reconnected within the window — buffered messages already flushed
     onReconnect: (room, client) => {
-        room.send(client, { type: 'welcome-back' });
+        room.send(client, JSON.stringify({ type: 'welcome-back' }));
     },
 
     // client permanently left — consented close, eviction, or window expired
     onLeave: (room, client) => {
-        room.broadcast({ type: 'left', id: client.id });
+        room.broadcast(JSON.stringify({ type: 'left', id: client.id }));
     },
 
     // SIGTERM or room.stop()
