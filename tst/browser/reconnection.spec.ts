@@ -21,7 +21,7 @@
 
 import type { Page, WebSocketRoute } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import type { Client } from '../../room';
+import type { Client } from '../../src/room';
 import { startPageServer, startRoom } from './helpers';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- browser evaluate needs any for window access

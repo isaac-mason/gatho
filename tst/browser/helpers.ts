@@ -4,9 +4,9 @@
 import { readFileSync } from 'fs';
 import { createServer as createHttpServer } from 'http';
 import { resolve } from 'path';
-import type { Room } from '../../room';
-import { auth, start } from '../../room';
-import type { StartOptions } from '../../room/start';
+import type { Room } from '../../src/room';
+import { auth, start } from '../../src/room';
+import type { StartOptions } from '../../src/room/start';
 
 const CLIENT_BUNDLE_PATH = resolve(import.meta.dirname, '../../dist/client.js');
 

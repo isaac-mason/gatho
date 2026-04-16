@@ -33,10 +33,10 @@ function bundle(input, output, external = []) {
 }
 
 export default [
-    bundle('./common/index.ts', 'dist/common.js', []),
-    bundle('./server/index.ts', 'dist/server.js', []),
-    bundle('./client/index.ts', 'dist/client.js', []),
-    bundle('./room/index.ts', 'dist/room.js', ['ws']),
-    bundle('./sdk/index.ts', 'dist/sdk.js', []),
-    bundle('./driver/index.ts', 'dist/driver.js', ['postgres', 'ioredis']),
+    bundle('./src/common/index.ts', 'dist/common.js', []),
+    bundle('./src/server/index.ts', 'dist/server.js', []),
+    bundle('./src/client/index.ts', 'dist/client.js', []),
+    bundle('./src/room/index.ts', 'dist/room.js', ['ws']),
+    bundle('./src/sdk/index.ts', 'dist/sdk.js', []),
+    bundle('./src/driver/index.ts', 'dist/driver.js', ['postgres', 'ioredis']),
 ];

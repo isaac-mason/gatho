@@ -18,27 +18,27 @@
     "exports": {
         "./server": {
             "import": "./dist/server.js",
-            "types": "./dist/server/index.d.ts"
+            "types": "./dist/src/server/index.d.ts"
         },
         "./room": {
             "import": "./dist/room.js",
-            "types": "./dist/room/index.d.ts"
+            "types": "./dist/src/room/index.d.ts"
         },
         "./driver": {
             "import": "./dist/driver.js",
-            "types": "./dist/driver/index.d.ts"
+            "types": "./dist/src/driver/index.d.ts"
         },
         "./common": {
             "import": "./dist/common.js",
-            "types": "./dist/common/index.d.ts"
+            "types": "./dist/src/common/index.d.ts"
         },
         "./client": {
             "import": "./dist/client.js",
-            "types": "./dist/client/index.d.ts"
+            "types": "./dist/src/client/index.d.ts"
         },
         "./sdk": {
             "import": "./dist/sdk.js",
-            "types": "./dist/sdk/index.d.ts"
+            "types": "./dist/src/sdk/index.d.ts"
         }
     },
     "files": [

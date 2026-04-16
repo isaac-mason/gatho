@@ -4,9 +4,9 @@
 // network-drop scenarios (close code 1006, backoff, buffering during offline)
 // are tested in tst/browser/ with playwright + setOffline.
 import { afterEach, describe, expect, it } from 'vitest';
-import { connect } from '../../client';
-import type { Client, Room } from '../../room';
-import { auth, start } from '../../room';
+import { connect } from '../../src/client';
+import type { Client, Room } from '../../src/room';
+import { auth, start } from '../../src/room';
 
 function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));

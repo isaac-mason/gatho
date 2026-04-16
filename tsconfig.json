@@ -21,6 +21,6 @@
         "rootDir": "./",
         "allowSyntheticDefaultImports": true
     },
-    "include": ["./src", "./three", "./client", "./server", "./sdk", "./driver", "./room"],
+    "include": ["./src"],
     "exclude": ["./dist"]
 }
