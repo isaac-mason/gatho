@@ -1,12 +1,11 @@
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname } from 'node:path';
-import { createMessageReceiver, FrameReader, type JsonMessage, sendMessage, type UdsConnection } from '../../common/uds';
-import type { RoomMessage } from './ipc-types';
+import { FrameReader, type RoomMessage, type UdsConnection } from '../../common/uds';
 
 export function listenOnSocket(
     socketPath: string,
-    onMessage: (msg: JsonMessage) => void,
+    onMessage: (msg: RoomMessage) => void,
     options?: { timeoutMs?: number; onClose?: () => void },
 ): Promise<UdsConnection> {
     return new Promise((resolve, reject) => {
@@ -17,8 +16,6 @@ export function listenOnSocket(
 
         let settled = false;
         let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-
-        const receiver = createMessageReceiver(onMessage);
 
         // clean up stale socket file if present
         try {
@@ -41,15 +38,17 @@ export function listenOnSocket(
 
             server.close();
 
-            const reader = new FrameReader(receiver);
+            const reader = new FrameReader(onMessage);
             const onClose = options?.onClose;
 
             socket.on('data', (chunk) => reader.push(chunk));
             socket.on('close', () => onClose?.());
 
             resolve({
-                send(msg: JsonMessage) {
-                    sendMessage(socket, msg);
+                send() {
+                    // server never sends to room — this is a no-op placeholder
+                    // to satisfy UdsConnection interface
+                    throw new Error('server-side uds does not send messages');
                 },
                 close() {
                     socket.destroy();
@@ -101,7 +100,7 @@ export async function createUdsServer(
     onMessage: (msg: RoomMessage) => void,
     options?: { timeoutMs?: number; onClose?: () => void },
 ): Promise<UdsServer> {
-    const conn = await listenOnSocket(socketPath, onMessage as (msg: JsonMessage) => void, options);
+    const conn = await listenOnSocket(socketPath, onMessage, options);
     return {
         close() {
             conn.close();

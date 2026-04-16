@@ -15,7 +15,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { log } from '../common/logger';
 import type { Driver, RoomData } from '../driver/types';
-import type { RoomMessage } from './runner/ipc-types';
+import type { RoomMessage } from '../common/uds';
 import type { RoomRunner } from './runner/types';
 import { createUdsServer } from './runner/uds';
 

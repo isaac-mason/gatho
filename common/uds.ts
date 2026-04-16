@@ -1,76 +1,94 @@
-// shared uds framing protocol used by both room and server
+// uds ipc protocol — packcat-encoded, length-prefixed framing.
 //
-// frame format: tag(1 byte) + length(4 bytes, uint32 BE) + payload(length bytes)
-//   tag 0x00 = json text frame (utf-8 JSON, parsed with JSON.parse)
-//   tag 0x01 = binary data frame (raw bytes, delivered as Uint8Array)
+// frame format: length(4 bytes, uint32 BE) + payload(length bytes, packcat-encoded RoomMessage)
 //
-// messages with binary payloads (Uint8Array in data field) are sent as two frames:
-// a json frame with { binary: true } replacing the data field, then a binary frame
-// with the raw bytes. text messages are a single json frame.
+// messages flow one direction: room → server.
 
 import type { Socket } from 'node:net';
+import * as pack from 'packcat';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type JsonMessage = Record<string, any>;
+// --- message schema ---
 
-export type Frame = {
-    tag: number;
-    payload: Buffer;
-};
+const ProcessMetrics = pack.object({
+    memoryRss: pack.float64(),
+    memoryHeapUsed: pack.float64(),
+    memoryHeapTotal: pack.float64(),
+    cpuUser: pack.float64(),
+    cpuSystem: pack.float64(),
+});
+
+const Ready = pack.object({
+    type: pack.literal('ready'),
+    port: pack.uint16(),
+});
+
+const Heartbeat = pack.object({
+    type: pack.literal('heartbeat'),
+    timestamp: pack.float64(),
+    metrics: ProcessMetrics,
+    clientIds: pack.list(pack.string()),
+});
+
+const ClientConnected = pack.object({
+    type: pack.literal('client-connected'),
+    clientId: pack.string(),
+});
+
+const ClientDisconnected = pack.object({
+    type: pack.literal('client-disconnected'),
+    clientId: pack.string(),
+});
+
+const ErrorMsg = pack.object({
+    type: pack.literal('error'),
+    message: pack.string(),
+});
+
+const Stopped = pack.object({
+    type: pack.literal('stopped'),
+});
+
+const RoomMessageSchema = pack.union('type', [Ready, Heartbeat, ClientConnected, ClientDisconnected, ErrorMsg, Stopped]);
+
+export const ipcCodec = pack.build(RoomMessageSchema);
+
+export type RoomMessage = pack.SchemaType<typeof RoomMessageSchema>;
+
+// re-derive sub-types for convenience at call sites
+export type ReadyMessage = pack.SchemaType<typeof Ready>;
+export type HeartbeatMessage = pack.SchemaType<typeof Heartbeat>;
+export type ProcessMetricsMessage = pack.SchemaType<typeof ProcessMetrics>;
+export type ClientConnectedMessage = pack.SchemaType<typeof ClientConnected>;
+export type ClientDisconnectedMessage = pack.SchemaType<typeof ClientDisconnected>;
+export type ErrorMessage = pack.SchemaType<typeof ErrorMsg>;
+export type StoppedMessage = pack.SchemaType<typeof Stopped>;
+
+// --- framing ---
+
+// header: 4 bytes uint32 BE length
+const HEADER_SIZE = 4;
 
 export type UdsConnection = {
-    send: (msg: JsonMessage) => void;
+    send: (msg: RoomMessage) => void;
     close: () => void;
 };
 
-// frame tags
-export const TAG_JSON = 0x00;
-export const TAG_BINARY = 0x01;
-
-// header: 1 byte tag + 4 bytes uint32 BE length
-export const HEADER_SIZE = 5;
-
-// --- frame writing ---
-
-export function buildFrame(tag: number, payload: Uint8Array | string): Buffer {
-    const payloadBuf = typeof payload === 'string' ? Buffer.from(payload, 'utf-8') : payload;
-    const frame = Buffer.alloc(HEADER_SIZE + payloadBuf.byteLength);
-    frame[0] = tag;
-    frame.writeUInt32BE(payloadBuf.byteLength, 1);
-    frame.set(payloadBuf, HEADER_SIZE);
-    return frame;
+// encode and write a length-prefixed packcat frame
+export function sendMessage(socket: Socket, msg: RoomMessage): void {
+    const payload = ipcCodec.pack(msg);
+    const frame = Buffer.alloc(HEADER_SIZE + payload.byteLength);
+    frame.writeUInt32BE(payload.byteLength, 0);
+    frame.set(payload, HEADER_SIZE);
+    socket.write(frame);
 }
-
-export function writeFrame(socket: Socket, tag: number, payload: Uint8Array | string): void {
-    socket.write(buildFrame(tag, payload));
-}
-
-// send an ipc message. handles the json/binary split transparently.
-// binary-payload messages are sent as two frames batched into one write call.
-export function sendMessage(socket: Socket, msg: JsonMessage): void {
-    const rec = msg as Record<string, unknown>;
-    if ('data' in rec && rec.data instanceof Uint8Array) {
-        const { data, ...rest } = rec;
-        const jsonFrame = buildFrame(TAG_JSON, JSON.stringify({ ...rest, binary: true }));
-        const binFrame = buildFrame(TAG_BINARY, data as Uint8Array);
-        const combined = Buffer.alloc(jsonFrame.byteLength + binFrame.byteLength);
-        combined.set(jsonFrame, 0);
-        combined.set(binFrame, jsonFrame.byteLength);
-        socket.write(combined);
-        return;
-    }
-    socket.write(buildFrame(TAG_JSON, JSON.stringify(msg)));
-}
-
-// --- frame reading ---
 
 // streaming frame reader — handles partial reads and buffering across data events
 export class FrameReader {
     private buffer: Buffer = Buffer.alloc(0);
-    private onFrame: (frame: Frame) => void;
+    private onMessage: (msg: RoomMessage) => void;
 
-    constructor(onFrame: (frame: Frame) => void) {
-        this.onFrame = onFrame;
+    constructor(onMessage: (msg: RoomMessage) => void) {
+        this.onMessage = onMessage;
     }
 
     push(data: Buffer | Uint8Array): void {
@@ -78,40 +96,15 @@ export class FrameReader {
         this.buffer = this.buffer.byteLength === 0 ? buf : Buffer.concat([this.buffer, buf]);
 
         while (this.buffer.byteLength >= HEADER_SIZE) {
-            const tag = this.buffer[0];
-            const payloadLength = this.buffer.readUInt32BE(1);
+            const payloadLength = this.buffer.readUInt32BE(0);
             const totalFrameSize = HEADER_SIZE + payloadLength;
 
             if (this.buffer.byteLength < totalFrameSize) break;
 
-            const payload = Buffer.from(this.buffer.subarray(HEADER_SIZE, totalFrameSize));
+            const payload = this.buffer.subarray(HEADER_SIZE, totalFrameSize);
             this.buffer = this.buffer.subarray(totalFrameSize);
 
-            this.onFrame({ tag, payload });
+            this.onMessage(ipcCodec.unpack(payload));
         }
     }
-}
-
-// reassembles binary-flagged messages into typed ipc messages
-export function createMessageReceiver(handler: (msg: JsonMessage) => void): (frame: Frame) => void {
-    let pendingJsonMsg: Record<string, unknown> | null = null;
-
-    return (frame: Frame) => {
-        if (frame.tag === TAG_JSON) {
-            const parsed = JSON.parse(frame.payload.toString('utf-8')) as Record<string, unknown>;
-            if (parsed.binary === true) {
-                pendingJsonMsg = parsed;
-                return;
-            }
-            handler(parsed as unknown as JsonMessage);
-        } else if (frame.tag === TAG_BINARY) {
-            if (pendingJsonMsg) {
-                pendingJsonMsg.data = new Uint8Array(frame.payload);
-                delete pendingJsonMsg.binary;
-                handler(pendingJsonMsg as unknown as JsonMessage);
-                pendingJsonMsg = null;
-            }
-            // binary frame without pending json — protocol violation, drop
-        }
-    };
 }

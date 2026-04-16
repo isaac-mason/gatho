@@ -3,7 +3,7 @@ import { auth, start } from 'gatho/room';
 const messages: Array<{ user: string; text: string; timestamp: number }> = [];
 
 await start({
-    onAuth: (joinData: { displayName?: string }) => {
+    onAuth: (_room, joinData: { displayName?: string }) => {
         const username = joinData.displayName || 'anonymous';
         return auth.ok({ username });
     },

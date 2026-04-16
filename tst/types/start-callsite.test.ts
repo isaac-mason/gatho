@@ -12,7 +12,7 @@ function mockStart<ClientData, JoinData extends Record<string, unknown> = Record
 describe('start() generic inference', () => {
     test('ClientData from auth.ok, JoinData from annotation', () => {
         mockStart({
-            onAuth: (joinData: { displayName?: string }) => {
+            onAuth: (_room, joinData: { displayName?: string }) => {
                 return auth.ok({ username: joinData.displayName || 'anon' });
             },
 
@@ -45,7 +45,7 @@ describe('start() generic inference', () => {
 
     test('only joinData annotated', () => {
         mockStart({
-            onAuth: (joinData: { token: string }) => {
+            onAuth: (_room, joinData: { token: string }) => {
                 return auth.ok({ verified: true, token: joinData.token });
             },
             onJoin: (_room, client) => {

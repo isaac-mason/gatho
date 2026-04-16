@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { jwtVerify } from '../common/jwt';
 import type { Logger } from '../common/logger';
 import { createLogger } from '../common/logger';
-import type { RoomMessage } from '../server/runner/ipc-types';
+import type { RoomMessage } from '../common/uds';
 import { connectToSocket } from './ipc';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
@@ -137,10 +137,10 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
      *  `room` gives access to current room state (e.g. `room.clients.count()` for capacity checks).
      *  annotate the joinData parameter to get type inference:
      *  ```ts
-     *  onAuth: (joinData: { displayName?: string }) =>
+     *  onAuth: (room, joinData: { displayName?: string }) =>
      *    auth.ok({ username: joinData.displayName ?? 'anon' })
      *  ``` */
-    onAuth?: (joinData: JoinData, room: Room<unknown>) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
+    onAuth?: (room: Room<unknown>, joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
 
     /** fires after a client is authenticated and added to the room. */
     onJoin?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
@@ -379,7 +379,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
     options: {
         port?: number;
         maxBufferBytes: number;
-        onAuth?: (joinData: JoinData, room: Room<unknown>) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
+        onAuth?: (room: Room<unknown>, joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
         onJoin?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
         onMessage?: (room: Room<ClientData>, client: Client<ClientData>, message: string | ArrayBuffer) => void | Promise<void>;
         onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
@@ -449,7 +449,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 let result: AuthResult<ClientData>;
                 try {
                     result = await Promise.resolve(
-                        options.onAuth ? options.onAuth(joinData as JoinData, room) : { ok: true, data: {} as ClientData },
+                        options.onAuth ? options.onAuth(room, joinData as JoinData) : { ok: true, data: {} as ClientData },
                     );
                 } catch (err) {
                     // onAuth threw — bug in user code

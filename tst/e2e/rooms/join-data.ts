@@ -2,7 +2,7 @@
 import { auth, start } from '../../../room';
 
 await start({
-    onAuth: (joinData: Record<string, unknown>) => auth.ok({ joinData }),
+    onAuth: (_room, joinData: Record<string, unknown>) => auth.ok({ joinData }),
     onJoin: (room, client) => {
         room.send(client, JSON.stringify({ type: 'join-data', data: client.data.joinData }));
     },

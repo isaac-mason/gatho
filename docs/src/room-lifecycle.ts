@@ -2,7 +2,7 @@ import { auth, start } from 'gatho/room';
 
 await start({
     // return auth.ok(data) to accept, auth.fail(reason) to reject
-    onAuth: (joinData: { displayName: string }, room) => {
+    onAuth: (room, joinData: { displayName: string }) => {
         if (room.clients.count() >= 10) return auth.fail('room is full');
         return auth.ok({ displayName: joinData.displayName });
     },

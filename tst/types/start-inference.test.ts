@@ -18,7 +18,7 @@ describe('StartOptions type structure', () => {
         type Opts = StartOptions<{ username: string }, { displayName?: string }>;
         type OnAuth = NonNullable<Opts['onAuth']>;
 
-        type JoinDataArg = Parameters<OnAuth>[0];
+        type JoinDataArg = Parameters<OnAuth>[1];
         expectTypeOf<JoinDataArg>().toEqualTypeOf<{ displayName?: string }>();
     });
 
@@ -34,7 +34,7 @@ describe('StartOptions type structure', () => {
         type Opts = StartOptions<{ username: string }>;
         type OnAuth = NonNullable<Opts['onAuth']>;
 
-        type JoinDataArg = Parameters<OnAuth>[0];
+        type JoinDataArg = Parameters<OnAuth>[1];
         expectTypeOf<JoinDataArg>().toEqualTypeOf<Record<string, unknown>>();
     });
 });

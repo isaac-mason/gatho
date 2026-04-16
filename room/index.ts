@@ -7,8 +7,8 @@ export { start } from './start';
 export type { WsTransportConfig } from './transport/index';
 export { wsTransport } from './transport/index';
 export type {
-    ClientSocket as WsSocket,
-    Transport as RoomTransport,
+    ClientSocket,
+    Transport,
     TransportHandlers,
     TransportListenConfig,
     TransportServer,

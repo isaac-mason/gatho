@@ -3,7 +3,7 @@
 // so no frame reading is needed; we just wire up the send side.
 
 import { createConnection } from 'node:net';
-import { sendMessage, type JsonMessage, type UdsConnection } from '../common/uds';
+import { sendMessage, type RoomMessage, type UdsConnection } from '../common/uds';
 
 export function connectToSocket(
     socketPath: string,
@@ -27,7 +27,7 @@ export function connectToSocket(
                 }
 
                 resolve({
-                    send(msg: JsonMessage) {
+                    send(msg: RoomMessage) {
                         sendMessage(socket, msg);
                     },
                     close() {
