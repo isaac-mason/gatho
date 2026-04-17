@@ -24,7 +24,6 @@ import { expect, test } from '@playwright/test';
 import type { Client } from '../../src/room';
 import { startPageServer, startRoom } from './helpers';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- browser evaluate needs any for window access
 type W = Record<string, any>;
 
 // port range for browser tests: 19950-19999

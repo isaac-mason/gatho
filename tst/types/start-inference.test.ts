@@ -1,7 +1,7 @@
 // type-level tests for StartOptions generic structure.
 // verifies the shape of StartOptions at the type level.
 import { describe, expectTypeOf, test } from 'vitest';
-import type { Client, Room, StartOptions } from '../../room';
+import type { Client, Room, StartOptions } from '../../src/room';
 
 describe('StartOptions type structure', () => {
     test('ClientData flows through Room and Client in callbacks', () => {

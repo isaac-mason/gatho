@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { connect } from '../../client';
-import type { Room } from '../../room';
-import { auth, start } from '../../room';
+import { connect } from '../../src/client';
+import type { Room } from '../../src/room';
+import { auth, start } from '../../src/room';
 
 function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));

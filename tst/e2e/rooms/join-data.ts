@@ -1,5 +1,5 @@
 // join-data room — sends joinData back to the client on join
-import { auth, start } from '../../../room';
+import { auth, start } from '../../../src/room';
 
 await start({
     onAuth: (_room, joinData: Record<string, unknown>) => auth.ok({ joinData }),

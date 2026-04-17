@@ -2,10 +2,10 @@
 // when fast-path connect/disconnect messages fail, the heartbeat backstop
 // should eventually correct driver state.
 import { afterEach, describe, expect, it } from 'vitest';
-import { createMemoryDriver } from '../../driver';
-import { createGathoSDK } from '../../sdk';
-import { createServer, subprocess } from '../../server';
-import type { Server } from '../../server/server';
+import { createMemoryDriver } from '../../src/driver';
+import { createGathoSDK } from '../../src/sdk';
+import { createServer, subprocess } from '../../src/server';
+import type { Server } from '../../src/server/server';
 import { connectAndCollect, roomScripts, sleep, waitUntil } from './helpers';
 
 describe('client reconciliation via heartbeat', () => {

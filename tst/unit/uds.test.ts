@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ipcCodec, createFrameReader, type RoomMessage } from '../../common/uds';
+import { ipcCodec, createFrameReader, type RoomMessage } from '../../src/common/uds';
 
 describe('uds ipc codec', () => {
     // round-trip every message variant through pack/unpack

@@ -8,9 +8,9 @@ import {
     RoomNotRunningError,
     RoomTimeoutError,
     ServerNotFoundError,
-} from '../../common/errors';
-import { createMemoryDriver } from '../../driver';
-import type { Driver } from '../../driver/types';
+} from '../../src/common/errors';
+import { createMemoryDriver } from '../../src/driver';
+import type { Driver } from '../../src/driver/types';
 
 describe('typed errors', () => {
     let driver: Driver;

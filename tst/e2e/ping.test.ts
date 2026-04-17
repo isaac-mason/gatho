@@ -1,10 +1,10 @@
 // ping endpoint test — verifies GET /ping returns 200 'pong'
 // also verifies ServerInfo.endpoint is a fully-qualified URL usable for ping
 import { afterEach, describe, expect, it } from 'vitest';
-import { createMemoryDriver } from '../../driver';
-import { createGathoSDK } from '../../sdk';
-import { createServer, subprocess } from '../../server';
-import type { Server } from '../../server/server';
+import { createMemoryDriver } from '../../src/driver';
+import { createGathoSDK } from '../../src/sdk';
+import { createServer, subprocess } from '../../src/server';
+import type { Server } from '../../src/server/server';
 import { roomScripts } from './helpers';
 
 describe('/ping endpoint', () => {

@@ -1,12 +1,12 @@
 // e2e test helpers
 import { resolve } from 'path';
-import type { RoomConnection } from '../../client';
-import { connect } from '../../client';
-import type { Driver } from '../../driver/types';
-import type { GathoSDK } from '../../sdk';
-import { createGathoSDK } from '../../sdk';
-import { createServer, subprocess } from '../../server';
-import type { Server } from '../../server/server';
+import type { RoomConnection } from '../../src/client';
+import { connect } from '../../src/client';
+import type { Driver } from '../../src/driver/types';
+import type { GathoSDK } from '../../src/sdk';
+import { createGathoSDK } from '../../src/sdk';
+import { createServer, subprocess } from '../../src/server';
+import type { Server } from '../../src/server/server';
 
 const ROOMS_DIR = resolve(import.meta.dirname, 'rooms');
 

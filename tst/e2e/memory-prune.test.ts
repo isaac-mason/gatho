@@ -1,8 +1,8 @@
 // tests that memoryDriver prunes stale servers, their rooms/clients,
 // and expired client reservations on the background interval
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMemoryDriver } from '../../driver';
-import type { Driver } from '../../driver/types';
+import { createMemoryDriver } from '../../src/driver';
+import type { Driver } from '../../src/driver/types';
 
 const STALE_MS = 30_000;
 const PRUNE_INTERVAL_MS = 10_000;
