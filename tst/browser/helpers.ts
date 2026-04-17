@@ -37,7 +37,7 @@ export function startPageServer(): Promise<{ port: number; close: () => void }> 
     const html = buildPage(clientBundle);
 
     return new Promise((resolve, reject) => {
-        const server = createHttpServer((req, res) => {
+        const server = createHttpServer((_req, res) => {
             res.writeHead(200, { 'Content-Type': 'text/html' });
             res.end(html);
         });

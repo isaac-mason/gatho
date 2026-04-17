@@ -304,11 +304,6 @@ describe('reconnection lifecycle', () => {
         // but the session is invalid, so server sends __auth_error
         const conn = connect('ws://127.0.0.1:19916?session=invalid-token');
 
-        let closeCode = 0;
-        conn.on('close', (code) => {
-            closeCode = code;
-        });
-
         await sleep(500);
 
         // the connection should have been closed — server sent __auth_error
