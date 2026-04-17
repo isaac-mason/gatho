@@ -43,7 +43,7 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 
 ## Concepts
 
-A **room** (`gatho/room`) is a shared multiplayer session — a game match, a lobby, a collaborative space. State lives in module scope and clients connect directly over WebSocket.
+A **room** (`gatho/room`) is a shared multiplayer session — a game match, a lobby, a collaborative space. Organise statee
 
 A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — by default `subprocess()` spawns each room as its own process, but you can run rooms in the same process, in a container, or anywhere else. Rooms report their health and status back to the server over a Unix domain socket. Running multiple servers gives you horizontal scale.
 
