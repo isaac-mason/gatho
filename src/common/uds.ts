@@ -84,7 +84,12 @@ export function sendMessage(socket: Socket, msg: RoomMessage): void {
 
 // streaming frame reader — handles partial reads and buffering across data events.
 // returns a push function that accepts raw chunks from the socket.
-export function createFrameReader(onMessage: (msg: RoomMessage) => void): (data: Buffer | Uint8Array) => void {
+// malformed frames are dropped with a log rather than thrown — callers are socket
+// 'data' handlers which must not throw.
+export function createFrameReader(
+    onMessage: (msg: RoomMessage) => void,
+    onError?: (err: unknown) => void,
+): (data: Buffer | Uint8Array) => void {
     let buffer = Buffer.alloc(0) as Buffer;
 
     return (data: Buffer | Uint8Array) => {
@@ -100,7 +105,13 @@ export function createFrameReader(onMessage: (msg: RoomMessage) => void): (data:
             const payload = buffer.subarray(HEADER_SIZE, totalFrameSize);
             buffer = buffer.subarray(totalFrameSize);
 
-            onMessage(ipcCodec.unpack(payload));
+            try {
+                onMessage(ipcCodec.unpack(payload));
+            } catch (err) {
+                // malformed frame — drop it and keep reading. never let a decode
+                // error propagate out of a socket 'data' handler.
+                onError?.(err);
+            }
         }
     };
 }

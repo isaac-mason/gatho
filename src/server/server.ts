@@ -323,24 +323,27 @@ async function createRoom(s: ServerState, roomId: string, roomType: string, data
     // race UDS connection against child exit — if the child crashes before
     // connecting (bad path, syntax error, etc.), we reject immediately instead
     // of blocking for the full 30s UDS timeout.
+    //
+    // we also wire the post-startup exit handler here (guarded by `started`) so
+    // there's no window between the race resolving and the handler being attached
+    // where a fast crash could go undetected.
+    let started = false;
     const childExited = new Promise<never>((_, reject) => {
         spawnResult.onExit((code) => {
-            reject(new Error(`room process exited during startup (code ${code})`));
+            if (!started) {
+                reject(new Error(`room process exited during startup (code ${code})`));
+            } else {
+                cleanupRoom(s, roomId, 'process-exited');
+            }
         });
     });
 
     const uds = await Promise.race([udsPromise, childExited]);
+    started = true;
 
     // wire up the room process handle
     roomProcess.kill = () => spawnResult.kill();
     roomProcess.closeIpc = () => uds.close();
-
-    // now that the process is registered, wire up exit handler for post-startup
-    // crashes. if the child exited during startup, the race above already rejected
-    // and we never reach here.
-    spawnResult.onExit((_code) => {
-        cleanupRoom(s, roomId, 'process-exited');
-    });
 
     s.processes.set(roomId, roomProcess);
     s.lastHeartbeats.set(roomId, Date.now());
@@ -465,10 +468,12 @@ function stopReconciler(s: ServerState): void {
 
 async function reapStaleServers(s: ServerState): Promise<void> {
     const stale = await s.driver.listStaleServers();
-    for (const server of stale) {
-        log.info('reaping stale server', { staleServerId: server.serverId, endpoint: server.endpoint });
-        await s.driver.unregisterServer(server.serverId);
-    }
+    await Promise.all(
+        stale.map((server) => {
+            log.info('reaping stale server', { staleServerId: server.serverId, endpoint: server.endpoint });
+            return s.driver.unregisterServer(server.serverId);
+        }),
+    );
 }
 
 async function cleanOrphanedRoomEntries(s: ServerState): Promise<void> {
@@ -496,11 +501,8 @@ async function cleanOrphanedRoomEntries(s: ServerState): Promise<void> {
     const allRooms = await s.driver.listRooms();
     const liveRoomIds = new Set(allRooms.map((r) => r.roomId));
 
-    for (const roomId of serverRoomIds) {
-        if (!liveRoomIds.has(roomId)) {
-            await s.driver.unregisterRoom(roomId);
-        }
-    }
+    const orphaned = Array.from(serverRoomIds).filter((id) => !liveRoomIds.has(id));
+    await Promise.all(orphaned.map((roomId) => s.driver.unregisterRoom(roomId)));
 }
 
 async function runLeaderDuties(s: ServerState): Promise<void> {
@@ -519,16 +521,25 @@ async function attemptLeaderElection(s: ServerState): Promise<void> {
         s.isLeader = true;
         log.info('acquired leadership', { serverId: s.serverId });
 
-        s.leaderRenewalInterval = setInterval(async () => {
-            const renewed = await s.driver.renewLeader(s.serverId);
-            if (!renewed) {
-                log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
-                s.isLeader = false;
-                if (s.leaderRenewalInterval) {
-                    clearInterval(s.leaderRenewalInterval);
-                    s.leaderRenewalInterval = null;
-                }
-            }
+        s.leaderRenewalInterval = setInterval(() => {
+            s.driver
+                .renewLeader(s.serverId)
+                .then((renewed) => {
+                    if (!renewed) {
+                        log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
+                        s.isLeader = false;
+                        if (s.leaderRenewalInterval) {
+                            clearInterval(s.leaderRenewalInterval);
+                            s.leaderRenewalInterval = null;
+                        }
+                    }
+                })
+                .catch((err) => {
+                    // driver error during renewal — log and keep trying next tick.
+                    // we do not flip isLeader here: the lock ttl may still be live,
+                    // and the next successful renewal will confirm or lose it.
+                    log.error('leader renewal error', { serverId: s.serverId, err });
+                });
         }, LEADER_RENEWAL_INTERVAL_MS);
 
         await runLeaderDuties(s);
@@ -599,6 +610,13 @@ async function start(s: ServerState): Promise<void> {
             }
             resolve();
         });
+    });
+
+    // replace the startup error listener with a persistent one — without this,
+    // post-startup http errors (e.g. ECONNRESET) become uncaught EventEmitter errors.
+    s.httpServer.removeAllListeners('error');
+    s.httpServer.on('error', (err) => {
+        log.error('http server error', { err });
     });
 
     const adminHost = s.currentAddress?.host ?? s.host;

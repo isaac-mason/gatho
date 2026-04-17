@@ -9,6 +9,7 @@ import {
     ServerNotFoundError,
 } from '../common/errors';
 import { jwtSign } from '../common/jwt';
+import { log } from '../common/logger';
 import type {
     ClientInfo,
     ClientReservation,
@@ -33,7 +34,7 @@ import { validateTags } from './types';
 export async function createPostgresDriver(options: PostgresDriverOptions = {}): Promise<Driver> {
     const db = options.sql ?? postgres(options.url ?? process.env.GATHO_POSTGRES_URL ?? 'postgresql://localhost:5432/gatho');
     const t = createTableNames(options.schema ?? 'gatho');
-    await ensureSchema(db, t);
+    await ensureSchemaWithRetry(db, t);
 
     // helper: get clients for a room
     async function getClientsForRoom(db: Sql, roomId: string): Promise<ClientInfo[]> {
@@ -574,6 +575,33 @@ function createTableNames(schema: string): SchemaTable {
     };
 }
 
+// retries ensureSchema with exponential backoff until postgres is reachable.
+// mirrors ioredis behaviour: the driver factory never rejects just because
+// the db isn't up yet — it keeps trying and resolves once the schema is ready.
+const SCHEMA_RETRY_BASE_MS = 500;
+const SCHEMA_RETRY_MAX_MS = 30_000;
+const SCHEMA_RETRY_JITTER_MS = 200;
+
+async function ensureSchemaWithRetry(sql: Sql, t: SchemaTable): Promise<void> {
+    let attempt = 0;
+    while (true) {
+        try {
+            await ensureSchema(sql, t);
+            if (attempt > 0) {
+                log.info('postgres schema ready after retry', { attempts: attempt + 1 });
+            }
+            return;
+        } catch (err) {
+            attempt++;
+            const backoff = Math.min(SCHEMA_RETRY_BASE_MS * 2 ** (attempt - 1), SCHEMA_RETRY_MAX_MS);
+            const jitter = Math.random() * SCHEMA_RETRY_JITTER_MS;
+            const delay = backoff + jitter;
+            log.warn('postgres not ready, retrying', { attempt, delayMs: Math.round(delay), err });
+            await new Promise<void>((r) => setTimeout(r, delay));
+        }
+    }
+}
+
 // schema creation — uses UNLOGGED tables for speed (no WAL writes).
 // all gatho state is ephemeral and reconstructed on startup.
 // tables live in a dedicated pg schema so we can atomically
@@ -583,81 +611,95 @@ function createTableNames(schema: string): SchemaTable {
 async function ensureSchema(sql: Sql, t: SchemaTable): Promise<void> {
     // schema_version lives in public — must survive DROP SCHEMA CASCADE.
     // regular (logged) table so it persists across unclean pg restarts.
+    // single-row enforced by primary key so we never get stale duplicate rows.
     await sql`
         create table if not exists ${sql.unsafe(t.schemaVersion)} (
+            id      integer primary key default 1 check (id = 1),
             version integer not null
         )
     `;
 
-    const rows = await sql<{ version: number }[]>`
-        select version from ${sql.unsafe(t.schemaVersion)} limit 1
-    `;
+    // advisory lock scoped to this transaction prevents concurrent servers racing
+    // through migration at the same time. hashtext gives a stable integer key
+    // from the schema name so different schemas don't contend with each other.
+    // re-check the version inside the lock — another server may have already
+    // completed the migration by the time we acquire it.
+    await sql.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtext(${t.schema}))`;
 
-    if (rows.length > 0 && rows[0].version === SCHEMA_VERSION) return;
+        const rows = await tx<{ version: number }[]>`
+            select version from ${tx.unsafe(t.schemaVersion)} limit 1
+        `;
 
-    // mismatch or missing — nuke the entire schema and recreate.
-    // this is the pg equivalent of redis SCAN+UNLINK — one atomic drop
-    // covers every table/index/sequence regardless of what prior versions created.
-    await sql`drop schema if exists ${sql.unsafe(`"${t.schema}"`)} cascade`;
-    await sql`create schema ${sql.unsafe(`"${t.schema}"`)}`;
-    await sql`delete from ${sql.unsafe(t.schemaVersion)}`;
+        if (rows.length > 0 && rows[0].version === SCHEMA_VERSION) return;
 
-    await sql`
-        create unlogged table ${sql.unsafe(t.servers)} (
-            server_id   text primary key,
-            endpoint    text not null,
-            tags        jsonb not null default '{}',
-            room_types  text[] not null default '{}',
-            last_heartbeat bigint not null
-        )
-    `;
+        // mismatch or missing — nuke the entire schema and recreate.
+        // this is the pg equivalent of redis SCAN+UNLINK — one atomic drop
+        // covers every table/index/sequence regardless of what prior versions created.
+        // all ddl is inside a transaction so a mid-migration crash leaves no
+        // partial state — the version row is only written on full success.
+        await tx`drop schema if exists ${tx.unsafe(`"${t.schema}"`)} cascade`;
+        await tx`create schema ${tx.unsafe(`"${t.schema}"`)}`;
+        await tx`delete from ${tx.unsafe(t.schemaVersion)}`;
 
-    await sql`
-        create unlogged table ${sql.unsafe(t.rooms)} (
-            room_id     text primary key,
-            room_type   text not null,
-            server_id   text not null references ${sql.unsafe(t.servers)}(server_id) on delete cascade,
-            status      text not null default 'requested',
-            endpoint    text,
-            room_secret text,
-            data        jsonb not null default '{}',
-            tags        jsonb not null default '{}',
-            created_at  bigint not null
-        )
-    `;
+        await tx`
+            create unlogged table ${tx.unsafe(t.servers)} (
+                server_id   text primary key,
+                endpoint    text not null,
+                tags        jsonb not null default '{}',
+                room_types  text[] not null default '{}',
+                last_heartbeat bigint not null
+            )
+        `;
 
-    // index for fast lookups by server_id (used by getDesiredState, getRoomsForServer)
-    await sql`
-        create index on ${sql.unsafe(t.rooms)}(server_id)
-    `;
+        await tx`
+            create unlogged table ${tx.unsafe(t.rooms)} (
+                room_id     text primary key,
+                room_type   text not null,
+                server_id   text not null references ${tx.unsafe(t.servers)}(server_id) on delete cascade,
+                status      text not null default 'requested',
+                endpoint    text,
+                room_secret text,
+                data        jsonb not null default '{}',
+                tags        jsonb not null default '{}',
+                created_at  bigint not null
+            )
+        `;
 
-    await sql`
-        create unlogged table ${sql.unsafe(t.clients)} (
-            client_id   text primary key,
-            room_id     text not null references ${sql.unsafe(t.rooms)}(room_id) on delete cascade,
-            status      text not null default 'reserved',
-            expires_at  bigint not null default 0,
-            tags        jsonb not null default '{}'::jsonb
-        )
-    `;
+        // index for fast lookups by server_id (used by getDesiredState, getRoomsForServer)
+        await tx`
+            create index on ${tx.unsafe(t.rooms)}(server_id)
+        `;
 
-    // index for fast lookups by room_id (used by getClientsForRoom)
-    await sql`
-        create index on ${sql.unsafe(t.clients)}(room_id)
-    `;
+        await tx`
+            create unlogged table ${tx.unsafe(t.clients)} (
+                client_id   text primary key,
+                room_id     text not null references ${tx.unsafe(t.rooms)}(room_id) on delete cascade,
+                status      text not null default 'reserved',
+                expires_at  bigint not null default 0,
+                tags        jsonb not null default '{}'::jsonb
+            )
+        `;
 
-    // leader election table — single row, row-level locking
-    await sql`
-        create unlogged table ${sql.unsafe(t.leader)} (
-            id          integer primary key default 1 check (id = 1),
-            server_id   text not null,
-            renewed_at  bigint not null
-        )
-    `;
+        // index for fast lookups by room_id (used by getClientsForRoom)
+        await tx`
+            create index on ${tx.unsafe(t.clients)}(room_id)
+        `;
 
-    await sql`
-        insert into ${sql.unsafe(t.schemaVersion)} (version) values (${SCHEMA_VERSION})
-    `;
+        // leader election table — single row, row-level locking
+        await tx`
+            create unlogged table ${tx.unsafe(t.leader)} (
+                id          integer primary key default 1 check (id = 1),
+                server_id   text not null,
+                renewed_at  bigint not null
+            )
+        `;
+
+        await tx`
+            insert into ${tx.unsafe(t.schemaVersion)} (version) values (${SCHEMA_VERSION})
+            on conflict (id) do update set version = excluded.version
+        `;
+    });
 }
 
 // helper: build a tag containment condition for jsonb @> operator.

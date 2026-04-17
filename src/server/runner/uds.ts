@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname } from 'node:path';
 import { createFrameReader, type RoomMessage, type UdsConnection } from '../../common/uds';
+import { log } from '../../common/logger';
 
 export function listenOnSocket(
     socketPath: string,
@@ -38,9 +39,17 @@ export function listenOnSocket(
 
             server.close();
 
-            const push = createFrameReader(onMessage);
+            const push = createFrameReader(onMessage, (err) => {
+                log.error('uds: malformed frame dropped', { socketPath, err });
+            });
             const onClose = options?.onClose;
 
+            // absorb socket errors — a broken pipe or reset should not become an
+            // uncaught EventEmitter error. the 'close' event fires after 'error',
+            // so cleanupRoom is still triggered via the onClose callback.
+            socket.on('error', (err) => {
+                log.error('uds: socket error', { socketPath, err });
+            });
             socket.on('data', (chunk: Buffer) => push(chunk));
             socket.on('close', () => onClose?.());
 
