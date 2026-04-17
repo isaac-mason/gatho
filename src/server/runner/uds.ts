@@ -41,7 +41,7 @@ export function listenOnSocket(
             const push = createFrameReader(onMessage);
             const onClose = options?.onClose;
 
-            socket.on('data', (chunk) => push(chunk));
+            socket.on('data', (chunk: Buffer) => push(chunk));
             socket.on('close', () => onClose?.());
 
             resolve({
