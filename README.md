@@ -12,6 +12,8 @@
 
 gatho is a javascript multiplayer toolkit for building real-time games and applications.
 
+> NOTE: gatho is in early alpha. Browse and experiment to your heart's content, but expect breaking changes for the time being.
+
 **Features**
 
 - 🕹️ Multiplayer WebSocket rooms
@@ -43,9 +45,9 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 
 ## Concepts
 
-A **room** (`gatho/room`) is a shared multiplayer session — a game match, a lobby, a collaborative space. Organise statee
+A **room** (`gatho/room`) is a shared multiplayer session — a game match, a lobby, a collaborative space. Organise your application and state however you like, use `start` to initialize the room.
 
-A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — by default `subprocess()` spawns each room as its own process, but you can run rooms in the same process, in a container, or anywhere else. Rooms report their health and status back to the server over a Unix domain socket. Running multiple servers gives you horizontal scale.
+A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — by default `subprocess()` spawns each room as its own process, but you can run rooms in the same process, in a container, whatever you want. Rooms report their health and status back to the server over a Unix domain socket. Running multiple servers gives you horizontal scale.
 
 Your backend uses the **SDK** (`gatho/sdk`) to manage rooms — create, query, and destroy them, tag them for filtering, and call `join()` to mint a short-lived token URL you hand to your client. Tags and client data make it flexible enough to build whatever matchmaking logic you need.
 
