@@ -1,11 +1,12 @@
 // reconciliation test — verifies heartbeat-driven client reconciliation
 // when fast-path connect/disconnect messages fail, the heartbeat backstop
 // should eventually correct driver state.
+
+import { createMemoryDriver } from 'gatho/driver';
+import { createGathoSDK } from 'gatho/sdk';
+import type { Server } from 'gatho/server';
+import { createServer, subprocess } from 'gatho/server';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createMemoryDriver } from '../../src/driver';
-import { createGathoSDK } from '../../src/sdk';
-import { createServer, subprocess } from '../../src/server';
-import type { Server } from '../../src/server/server';
 import { connectAndCollect, roomScripts, sleep, waitUntil } from './helpers';
 
 describe('client reconciliation via heartbeat', () => {

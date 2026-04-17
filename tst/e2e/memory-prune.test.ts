@@ -1,8 +1,9 @@
 // tests that memoryDriver prunes stale servers, their rooms/clients,
 // and expired client reservations on the background interval
+
+import type { Driver } from 'gatho/driver';
+import { createMemoryDriver } from 'gatho/driver';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMemoryDriver } from '../../src/driver';
-import type { Driver } from '../../src/driver/types';
 
 const STALE_MS = 30_000;
 const PRUNE_INTERVAL_MS = 10_000;

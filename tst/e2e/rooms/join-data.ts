@@ -1,5 +1,5 @@
 // join-data room — sends joinData back to the client on join
-import { auth, start } from '../../../src/room';
+import { auth, start } from 'gatho/room';
 
 await start({
     onAuth: (_room, joinData: Record<string, unknown>) => auth.ok({ joinData }),

@@ -35,9 +35,9 @@ function bundle(input, output, external = []) {
 
 export default [
     bundle('./src/common/index.ts', 'dist/common.js', []),
-    bundle('./src/server/index.ts', 'dist/server.js', []),
-    bundle('./src/client/index.ts', 'dist/client.js', []),
-    bundle('./src/room/index.ts', 'dist/room.js', ['ws']),
-    bundle('./src/sdk/index.ts', 'dist/sdk.js', []),
-    bundle('./src/driver/index.ts', 'dist/driver.js', ['postgres', 'ioredis']),
+    bundle('./src/server/index.ts', 'dist/server.js', ['gatho/common']),
+    bundle('./src/client/index.ts', 'dist/client.js', ['gatho/common']),
+    bundle('./src/room/index.ts', 'dist/room.js', ['ws', 'gatho/common']),
+    bundle('./src/sdk/index.ts', 'dist/sdk.js', ['gatho/common']),
+    bundle('./src/driver/index.ts', 'dist/driver.js', ['postgres', 'ioredis', 'gatho/common']),
 ];

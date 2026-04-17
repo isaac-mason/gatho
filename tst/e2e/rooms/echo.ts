@@ -1,5 +1,5 @@
 // echo room — sends every message back to the sender
-import { auth, start } from '../../../src/room';
+import { auth, start } from 'gatho/room';
 
 await start({
     onAuth: () => auth.ok({}),

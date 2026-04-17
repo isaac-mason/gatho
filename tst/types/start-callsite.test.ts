@@ -1,7 +1,8 @@
 // type-level tests for start() generic inference.
 // verifies that ClientData and JoinData are correctly inferred from callback annotations.
+
+import { auth, type StartOptions } from 'gatho/room';
 import { describe, expectTypeOf, test } from 'vitest';
-import { auth, type StartOptions } from '../../src/room';
 
 // real function with the same generic signature as start().
 // avoids spinning up an actual server — we only care about types.

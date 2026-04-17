@@ -2,7 +2,7 @@
 // is delivered to the room's onAuth callback as joinData
 import { afterEach, describe, expect, it } from 'vitest';
 import { memoryDriverSetup } from './drivers';
-import { buildContext, connectAndCollect, sleep, type TestContext } from './helpers';
+import { buildContext, connectAndCollect, type TestContext } from './helpers';
 
 describe('join data', () => {
     let ctx: TestContext;

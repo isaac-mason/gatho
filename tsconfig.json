@@ -18,6 +18,6 @@
         "rootDir": "./",
         "allowSyntheticDefaultImports": true
     },
-    "include": ["./src"],
+    "include": ["./src", "./tst"],
     "exclude": ["./dist"]
 }

@@ -242,7 +242,7 @@ export type Driver = {
 
 // --- tag validation ---
 
-import { InvalidTagError } from '../common/errors';
+import { InvalidTagError } from 'gatho/common';
 
 const VALID_TAG_RE = /^[a-zA-Z0-9_-]+$/;
 

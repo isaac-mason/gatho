@@ -1,7 +1,7 @@
+import { connect } from 'gatho/client';
+import type { Room } from 'gatho/room';
+import { auth, start } from 'gatho/room';
 import { afterEach, describe, expect, it } from 'vitest';
-import { connect } from '../../src/client';
-import type { Room } from '../../src/room';
-import { auth, start } from '../../src/room';
 
 function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));

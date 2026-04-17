@@ -21,7 +21,7 @@
 
 import type { Page, WebSocketRoute } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import type { Client } from '../../src/room';
+import type { Client } from 'gatho/room';
 import { startPageServer, startRoom } from './helpers';
 
 type W = Record<string, any>;

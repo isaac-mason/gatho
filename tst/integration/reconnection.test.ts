@@ -3,10 +3,11 @@
 // these tests use node's WebSocket client (via gatho client), not a real browser.
 // network-drop scenarios (close code 1006, backoff, buffering during offline)
 // are tested in tst/browser/ with playwright + setOffline.
+
+import { connect } from 'gatho/client';
+import type { Client, Room } from 'gatho/room';
+import { auth, start } from 'gatho/room';
 import { afterEach, describe, expect, it } from 'vitest';
-import { connect } from '../../src/client';
-import type { Client, Room } from '../../src/room';
-import { auth, start } from '../../src/room';
 
 function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));

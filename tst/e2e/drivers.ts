@@ -1,7 +1,7 @@
 // driver setup definitions for e2e tests
 import Redis from 'ioredis';
-import { createMemoryDriver, createPostgresDriver, createRedisDriver } from '../../src/driver';
-import type { Driver } from '../../src/driver';
+import { createMemoryDriver, createPostgresDriver, createRedisDriver } from 'gatho/driver';
+import type { Driver } from 'gatho/driver';
 
 export type DriverSetup = {
     name: string;
