@@ -66,11 +66,14 @@ And you can connect to URLs returned by `join()` with `gatho/client`:
 
 <Snippet source="./src/quick-start-client.ts" />
 
+## Examples
+
+- [**chat**](./examples/chat) — a onebox chat app (one process, in-memory driver). Good for getting started and seeing how the pieces fit together without any infra.
+- [**ha**](./examples/ha) — example demonstrating multiple gatho servers sharing state via Redis, a separate REST backend, and Caddy in front. This has the "shape" of a production setup but is meant to be run locally for experimentation.
+
 ## Server
 
-`gatho/server` hosts rooms. Call `start()` with a driver, a `roomEndpoint` mapper, and a `rooms` map telling the server how to run each room type. The server registers itself with the driver, runs a reconciliation loop that picks up room assignments, and handles per-room lifecycle — spawning the room, wiring IPC over a Unix domain socket, tracking heartbeats, and cleaning up on exit. Run multiple servers against the same driver for horizontal scale.
-
-`start()` resolves to a handle with `stop()`, `address()`, `serverId`, and room introspection methods.
+`gatho/server` is the host process for your rooms. When starting a server you tell it how to run different types of rooms, and it takes care of placement, spawning, health tracking, and shutdown. Run multiple instances against the same driver (e.g. Redis, Postgres) for horizontal scale.
 
 ### Runners
 
@@ -98,7 +101,7 @@ For Docker, microVMs, or any other runtime, write the runner body directly. The 
 
 ## Rooms
 
-`gatho/room` is the runtime that hosts a single multiplayer session. Call `start()` with lifecycle callbacks — auth, join, message, drop, reconnect, leave, shutdown — and you get back a room handle for sending and broadcasting. The room manages its own WebSocket transport on an OS-assigned port and reports back to the server over IPC.
+`gatho/room` is the runtime for a single multiplayer session — a game match, a lobby, a collaborative space. You supply lifecycle callbacks — auth, join, message, drop, reconnect, leave, shutdown — and get back a handle for sending messages to and broadcasting to connected clients.
 
 ### Lifecycle
 
