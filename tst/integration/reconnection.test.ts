@@ -39,6 +39,7 @@ describe('reconnection lifecycle', () => {
         let leaveCalled = false;
 
         room = await start({
+            standalone: true,
             port: 19901,
             onAuth: () => auth.ok({}),
             onDrop: () => {
@@ -74,6 +75,7 @@ describe('reconnection lifecycle', () => {
         let leaveCalled = false;
 
         room = await start({
+            standalone: true,
             port: 19903,
             onAuth: () => auth.ok({}),
             // no onDrop — backward compatible behavior
@@ -100,6 +102,7 @@ describe('reconnection lifecycle', () => {
         let joinedClient: Client | null = null;
 
         room = await start({
+            standalone: true,
             port: 19904,
             onAuth: () => auth.ok({}),
             onJoin: (_r, client) => {
@@ -140,6 +143,7 @@ describe('reconnection lifecycle', () => {
         const joinedIds: string[] = [];
 
         room = await start({
+            standalone: true,
             port: 19906,
             onAuth: () => auth.ok({}),
             onJoin: (_r, client) => {
@@ -177,6 +181,7 @@ describe('reconnection lifecycle', () => {
         let dropCalled = false;
 
         room = await start({
+            standalone: true,
             port: 19907,
             onAuth: () => auth.ok({}),
             onDrop: () => {
@@ -200,6 +205,7 @@ describe('reconnection lifecycle', () => {
 
     it('client send during reconnecting state buffers reliable messages', async () => {
         room = await start({
+            standalone: true,
             port: 19912,
             onAuth: () => auth.ok({}),
         });
@@ -227,6 +233,7 @@ describe('reconnection lifecycle', () => {
 
     it('client send buffer overflow transitions to closed', async () => {
         room = await start({
+            standalone: true,
             port: 19913,
             onAuth: () => auth.ok({}),
         });
@@ -262,6 +269,7 @@ describe('reconnection lifecycle', () => {
         const leftIds: string[] = [];
 
         room = await start({
+            standalone: true,
             port: 19915,
             onAuth: () => auth.ok({}),
             onJoin: (_r, client) => {
@@ -296,6 +304,7 @@ describe('reconnection lifecycle', () => {
 
     it('onAuth rejection during reconnection — client receives authError', async () => {
         room = await start({
+            standalone: true,
             port: 19916,
             onAuth: () => auth.ok({}),
         });
@@ -319,6 +328,7 @@ describe('reconnection lifecycle', () => {
         let leaveData: TestData | null = null;
 
         room = await start<TestData>({
+            standalone: true,
             port: 19917,
             onAuth: () => auth.ok({ role: 'admin' }),
             onJoin: (_r, client) => {

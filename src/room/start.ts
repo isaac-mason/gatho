@@ -93,14 +93,19 @@ export type ServerConfig = {
 
 /** options for starting a room via `start()`.
  *
- *  two modes depending on whether a server is managing this room:
+ *  two modes depending on how the room is invoked:
  *
- *  - **managed mode** — room is spawned by the server (`start()` from `gatho/server`).
- *    the server sets `GATHO_*` env vars automatically. ipc connects to the parent
- *    for heartbeats, ready signals, and client tracking.
+ *  - **managed mode** (default when `GATHO_*` env vars or `options.server` are present) —
+ *    the server spawns the room and sets `GATHO_*` env vars, or you pass the same
+ *    values via `options.server`. ipc connects to the parent for heartbeats, ready
+ *    signals, and client tracking. client connections are authenticated via the
+ *    seat-token jwt.
  *
- *  - **standalone mode** — no server, no `GATHO_*` env vars. the room runs
- *    independently with a random roomId and no ipc. great for local dev and tests.
+ *  - **standalone mode** (opt-in via `standalone: true`) — the room runs independently
+ *    with a random roomId, no ipc, and no jwt verification. accepts any connection.
+ *    useful for local dev and tests. `start()` throws if no managed context is
+ *    detected and `standalone` is not explicitly set — this prevents accidentally
+ *    deploying a room that silently skips auth.
  *
  *  generic parameters:
  *  - `ClientData` — the data shape returned by `onAuth` via `auth.ok(data)`.
@@ -109,11 +114,16 @@ export type ServerConfig = {
  *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in. */
 export type StartOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
     /** server-managed config. when provided, fields override `GATHO_*` env vars.
-     *  when omitted, env vars are still checked — if `GATHO_SOCKET` is set
-     *  in the environment, the room connects ipc automatically.
-     *  in standalone mode (no server config, no env vars), roomId defaults
-     *  to a random uuid and roomType defaults to `'room'`. */
+     *  when omitted, env vars are checked instead — if `GATHO_SOCKET` is set,
+     *  the room connects ipc automatically. mutually exclusive with `standalone`. */
     server?: ServerConfig;
+
+    /** explicit opt-in to run without a managed server context. required when
+     *  neither `GATHO_SOCKET`/`GATHO_ROOM_SECRET` env vars are set nor
+     *  `options.server.socket`/`options.server.roomSecret` are provided —
+     *  otherwise `start()` throws. when `true`, all managed config (env vars and
+     *  `options.server`) is ignored; a warning is logged if any was present. */
+    standalone?: boolean;
 
     /** port for the ws server. `0` = os-assigned (default).
      *  in managed mode this is typically left as 0 since the server
@@ -676,16 +686,66 @@ async function stopRoom<ClientData>(
     state.ipc?.close();
 }
 
+// env vars that indicate a managed server context
+const MANAGED_ENV_KEYS = [
+    'GATHO_SOCKET',
+    'GATHO_ROOM_ID',
+    'GATHO_ROOM_TYPE',
+    'GATHO_ROOM_SECRET',
+    'GATHO_SERVER_ID',
+] as const;
+
 export async function start<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(
     options: StartOptions<ClientData, JoinData>,
 ): Promise<Room<ClientData>> {
-    // resolve config: server object > env vars > standalone defaults
-    const server = options.server;
-    const roomId = server?.roomId ?? process.env.GATHO_ROOM_ID ?? randomUUID();
-    const roomType = server?.roomType ?? process.env.GATHO_ROOM_TYPE ?? 'room';
-    const socketPath = server?.socket ?? process.env.GATHO_SOCKET;
-    const roomSecret = server?.roomSecret ?? process.env.GATHO_ROOM_SECRET ?? null;
-    const serverId = server?.serverId ?? process.env.GATHO_SERVER_ID;
+    // --- resolve managed context ---
+
+    const presentEnvKeys = MANAGED_ENV_KEYS.filter((k) => process.env[k] !== undefined);
+    const hasServerOption = options.server !== undefined;
+
+    let server: ServerConfig | undefined;
+    let roomId: string;
+    let roomType: string;
+    let socketPath: string | undefined;
+    let roomSecret: string | null;
+    let serverId: string | undefined;
+
+    if (options.standalone === true) {
+        // pure standalone — ignore all managed config
+        if (hasServerOption || presentEnvKeys.length > 0) {
+            const bits = [
+                hasServerOption ? 'options.server' : null,
+                presentEnvKeys.length > 0 ? `env vars (${presentEnvKeys.join(', ')})` : null,
+            ].filter(Boolean).join(' and ');
+            createLogger().warn(
+                `gatho/room: standalone: true is set, ignoring managed context from ${bits}`,
+            );
+        }
+        server = undefined;
+        roomId = randomUUID();
+        roomType = 'room';
+        socketPath = undefined;
+        roomSecret = null;
+        serverId = undefined;
+    } else {
+        server = options.server;
+        roomId = server?.roomId ?? process.env.GATHO_ROOM_ID ?? randomUUID();
+        roomType = server?.roomType ?? process.env.GATHO_ROOM_TYPE ?? 'room';
+        socketPath = server?.socket ?? process.env.GATHO_SOCKET;
+        roomSecret = server?.roomSecret ?? process.env.GATHO_ROOM_SECRET ?? null;
+        serverId = server?.serverId ?? process.env.GATHO_SERVER_ID;
+
+        // fail closed: require managed context OR explicit standalone opt-in.
+        // this prevents accidentally running a room with no auth in production.
+        if (!socketPath && !roomSecret) {
+            throw new Error(
+                'gatho/room start(): no managed server context detected ' +
+                '(no GATHO_SOCKET / GATHO_ROOM_SECRET, and no options.server.socket / roomSecret). ' +
+                'If running this room directly for local dev or tests, pass `standalone: true`. ' +
+                'Otherwise ensure the gatho server spawned this process so GATHO_* env vars are set.',
+            );
+        }
+    }
 
     // set up ipc if socket path is present (managed mode)
     let ipc: IpcConnection | null = null;

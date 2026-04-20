@@ -74,6 +74,7 @@ export async function startRoom<ClientData = Record<string, unknown>>(
     },
 ): Promise<{ room: Room<ClientData>; wsPort: number }> {
     const room = await start<ClientData>({
+        standalone: true,
         port: opts.port,
         onAuth: opts.onAuth ?? (() => auth.ok({} as ClientData)),
         onJoin: opts.onJoin,

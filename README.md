@@ -289,7 +289,22 @@ await start({
 
 ### Running Rooms Standalone
 
-When a room is spawned by a server, it reads `GATHO_*` env vars, connects IPC to the parent for heartbeats and client tracking, and validates seat tokens minted by `sdk.join()`. With no `GATHO_*` env vars present, the room runs standalone — it picks a random `roomId`, skips IPC, and accepts any connection. Useful for local dev and tests where you just want to `bun run room.ts` and connect a client directly.
+By default a room expects to be spawned by a gatho server — it reads `GATHO_*` env vars (set automatically when using `subprocess()`), or takes the same values via `options.server` (e.g. if you are using a custom runner). It opens a Unix domain socket (UDS) back to the parent server to report heartbeats and client connects/disconnects, and it verifies seat tokens minted by `sdk.join()` on every new connection. `start()` throws at startup if no managed context is detected, so a mis-deployed room can't silently accept unauthenticated connections.
+
+For local dev or tests where you want to `bun run room.ts` and connect a client directly, pass `standalone: true`. The room picks a random `roomId`, skips the UDS, and accepts any connection.
+
+```ts
+import { auth, start } from 'gatho/room';
+
+// opt in to standalone mode — skips jwt auth and ipc.
+// throws if `standalone` is omitted and no GATHO_* env vars are set.
+await start({
+    standalone: true,
+    port: 8080,
+    onAuth: () => auth.ok(),
+    onMessage: (room, client, message) => room.send(client, message),
+});
+```
 
 ## Messages
 

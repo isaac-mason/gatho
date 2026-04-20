@@ -39,6 +39,7 @@ describe('standalone room', () => {
 
     it('starts with auto-generated roomId and default roomType', async () => {
         room = await start({
+            standalone: true,
             onAuth: () => auth.ok({}),
         });
 
@@ -52,6 +53,7 @@ describe('standalone room', () => {
 
     it('accepts connections without jwt tokens (dev mode)', async () => {
         room = await start({
+            standalone: true,
             port: 19876,
             onAuth: () => auth.ok({}),
             onMessage: (r, client, msg) => r.send(client, msg),
@@ -69,6 +71,7 @@ describe('standalone room', () => {
 
     it('echo round-trip — send message, receive same message back', async () => {
         room = await start({
+            standalone: true,
             port: 19877,
             onAuth: () => auth.ok({}),
             onMessage: (r, client, msg) => r.send(client, msg),
@@ -89,6 +92,7 @@ describe('standalone room', () => {
 
     it('broadcast reaches all connected clients', async () => {
         room = await start({
+            standalone: true,
             port: 19878,
             onAuth: () => auth.ok({}),
             onMessage: (r, _client, msg) => r.broadcast(msg),
@@ -116,6 +120,7 @@ describe('standalone room', () => {
         let leftCount = 0;
 
         room = await start({
+            standalone: true,
             port: 19879,
             onAuth: () => auth.ok({}),
             onJoin: (r) => {
@@ -160,6 +165,7 @@ describe('standalone room', () => {
 
     it('onAuth rejection closes the connection', async () => {
         room = await start({
+            standalone: true,
             port: 19880,
             onAuth: () => auth.fail('not allowed'),
         });
@@ -187,6 +193,7 @@ describe('standalone room', () => {
 
     it('room.stop() closes all connections gracefully', async () => {
         room = await start({
+            standalone: true,
             port: 19881,
             onAuth: () => auth.ok({}),
         });
@@ -225,6 +232,7 @@ describe('standalone room', () => {
                 roomId: 'custom-id',
                 roomType: 'custom-type',
                 serverId: 'srv-1',
+                roomSecret: 'test',
             },
             onAuth: () => auth.ok({}),
         });
@@ -236,6 +244,7 @@ describe('standalone room', () => {
 
     it('multiple listeners fire for the same event', async () => {
         room = await start({
+            standalone: true,
             port: 19882,
             onAuth: () => auth.ok({}),
             onMessage: (r, client, msg) => r.send(client, msg),
@@ -261,6 +270,7 @@ describe('standalone room', () => {
 
     it('on() returns an unsubscribe function that removes the listener', async () => {
         room = await start({
+            standalone: true,
             port: 19883,
             onAuth: () => auth.ok({}),
             onMessage: (r, client, msg) => r.send(client, msg),
@@ -296,6 +306,7 @@ describe('standalone room', () => {
 
     it('off() removes a listener by reference', async () => {
         room = await start({
+            standalone: true,
             port: 19884,
             onAuth: () => auth.ok({}),
             onMessage: (r, client, msg) => r.send(client, msg),
