@@ -41,13 +41,14 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 - [Client](#client)
 - [Messages](#messages)
 - [Room Lifecycle](#room-lifecycle)
+- [Runners](#runners)
 - [Drivers](#drivers)
 
 ## Concepts
 
 A **room** (`gatho/room`) is a shared multiplayer session — a game match, a lobby, a collaborative space. Organise your application and state however you like, use `start` to initialize the room.
 
-A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — by default `subprocess()` spawns each room as its own process, but you can run rooms in the same process, in a container, whatever you want. Rooms report their health and status back to the server over a Unix domain socket. Running multiple servers gives you horizontal scale.
+A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — the built-in `subprocess()` helper spawns each room as its own child process, but you can run rooms in the same process, in a container, whatever you want. Rooms report their health and status back to the server over a Unix domain socket. Running multiple servers gives you horizontal scale.
 
 Your backend uses the **SDK** (`gatho/sdk`) to manage rooms — create, query, and destroy them, tag them for filtering, and call `join()` to mint a short-lived token URL you hand to your client. Tags and client data make it flexible enough to build whatever matchmaking logic you need.
 
@@ -91,20 +92,17 @@ Start a gatho server with a driver and tell it how to run your rooms:
 ```ts
 // server.ts
 import { createRedisDriver } from 'gatho/driver';
-import { createServer, subprocess } from 'gatho/server';
+import { runner, start, subprocess } from 'gatho/server';
 
 const driver = createRedisDriver({ url: 'redis://localhost:6379' });
 
-const server = createServer({
+await start({
     rooms: {
-        counter: subprocess(['bun', 'run', './counter-room.ts']),
+        counter: runner((ctx) => subprocess(ctx, ['bun', 'run', './counter-room.ts'])),
     },
     driver,
     roomEndpoint: ({ port }) => `ws://localhost:${port}`,
-    tags: {},
 });
-
-await server.start();
 ```
 
 Then you can start rooms using the `gatho/sdk`:
@@ -293,6 +291,83 @@ await start({
     onShutdown: () => {
         console.log('shutting down');
     },
+});
+```
+
+## Runners
+
+Runners control how room processes are started and stopped. The server maps each room type to a runner.
+
+### `subprocess()` — local processes
+
+The built-in `subprocess()` helper spawns a child process from inside a `runner()` callback. It forwards the standard `GATHO_*` env vars from `ctx.env`, wires exit signalling, and handles graceful shutdown (SIGTERM → SIGKILL escalation). Use `options.env` to pass extra env vars or forward fields from `ctx.data`.
+
+```ts
+import { createMemoryDriver } from 'gatho/driver';
+import { runner, start, subprocess } from 'gatho/server';
+
+await start({
+    rooms: {
+        game: runner((ctx) =>
+            subprocess(ctx, ['bun', 'run', './game-room.ts'], {
+                env: {
+                    GAMEMODE: ctx.data.gamemode as string,
+                },
+            }),
+        ),
+    },
+    driver: createMemoryDriver(),
+    roomEndpoint: ({ port }) => `ws://localhost:${port}`,
+});
+```
+
+### `runner()` — custom runners
+
+If you need more control over how rooms should be executed on the server (e.g. if you want to run rooms with Docker, in-process, inside a microVM, whatever else) — use the `runner()` api. You provide a function that:
+
+1. Receives a context with room metadata, a `stopped` callback
+2. Sets up the room (sync or async)
+3. Returns a destructor that the server calls to stop the room
+
+Call `ctx.stopped(code)` when the room exits for any reason (crash, natural exit, killed). The destructor owns the full shutdown strategy — graceful escalation, a single API call, whatever fits your runtime.
+
+`ctx.env` contains the standard `GATHO_*` environment variables pre-built from the spawn context, ready to spread into a process env or pass as docker `-e` flags.
+
+**Docker example:**
+
+```ts
+// runner-docker.ts — custom runner using the runner() factory
+import { spawn } from 'node:child_process';
+import { createRedisDriver } from 'gatho/driver';
+import { runner, start } from 'gatho/server';
+
+const dockerRunner = runner((ctx) => {
+    const gameMode = String(ctx.data.gameMode ?? 'classic');
+
+    const child = spawn('docker', [
+        'run', '--rm', '--network=host',
+        '--name', `room-${ctx.roomId}`,
+        '--memory', '512m',
+        '-v', '/tmp/gatho-ipc:/tmp/gatho-ipc',
+        ...Object.entries(ctx.env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+        '-e', `GAME_MODE=${gameMode}`,
+        'my-game-image:latest',
+    ], { stdio: ['ignore', 'inherit', 'inherit'] });
+
+    child.on('exit', (code) => ctx.stopped(code));
+
+    return () => {
+        child.kill('SIGTERM');
+        const timer = setTimeout(() => child.kill('SIGKILL'), 10_000);
+        timer.unref();
+    };
+});
+
+await start({
+    rooms: { game: dockerRunner },
+    driver: createRedisDriver({ url: 'redis://localhost:6379' }),
+    roomEndpoint: ({ port }) => `wss://my-host/${port}`,
+    tags: { region: 'us-east-1' },
 });
 ```
 

@@ -1,4 +1,4 @@
-// createServer - main entry point for gatho server
+// start - main entry point for gatho server
 // uses reconciliation loop for room spawning.
 // rooms run their own websocket servers — clients connect directly.
 // this process is control-plane only: health checks, reconciliation, leader election.
@@ -36,8 +36,8 @@ export type CreateServerOptions = {
     host?: string;
     /** interval for reconciliation loop in milliseconds */
     reconcileIntervalMs?: number;
-    /** tags for this server instance */
-    tags: Record<string, string>;
+    /** tags for this server instance (defaults to `{}`) */
+    tags?: Record<string, string>;
     /** timeout for draining rooms in milliseconds */
     drainTimeoutMs?: number;
     /** full URL for this server's admin HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
@@ -53,7 +53,6 @@ export type RoomDetails = {
 };
 
 export type Server = {
-    start(): Promise<void>;
     stop(): Promise<void>;
     address(): { host: string; port: number } | null;
     readonly serverId: string;
@@ -590,7 +589,7 @@ function handleRequest(_req: http.IncomingMessage, res: http.ServerResponse): vo
 
 /* server lifecycle */
 
-async function start(s: ServerState): Promise<void> {
+async function startInternal(s: ServerState): Promise<void> {
     s.httpServer = http.createServer(handleRequest);
 
     s.httpServer.on('connection', (socket: Socket) => {
@@ -630,7 +629,7 @@ async function start(s: ServerState): Promise<void> {
     await s.driver.registerServer({
         serverId: s.serverId,
         endpoint: adminEndpoint,
-        tags: s.options.tags,
+        tags: s.options.tags ?? {},
         roomTypes: Array.from(s.knownRoomTypes),
     });
 
@@ -725,9 +724,9 @@ function getAllRoomDetails(s: ServerState): RoomDetails[] {
     return details;
 }
 
-/* createServer */
+/* start */
 
-export function createServer(options: CreateServerOptions): Server {
+export async function start(options: CreateServerOptions): Promise<Server> {
     const { _internal: driver } = options.driver;
     const runners = new Map(Object.entries(options.rooms));
     const socketDir = join(tmpdir(), 'gatho-ipc');
@@ -765,9 +764,10 @@ export function createServer(options: CreateServerOptions): Server {
         serverHeartbeatInterval: null,
     };
 
+    await startInternal(s);
+
     return {
         serverId: s.serverId,
-        start: () => start(s),
         stop: () => stop(s),
         address: () => s.currentAddress,
         getRoomDetails: (roomId) => getRoomDetails(s, roomId),

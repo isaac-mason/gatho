@@ -4,7 +4,7 @@
 import { createMemoryDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
 import type { Server } from 'gatho/server';
-import { createServer, subprocess } from 'gatho/server';
+import { runner, start, subprocess } from 'gatho/server';
 import { afterEach, describe, expect, it } from 'vitest';
 import { roomScripts } from './helpers';
 
@@ -21,17 +21,14 @@ describe('/ping endpoint', () => {
     it('returns 200 with body "pong"', async () => {
         const driver = createMemoryDriver();
 
-        server = createServer({
+        server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
             port: 0,
-            tags: {},
         });
-
-        await server.start();
 
         const addr = server.address();
         expect(addr).not.toBeNull();
@@ -46,24 +43,21 @@ describe('/ping endpoint', () => {
     it('responds fast (< 50ms)', async () => {
         const driver = createMemoryDriver();
 
-        server = createServer({
+        server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
             port: 0,
-            tags: {},
         });
-
-        await server.start();
 
         const addr = server.address();
         expect(addr).not.toBeNull();
 
-        const start = performance.now();
+        const startTime = performance.now();
         await fetch(`http://127.0.0.1:${addr!.port}/ping`);
-        const elapsed = performance.now() - start;
+        const elapsed = performance.now() - startTime;
 
         expect(elapsed).toBeLessThan(50);
     });
@@ -72,17 +66,14 @@ describe('/ping endpoint', () => {
         const driver = createMemoryDriver();
         const sdk = createGathoSDK({ driver });
 
-        server = createServer({
+        server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
             port: 0,
-            tags: {},
         });
-
-        await server.start();
 
         const servers = await sdk.getServers();
         expect(servers).toHaveLength(1);
@@ -102,9 +93,9 @@ describe('/ping endpoint', () => {
         const driver = createMemoryDriver();
         const sdk = createGathoSDK({ driver });
 
-        server = createServer({
+        server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
@@ -112,8 +103,6 @@ describe('/ping endpoint', () => {
             tags: {},
             serverEndpoint: 'https://us-east.example.com',
         });
-
-        await server.start();
 
         const servers = await sdk.getServers();
         expect(servers).toHaveLength(1);

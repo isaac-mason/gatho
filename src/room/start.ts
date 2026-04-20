@@ -95,9 +95,9 @@ export type ServerConfig = {
  *
  *  two modes depending on whether a server is managing this room:
  *
- *  - **managed mode** — room is spawned by `createServer()`. the server sets
- *    `GATHO_*` env vars automatically. ipc connects to the parent for heartbeats,
- *    ready signals, and client tracking.
+ *  - **managed mode** — room is spawned by the server (`start()` from `gatho/server`).
+ *    the server sets `GATHO_*` env vars automatically. ipc connects to the parent
+ *    for heartbeats, ready signals, and client tracking.
  *
  *  - **standalone mode** — no server, no `GATHO_*` env vars. the room runs
  *    independently with a random roomId and no ipc. great for local dev and tests.

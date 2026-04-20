@@ -138,7 +138,7 @@ export type DesiredRoom = {
 };
 
 /** driver interface — all methods are internal to gatho.
- *  use createServer() or createGathoSDK() instead of calling these directly. */
+ *  use start() or createGathoSDK() instead of calling these directly. */
 export type Driver = {
     /** optional cleanup hook — stops background timers, releases resources.
      *  only relevant for drivers that run background work (e.g. memoryDriver prune interval). */

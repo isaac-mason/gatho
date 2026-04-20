@@ -5,7 +5,7 @@
 import { createMemoryDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
 import type { Server } from 'gatho/server';
-import { createServer, subprocess } from 'gatho/server';
+import { runner, start, subprocess } from 'gatho/server';
 import { afterEach, describe, expect, it } from 'vitest';
 import { connectAndCollect, roomScripts, sleep, waitUntil } from './helpers';
 
@@ -35,17 +35,14 @@ describe('client reconciliation via heartbeat', () => {
             return originalConnect(clientId);
         };
 
-        server = createServer({
+        server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
             port: 0,
-            tags: {},
         });
-
-        await server.start();
 
         // create room and join
         const room = await sdk.createRoom({
@@ -97,17 +94,14 @@ describe('client reconciliation via heartbeat', () => {
         const driver = createMemoryDriver();
         const sdk = createGathoSDK({ driver });
 
-        server = createServer({
+        server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
             port: 0,
-            tags: {},
         });
-
-        await server.start();
 
         // create room and join
         const room = await sdk.createRoom({
@@ -197,17 +191,14 @@ describe('client reconciliation via heartbeat', () => {
             return originalDisconnect(clientId);
         };
 
-        server = createServer({
+        server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
             port: 0,
-            tags: {},
         });
-
-        await server.start();
 
         // create room and join
         const room = await sdk.createRoom({

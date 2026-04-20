@@ -5,7 +5,7 @@ import { connect } from 'gatho/client';
 import type { Driver } from 'gatho/driver';
 import type { GathoSDK } from 'gatho/sdk';
 import { createGathoSDK } from 'gatho/sdk';
-import { createServer, subprocess } from 'gatho/server';
+import { runner, start, subprocess } from 'gatho/server';
 import type { Server } from 'gatho/server';
 
 const ROOMS_DIR = resolve(import.meta.dirname, 'rooms');
@@ -29,18 +29,17 @@ export function buildContext(driver: Driver): TestContext {
     const servers: Server[] = [];
 
     async function startServer(opts?: { tags?: Record<string, string> }): Promise<Server> {
-        const server = createServer({
+        const server = await start({
             rooms: {
-                echo: subprocess(['bun', 'run', roomScripts.echo]),
-                'join-data': subprocess(['bun', 'run', roomScripts.joinData]),
+                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
+                'join-data': runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.joinData])),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
             port: 0,
-            tags: opts?.tags ?? {},
+            tags: opts?.tags,
         });
 
-        await server.start();
         servers.push(server);
         return server;
     }

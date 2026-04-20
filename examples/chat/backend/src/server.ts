@@ -1,7 +1,7 @@
 import Bun from 'bun';
 import { createMemoryDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
-import { createServer, subprocess } from 'gatho/server';
+import { runner, start, subprocess } from 'gatho/server';
 
 const API_PORT = 3001;
 
@@ -10,16 +10,13 @@ const driver = createMemoryDriver();
 
 // --- gatho server (control plane + room management) ---
 
-const server = createServer({
+const server = await start({
     rooms: {
-        chat: subprocess(['bun', 'run', new URL('./room.ts', import.meta.url).pathname]),
+        chat: runner((ctx) => subprocess(ctx, ['bun', 'run', new URL('./room.ts', import.meta.url).pathname])),
     },
     driver,
     roomEndpoint: ({ port }) => `ws://localhost:${port}`,
-    tags: {},
 });
-
-await server.start();
 
 // --- lobby api (room creation + seat reservation) ---
 

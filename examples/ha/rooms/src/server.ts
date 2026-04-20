@@ -11,7 +11,7 @@
 //   GATHO_PORT        — health check port for this server instance (required)
 
 import { createRedisDriver } from 'gatho/driver';
-import { createServer, subprocess } from 'gatho/server';
+import { runner, start, subprocess } from 'gatho/server';
 
 const caddyPort = process.env.GATHO_CADDY_PORT;
 if (!caddyPort) {
@@ -28,18 +28,15 @@ if (!port) {
 const host = process.env.GATHO_HOST ?? 'localhost';
 const redisUrl = process.env.GATHO_REDIS_URL ?? 'redis://localhost:6379';
 
-const server = createServer({
+const server = await start({
     rooms: {
-        ping: subprocess(['bun', 'run', new URL('./ping-room.ts', import.meta.url).pathname]),
+        ping: runner((ctx) => subprocess(ctx, ['bun', 'run', new URL('./ping-room.ts', import.meta.url).pathname])),
     },
     driver: createRedisDriver({ url: redisUrl }),
     // room on ephemeral port -> client connects through caddy at /{room_port}
     roomEndpoint: ({ port }) => `ws://${host}:${caddyPort}/${port}`,
     port: Number(port),
-    tags: {},
 });
-
-await server.start();
 
 console.log('');
 console.log('  \x1b[1mgatho\x1b[0m \x1b[2mha example — server\x1b[0m');
