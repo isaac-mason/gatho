@@ -1,6 +1,6 @@
 {
     "name": "gatho",
-    "version": "0.0.0-alpha-2",
+    "version": "0.0.0-alpha-3",
     "author": "Isaac Mason <isaac@isaacmason.com>",
     "description": "javascript multiplayer toolkit for building real-time games and applications",
     "keywords": [
