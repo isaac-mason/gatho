@@ -1,4 +1,3 @@
-// runner-docker.ts — custom runner using the runner() factory
 import { spawn } from 'node:child_process';
 import { createRedisDriver } from 'gatho/driver';
 import { runner, start } from 'gatho/server';

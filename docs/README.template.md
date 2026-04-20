@@ -66,6 +66,56 @@ And you can connect to URLs returned by `join()` with `gatho/client`:
 
 <Snippet source="./src/quick-start-client.ts" />
 
+## Server
+
+`gatho/server` hosts rooms. Call `start()` with a driver, a `roomEndpoint` mapper, and a `rooms` map telling the server how to run each room type. The server registers itself with the driver, runs a reconciliation loop that picks up room assignments, and handles per-room lifecycle — spawning the room, wiring IPC over a Unix domain socket, tracking heartbeats, and cleaning up on exit. Run multiple servers against the same driver for horizontal scale.
+
+`start()` resolves to a handle with `stop()`, `address()`, `serverId`, and room introspection methods.
+
+### Runners
+
+A runner is a function that knows how to start and stop a single room. The server calls it once per room assignment. The callback you pass to `runner()`:
+
+1. Receives a context with room metadata (`ctx.roomId`, `ctx.data`, `ctx.env`) and a `ctx.stopped(code)` callback.
+2. Spawns the room however you like — child process, container, in-process worker, whatever.
+3. Returns a destructor that the server invokes to stop the room.
+
+Call `ctx.stopped(code)` whenever the room exits (crash, clean exit, killed) so the server can reconcile. The destructor owns the shutdown strategy — graceful escalation, a single API call, whatever fits your runtime.
+
+`ctx.env` contains the standard `GATHO_*` environment variables pre-built for the room, ready to spread into a process env or pass as docker `-e` flags.
+
+#### `subprocess()` — child processes
+
+`subprocess()` is a helper for the common case: spawn a node/bun child process. It's called from inside a `runner()` callback, forwards `ctx.env`, wires exit signalling, and handles graceful shutdown (SIGTERM → SIGKILL escalation). Use `options.env` to pass extra env vars or forward fields from `ctx.data`.
+
+<Snippet source="./src/runner-subprocess.ts" />
+
+#### Custom runners
+
+For Docker, microVMs, or any other runtime, write the runner body directly. The destructor only needs to stop whatever you spawned.
+
+<Snippet source="./src/runner-docker.ts" />
+
+## Rooms
+
+`gatho/room` is the runtime that hosts a single multiplayer session. Call `start()` with lifecycle callbacks — auth, join, message, drop, reconnect, leave, shutdown — and you get back a room handle for sending and broadcasting. The room manages its own WebSocket transport on an OS-assigned port and reports back to the server over IPC.
+
+### Lifecycle
+
+<Snippet source="./src/room-lifecycle.ts" />
+
+### Running Rooms Standalone
+
+When a room is spawned by a server, it reads `GATHO_*` env vars, connects IPC to the parent for heartbeats and client tracking, and validates seat tokens minted by `sdk.join()`. With no `GATHO_*` env vars present, the room runs standalone — it picks a random `roomId`, skips IPC, and accepts any connection. Useful for local dev and tests where you just want to `bun run room.ts` and connect a client directly.
+
+## Messages
+
+gatho is unopinionated about message format — `room.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` / `JSON.parse()` yourself — gatho stays out of the way.
+
+If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types — no code generation, no IDL files.
+
+<Snippet source="./src/binary-messages.ts" />
+
 ## Client
 
 `gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself:
@@ -78,44 +128,6 @@ And you can connect to URLs returned by `join()` with `gatho/client`:
 On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
 
 <Snippet source="./src/reconnection.ts" />
-
-## Messages
-
-gatho is unopinionated about message format — `room.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` / `JSON.parse()` yourself — gatho stays out of the way.
-
-If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types — no code generation, no IDL files.
-
-<Snippet source="./src/binary-messages.ts" />
-
-## Room Lifecycle
-
-<Snippet source="./src/room-lifecycle.ts" />
-
-## Runners
-
-Runners control how room processes are started and stopped. The server maps each room type to a runner.
-
-### `subprocess()` — local processes
-
-The built-in `subprocess()` helper spawns a child process from inside a `runner()` callback. It forwards the standard `GATHO_*` env vars from `ctx.env`, wires exit signalling, and handles graceful shutdown (SIGTERM → SIGKILL escalation). Use `options.env` to pass extra env vars or forward fields from `ctx.data`.
-
-<Snippet source="./src/runner-subprocess.ts" />
-
-### `runner()` — custom runners
-
-If you need more control over how rooms should be executed on the server (e.g. if you want to run rooms with Docker, in-process, inside a microVM, whatever else) — use the `runner()` api. You provide a function that:
-
-1. Receives a context with room metadata, a `stopped` callback
-2. Sets up the room (sync or async)
-3. Returns a destructor that the server calls to stop the room
-
-Call `ctx.stopped(code)` when the room exits for any reason (crash, natural exit, killed). The destructor owns the full shutdown strategy — graceful escalation, a single API call, whatever fits your runtime.
-
-`ctx.env` contains the standard `GATHO_*` environment variables pre-built from the spawn context, ready to spread into a process env or pass as docker `-e` flags.
-
-**Docker example:**
-
-<Snippet source="./src/runner-docker.ts" />
 
 ## Drivers
 

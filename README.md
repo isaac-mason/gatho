@@ -38,10 +38,10 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 
 - [Concepts](#concepts)
 - [Quick Start](#quick-start)
-- [Client](#client)
+- [Server](#server)
+- [Rooms](#rooms)
 - [Messages](#messages)
-- [Room Lifecycle](#room-lifecycle)
-- [Runners](#runners)
+- [Client](#client)
 - [Drivers](#drivers)
 
 ## Concepts
@@ -154,32 +154,138 @@ room.on('message', (msg) => {
 room.send(JSON.stringify({ type: 'increment' }));
 ```
 
-## Client
+## Server
 
-`gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself:
+`gatho/server` hosts rooms. Call `start()` with a driver, a `roomEndpoint` mapper, and a `rooms` map telling the server how to run each room type. The server registers itself with the driver, runs a reconciliation loop that picks up room assignments, and handles per-room lifecycle — spawning the room, wiring IPC over a Unix domain socket, tracking heartbeats, and cleaning up on exit. Run multiple servers against the same driver for horizontal scale.
 
-- **Automatic reconnection** — on unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter.
-- **Reliable messaging** — messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. Future features around backpressure and handling and WebTransport will build on this.
-- **Session continuity** — the server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off.
-- **Clean close** — `close()` sends a protocol-level leave message so the server knows the disconnect was intentional and skips the reconnection window.
+`start()` resolves to a handle with `stop()`, `address()`, `serverId`, and room introspection methods.
 
-On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
+### Runners
+
+A runner is a function that knows how to start and stop a single room. The server calls it once per room assignment. The callback you pass to `runner()`:
+
+1. Receives a context with room metadata (`ctx.roomId`, `ctx.data`, `ctx.env`) and a `ctx.stopped(code)` callback.
+2. Spawns the room however you like — child process, container, in-process worker, whatever.
+3. Returns a destructor that the server invokes to stop the room.
+
+Call `ctx.stopped(code)` whenever the room exits (crash, clean exit, killed) so the server can reconcile. The destructor owns the shutdown strategy — graceful escalation, a single API call, whatever fits your runtime.
+
+`ctx.env` contains the standard `GATHO_*` environment variables pre-built for the room, ready to spread into a process env or pass as docker `-e` flags.
+
+#### `subprocess()` — child processes
+
+`subprocess()` is a helper for the common case: spawn a node/bun child process. It's called from inside a `runner()` callback, forwards `ctx.env`, wires exit signalling, and handles graceful shutdown (SIGTERM → SIGKILL escalation). Use `options.env` to pass extra env vars or forward fields from `ctx.data`.
+
+```ts
+import { createMemoryDriver } from 'gatho/driver';
+import { runner, start, subprocess } from 'gatho/server';
+
+await start({
+    rooms: {
+        game: runner((ctx) =>
+            subprocess(ctx, ['bun', 'run', './game-room.ts'], {
+                env: {
+                    GAMEMODE: ctx.data.gamemode as string,
+                },
+            }),
+        ),
+    },
+    driver: createMemoryDriver(),
+    roomEndpoint: ({ port }) => `ws://localhost:${port}`,
+});
+```
+
+#### Custom runners
+
+For Docker, microVMs, or any other runtime, write the runner body directly. The destructor only needs to stop whatever you spawned.
+
+```ts
+import { spawn } from 'node:child_process';
+import { createRedisDriver } from 'gatho/driver';
+import { runner, start } from 'gatho/server';
+
+const dockerRunner = runner((ctx) => {
+    const gameMode = String(ctx.data.gameMode ?? 'classic');
+
+    const child = spawn('docker', [
+        'run', '--rm', '--network=host',
+        '--name', `room-${ctx.roomId}`,
+        '--memory', '512m',
+        '-v', '/tmp/gatho-ipc:/tmp/gatho-ipc',
+        ...Object.entries(ctx.env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+        '-e', `GAME_MODE=${gameMode}`,
+        'my-game-image:latest',
+    ], { stdio: ['ignore', 'inherit', 'inherit'] });
+
+    child.on('exit', (code) => ctx.stopped(code));
+
+    return () => {
+        child.kill('SIGTERM');
+        const timer = setTimeout(() => child.kill('SIGKILL'), 10_000);
+        timer.unref();
+    };
+});
+
+await start({
+    rooms: { game: dockerRunner },
+    driver: createRedisDriver({ url: 'redis://localhost:6379' }),
+    roomEndpoint: ({ port }) => `wss://my-host/${port}`,
+    tags: { region: 'us-east-1' },
+});
+```
+
+## Rooms
+
+`gatho/room` is the runtime that hosts a single multiplayer session. Call `start()` with lifecycle callbacks — auth, join, message, drop, reconnect, leave, shutdown — and you get back a room handle for sending and broadcasting. The room manages its own WebSocket transport on an OS-assigned port and reports back to the server over IPC.
+
+### Lifecycle
 
 ```ts
 import { auth, start } from 'gatho/room';
 
 await start({
-    onAuth: () => auth.ok(),
-
-    onDrop: (room, client) => {
-        room.allowReconnection(client, 30_000); // hold seat for 30s
+    // return auth.ok(data) to accept, auth.fail(reason) to reject
+    onAuth: (room, joinData: { displayName: string }) => {
+        if (room.clients.count() >= 10) return auth.fail('room is full');
+        return auth.ok({ displayName: joinData.displayName });
     },
 
+    // client is authenticated and in the room
+    onJoin: (room, client) => {
+        room.broadcast(JSON.stringify({ type: 'joined', id: client.id }));
+    },
+
+    // client sent a message
+    onMessage: (room, client, message) => {
+        if (typeof message !== 'string') return;
+        room.broadcast(JSON.stringify({ type: 'echo', from: client.id, message }));
+    },
+
+    // non-consented disconnect — call allowReconnection to hold the seat
+    onDrop: (room, client) => {
+        room.allowReconnection(client, 30_000);
+    },
+
+    // client reconnected within the window — buffered messages already flushed
     onReconnect: (room, client) => {
         room.send(client, JSON.stringify({ type: 'welcome-back' }));
     },
+
+    // client permanently left — consented close, eviction, or window expired
+    onLeave: (room, client) => {
+        room.broadcast(JSON.stringify({ type: 'left', id: client.id }));
+    },
+
+    // SIGTERM or room.stop()
+    onShutdown: () => {
+        console.log('shutting down');
+    },
 });
 ```
+
+### Running Rooms Standalone
+
+When a room is spawned by a server, it reads `GATHO_*` env vars, connects IPC to the parent for heartbeats and client tracking, and validates seat tokens minted by `sdk.join()`. With no `GATHO_*` env vars present, the room runs standalone — it picks a random `roomId`, skips IPC, and accepts any connection. Useful for local dev and tests where you just want to `bun run room.ts` and connect a client directly.
 
 ## Messages
 
@@ -249,125 +355,30 @@ const unpackedClientMessage: ClientMessage = ClientMessageSerDes.unpack(exampleC
 console.log('unpacked client message:', unpackedClientMessage.movement);
 ```
 
-## Room Lifecycle
+## Client
+
+`gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself:
+
+- **Automatic reconnection** — on unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter.
+- **Reliable messaging** — messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. Future features around backpressure and handling and WebTransport will build on this.
+- **Session continuity** — the server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off.
+- **Clean close** — `close()` sends a protocol-level leave message so the server knows the disconnect was intentional and skips the reconnection window.
+
+On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
 
 ```ts
 import { auth, start } from 'gatho/room';
 
 await start({
-    // return auth.ok(data) to accept, auth.fail(reason) to reject
-    onAuth: (room, joinData: { displayName: string }) => {
-        if (room.clients.count() >= 10) return auth.fail('room is full');
-        return auth.ok({ displayName: joinData.displayName });
-    },
+    onAuth: () => auth.ok(),
 
-    // client is authenticated and in the room
-    onJoin: (room, client) => {
-        room.broadcast(JSON.stringify({ type: 'joined', id: client.id }));
-    },
-
-    // client sent a message
-    onMessage: (room, client, message) => {
-        if (typeof message !== 'string') return;
-        room.broadcast(JSON.stringify({ type: 'echo', from: client.id, message }));
-    },
-
-    // non-consented disconnect — call allowReconnection to hold the seat
     onDrop: (room, client) => {
-        room.allowReconnection(client, 30_000);
+        room.allowReconnection(client, 30_000); // hold seat for 30s
     },
 
-    // client reconnected within the window — buffered messages already flushed
     onReconnect: (room, client) => {
         room.send(client, JSON.stringify({ type: 'welcome-back' }));
     },
-
-    // client permanently left — consented close, eviction, or window expired
-    onLeave: (room, client) => {
-        room.broadcast(JSON.stringify({ type: 'left', id: client.id }));
-    },
-
-    // SIGTERM or room.stop()
-    onShutdown: () => {
-        console.log('shutting down');
-    },
-});
-```
-
-## Runners
-
-Runners control how room processes are started and stopped. The server maps each room type to a runner.
-
-### `subprocess()` — local processes
-
-The built-in `subprocess()` helper spawns a child process from inside a `runner()` callback. It forwards the standard `GATHO_*` env vars from `ctx.env`, wires exit signalling, and handles graceful shutdown (SIGTERM → SIGKILL escalation). Use `options.env` to pass extra env vars or forward fields from `ctx.data`.
-
-```ts
-import { createMemoryDriver } from 'gatho/driver';
-import { runner, start, subprocess } from 'gatho/server';
-
-await start({
-    rooms: {
-        game: runner((ctx) =>
-            subprocess(ctx, ['bun', 'run', './game-room.ts'], {
-                env: {
-                    GAMEMODE: ctx.data.gamemode as string,
-                },
-            }),
-        ),
-    },
-    driver: createMemoryDriver(),
-    roomEndpoint: ({ port }) => `ws://localhost:${port}`,
-});
-```
-
-### `runner()` — custom runners
-
-If you need more control over how rooms should be executed on the server (e.g. if you want to run rooms with Docker, in-process, inside a microVM, whatever else) — use the `runner()` api. You provide a function that:
-
-1. Receives a context with room metadata, a `stopped` callback
-2. Sets up the room (sync or async)
-3. Returns a destructor that the server calls to stop the room
-
-Call `ctx.stopped(code)` when the room exits for any reason (crash, natural exit, killed). The destructor owns the full shutdown strategy — graceful escalation, a single API call, whatever fits your runtime.
-
-`ctx.env` contains the standard `GATHO_*` environment variables pre-built from the spawn context, ready to spread into a process env or pass as docker `-e` flags.
-
-**Docker example:**
-
-```ts
-// runner-docker.ts — custom runner using the runner() factory
-import { spawn } from 'node:child_process';
-import { createRedisDriver } from 'gatho/driver';
-import { runner, start } from 'gatho/server';
-
-const dockerRunner = runner((ctx) => {
-    const gameMode = String(ctx.data.gameMode ?? 'classic');
-
-    const child = spawn('docker', [
-        'run', '--rm', '--network=host',
-        '--name', `room-${ctx.roomId}`,
-        '--memory', '512m',
-        '-v', '/tmp/gatho-ipc:/tmp/gatho-ipc',
-        ...Object.entries(ctx.env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
-        '-e', `GAME_MODE=${gameMode}`,
-        'my-game-image:latest',
-    ], { stdio: ['ignore', 'inherit', 'inherit'] });
-
-    child.on('exit', (code) => ctx.stopped(code));
-
-    return () => {
-        child.kill('SIGTERM');
-        const timer = setTimeout(() => child.kill('SIGKILL'), 10_000);
-        timer.unref();
-    };
-});
-
-await start({
-    rooms: { game: dockerRunner },
-    driver: createRedisDriver({ url: 'redis://localhost:6379' }),
-    roomEndpoint: ({ port }) => `wss://my-host/${port}`,
-    tags: { region: 'us-east-1' },
 });
 ```
 
