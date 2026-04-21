@@ -5,7 +5,8 @@
 [![Downloads](https://img.shields.io/npm/dt/gatho.svg?style=for-the-badge)](https://www.npmjs.com/package/gatho)
 
 ```bash
-> npm install gatho
+> npm install github:isaac-mason/gatho
+# (npm coming soon!)
 ```
 
 # gatho
