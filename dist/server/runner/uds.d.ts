@@ -1,4 +1,4 @@
-import { type RoomMessage, type UdsConnection } from '../../common/uds';
+import { type RoomMessage, type UdsConnection } from 'gatho/common';
 export declare function listenOnSocket(socketPath: string, onMessage: (msg: RoomMessage) => void, options?: {
     timeoutMs?: number;
     onClose?: () => void;

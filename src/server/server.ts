@@ -13,9 +13,8 @@ import * as http from 'http';
 import type { Socket } from 'net';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { log } from '../common/logger';
+import { log, type RoomMessage } from 'gatho/common';
 import type { Driver, RoomData } from '../driver/types';
-import type { RoomMessage } from '../common/uds';
 import type { RoomRunner } from './runner/types';
 import { createUdsServer } from './runner/uds';
 

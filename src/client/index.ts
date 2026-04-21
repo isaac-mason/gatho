@@ -1,4 +1,4 @@
-import { frameUserMessage, packProtocol, unpackFrame } from '../common/protocol';
+import { frameUserMessage, packProtocol, unpackFrame } from 'gatho/common';
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 

@@ -3,7 +3,7 @@
 // so no frame reading is needed; we just wire up the send side.
 
 import { createConnection } from 'node:net';
-import { sendMessage, type RoomMessage, type UdsConnection } from '../common/uds';
+import { sendMessage, type RoomMessage, type UdsConnection } from 'gatho/common';
 
 export function connectToSocket(
     socketPath: string,

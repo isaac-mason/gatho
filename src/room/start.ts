@@ -1,13 +1,17 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { jwtVerify } from '../common/jwt';
-import type { Logger } from '../common/logger';
-import { createLogger } from '../common/logger';
-import type { RoomMessage } from '../common/uds';
-import { connectToSocket } from './ipc';
+import {
+    createLogger,
+    frameUserMessage,
+    jwtVerify,
+    type Logger,
+    packProtocol,
+    type RoomMessage,
+    unpackFrame,
+} from 'gatho/common';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
+import { connectToSocket } from './ipc';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
 import { wsTransport } from './transport/ws';
-import { unpackFrame, packProtocol, frameUserMessage } from '../common/protocol';
 
 const HEARTBEAT_INTERVAL_MS = 3000;
 
@@ -678,13 +682,7 @@ async function stopRoom<ClientData>(
 }
 
 // env vars that indicate a managed server context
-const MANAGED_ENV_KEYS = [
-    'GATHO_SOCKET',
-    'GATHO_ROOM_ID',
-    'GATHO_ROOM_TYPE',
-    'GATHO_ROOM_SECRET',
-    'GATHO_SERVER_ID',
-] as const;
+const MANAGED_ENV_KEYS = ['GATHO_SOCKET', 'GATHO_ROOM_ID', 'GATHO_ROOM_TYPE', 'GATHO_ROOM_SECRET', 'GATHO_SERVER_ID'] as const;
 
 export async function start<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(
     options: StartOptions<ClientData, JoinData>,
@@ -707,10 +705,10 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
             const bits = [
                 hasServerOption ? 'options.server' : null,
                 presentEnvKeys.length > 0 ? `env vars (${presentEnvKeys.join(', ')})` : null,
-            ].filter(Boolean).join(' and ');
-            createLogger().warn(
-                `gatho/room: standalone: true is set, ignoring managed context from ${bits}`,
-            );
+            ]
+                .filter(Boolean)
+                .join(' and ');
+            createLogger().warn(`gatho/room: standalone: true is set, ignoring managed context from ${bits}`);
         }
         server = undefined;
         roomId = randomUUID();
@@ -731,9 +729,9 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
         if (!socketPath && !roomSecret) {
             throw new Error(
                 'gatho/room start(): no managed server context detected ' +
-                '(no GATHO_SOCKET / GATHO_ROOM_SECRET, and no options.server.socket / roomSecret). ' +
-                'If running this room directly for local dev or tests, pass `standalone: true`. ' +
-                'Otherwise ensure the gatho server spawned this process so GATHO_* env vars are set.',
+                    '(no GATHO_SOCKET / GATHO_ROOM_SECRET, and no options.server.socket / roomSecret). ' +
+                    'If running this room directly for local dev or tests, pass `standalone: true`. ' +
+                    'Otherwise ensure the gatho server spawned this process so GATHO_* env vars are set.',
             );
         }
     }

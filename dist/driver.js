@@ -1,19 +1,7 @@
 import { EventEmitter } from 'node:events';
-import { InvalidTagError, ServerNotFoundError, RoomNotFoundError, RoomNotRunningError, RoomTimeoutError, DriverConfigError, RoomStartError } from 'gatho/common';
-import { createHmac } from 'node:crypto';
+import { InvalidTagError, ServerNotFoundError, RoomNotFoundError, RoomNotRunningError, jwtSign, RoomTimeoutError, DriverConfigError, log, RoomStartError } from 'gatho/common';
 import postgres from 'postgres';
 import Redis from 'ioredis';
-
-// minimal hmac-sha256 jwt — no external deps.
-// single source of truth for sign + verify across drivers and room workers.
-// static header — always the same, computed once
-const JWT_HEADER = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-/** sign a payload with hs256, returns a compact jwt string */
-function jwtSign(payload, secret) {
-    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
-    const signature = createHmac('sha256', secret).update(`${JWT_HEADER}.${body}`).digest('base64url');
-    return `${JWT_HEADER}.${body}.${signature}`;
-}
 
 // --- tag validation ---
 const VALID_TAG_RE = /^[a-zA-Z0-9_-]+$/;
@@ -394,69 +382,6 @@ function createMemoryDriver() {
         },
     };
 }
-
-// structured json line logger
-// emits ndjson to stdout/stderr, supports child loggers for scoped context
-const LEVEL_VALUES = {
-    debug: 0,
-    info: 1,
-    warn: 2,
-    error: 3,
-};
-function resolveLevel() {
-    const env = (typeof process !== 'undefined' && process.env?.GATHO_LOG_LEVEL) || '';
-    const lower = env.toLowerCase();
-    if (lower in LEVEL_VALUES)
-        return lower;
-    return 'info';
-}
-// serialize a value, handling Error instances that JSON.stringify turns into {}
-function serializeValue(value) {
-    if (value instanceof Error) {
-        return { message: value.message, stack: value.stack };
-    }
-    return value;
-}
-function buildLine(level, msg, context, fields) {
-    const entry = { ts: Date.now(), level, msg };
-    for (const key in context) {
-        entry[key] = serializeValue(context[key]);
-    }
-    if (fields) {
-        for (const key in fields) {
-            entry[key] = serializeValue(fields[key]);
-        }
-    }
-    return JSON.stringify(entry);
-}
-function createLoggerInternal(minLevel, context) {
-    function log(level, msg, fields) {
-        if (LEVEL_VALUES[level] < minLevel)
-            return;
-        const line = buildLine(level, msg, context, fields);
-        if (level === 'error') {
-            process.stderr.write(`${line}\n`);
-        }
-        else {
-            process.stdout.write(`${line}\n`);
-        }
-    }
-    return {
-        debug: (msg, fields) => log('debug', msg, fields),
-        info: (msg, fields) => log('info', msg, fields),
-        warn: (msg, fields) => log('warn', msg, fields),
-        error: (msg, fields) => log('error', msg, fields),
-        child(fields) {
-            return createLoggerInternal(minLevel, { ...context, ...fields });
-        },
-    };
-}
-function createLogger(options) {
-    const level = resolveLevel();
-    return createLoggerInternal(LEVEL_VALUES[level], {});
-}
-// module-scope singleton — reads GATHO_LOG_LEVEL at import time
-const log = createLogger();
 
 /**
  * postgres driver implementation using porsager/postgres

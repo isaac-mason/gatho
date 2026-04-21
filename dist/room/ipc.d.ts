@@ -1,4 +1,4 @@
-import { type UdsConnection } from '../common/uds';
+import { type UdsConnection } from 'gatho/common';
 export declare function connectToSocket(socketPath: string, options?: {
     retries?: number;
     retryDelayMs?: number;

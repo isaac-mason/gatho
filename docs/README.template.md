@@ -99,6 +99,14 @@ For Docker, microVMs, or any other runtime, write the runner body directly. The 
 
 <Snippet source="./src/runner-docker.ts" />
 
+### Server ↔ Room IPC
+
+Rooms push messages to their parent server over a Unix domain socket (UDS), one per room, created in `socketDir` (default `${os.tmpdir()}/gatho-ipc`). The channel is one-way — rooms send ready signals, heartbeats, process metrics, and client connect/disconnect events; the server doesn't currently push anything back over this channel.
+
+A UDS is used instead of TCP because it is local-only: no TCP/IP stack, no port allocation, no handshake, no TLS — just a file on disk the kernel routes through. That means low latency and low overhead for the chatter between server and room, faster room startup (no port negotiation on the IPC side), and the IPC channel is never exposed to the network. The only port a room opens is the public WebSocket port clients connect to.
+
+When running rooms in a sandbox (Docker, microVM, etc.), bind-mount `socketDir` into the container so the path in `GATHO_SOCKET` resolves on both sides — see the custom runner snippet above.
+
 ## Rooms
 
 `gatho/room` is the runtime for a single multiplayer session — a game match, a lobby, a collaborative space. You supply lifecycle callbacks — auth, join, message, drop, reconnect, leave, shutdown — and get back a handle for sending messages to and broadcasting to connected clients.

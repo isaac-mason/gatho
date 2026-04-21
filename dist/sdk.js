@@ -1,3 +1,6 @@
+export { GathoError, InvalidTagError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from 'gatho/common';
+
+// errors thrown by sdk calls — re-exported so consumers don't have to reach into `gatho/common`
 /** create a new gatho sdk instance with the given options */
 function createGathoSDK(options) {
     const { _internal: driver } = options.driver;
