@@ -34,7 +34,7 @@ export type CreateServerOptions = {
     port?: number;
     /** host to listen on for admin HTTP endpoint and driver communication */
     host?: string;
-    /** interval for reconciliation loop in milliseconds */
+    /** interval for reconciliation loop in milliseconds @default 5000 */
     reconcileIntervalMs?: number;
     /** tags for this server instance (defaults to `{}`) */
     tags?: Record<string, string>;
@@ -43,6 +43,11 @@ export type CreateServerOptions = {
     /** full URL for this server's admin HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
      *  if not set, defaults to "http://{host}:{port}" using the bound address. */
     serverEndpoint?: string;
+    /** directory for the per-room UDS sockets used for server↔room IPC. defaults to
+     *  `${os.tmpdir()}/gatho-ipc`. set an explicit path when running rooms in docker
+     *  (or any other sandbox) so the same path can be bind-mounted into the container
+     *  and appear in `GATHO_SOCKET` unchanged. created if it doesn't exist. */
+    socketDir?: string;
 };
 
 export type RoomDetails = {
@@ -115,6 +120,7 @@ type ServerState = {
 
 /* constants */
 
+const DEFAULT_RECONCILE_INTERVAL_MS = 5000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
 const LEADER_ELECTION_INTERVAL_MS = 15_000;
 const LEADER_RENEWAL_INTERVAL_MS = 10_000;
@@ -641,7 +647,7 @@ async function startInternal(s: ServerState): Promise<void> {
 
     startLeaderLoop(s);
 
-    await startReconciler(s, s.options.reconcileIntervalMs ?? 5000);
+    await startReconciler(s, s.options.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS);
 }
 
 async function stop(s: ServerState): Promise<void> {
@@ -729,7 +735,7 @@ function getAllRoomDetails(s: ServerState): RoomDetails[] {
 export async function start(options: CreateServerOptions): Promise<Server> {
     const { _internal: driver } = options.driver;
     const runners = new Map(Object.entries(options.rooms));
-    const socketDir = join(tmpdir(), 'gatho-ipc');
+    const socketDir = options.socketDir ?? join(tmpdir(), 'gatho-ipc');
 
     const s: ServerState = {
         options,
