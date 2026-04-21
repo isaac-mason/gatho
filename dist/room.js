@@ -2200,17 +2200,21 @@ function unpackFrame(data) {
             throw new Error(`unknown frame type: 0x${type.toString(16).padStart(2, '0')}`);
     }
 }
-
-// frame a user message for the wire. strings become [0x01, ...utf8],
-// binary becomes [0x02, ...raw bytes]. ArrayBufferView is normalized to Uint8Array.
-function frameUserMessage(msg) {
-    if (typeof msg === 'string')
-        return packUserText(msg);
-    if (msg instanceof ArrayBuffer)
-        return packUserBinary(msg);
+function frameUserMessage(message) {
+    if (typeof message === 'string')
+        return packUserText(message);
+    if (message instanceof ArrayBuffer)
+        return packUserBinary(message);
+    if (message instanceof Blob) {
+        // blob should have been converted before reaching here — this is a
+        // fallback that shouldn't happen in practice. callers should await
+        // blob.arrayBuffer() first.
+        throw new Error('Blob must be converted to ArrayBuffer before framing');
+    }
     // ArrayBufferView (Uint8Array, Float32Array, etc.)
-    return packUserBinary(new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength));
+    return packUserBinary(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
 }
+
 const HEARTBEAT_INTERVAL_MS = 3000;
 function safeCall(log, label, fn) {
     Promise.resolve()

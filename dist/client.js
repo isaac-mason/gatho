@@ -1834,6 +1834,20 @@ function unpackFrame(data) {
             throw new Error(`unknown frame type: 0x${type.toString(16).padStart(2, '0')}`);
     }
 }
+function frameUserMessage(message) {
+    if (typeof message === 'string')
+        return packUserText(message);
+    if (message instanceof ArrayBuffer)
+        return packUserBinary(message);
+    if (message instanceof Blob) {
+        // blob should have been converted before reaching here — this is a
+        // fallback that shouldn't happen in practice. callers should await
+        // blob.arrayBuffer() first.
+        throw new Error('Blob must be converted to ArrayBuffer before framing');
+    }
+    // ArrayBufferView (Uint8Array, Float32Array, etc.)
+    return packUserBinary(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
+}
 
 // backoff constants — hardcoded, always right
 const MIN_DELAY = 1000;
@@ -1880,21 +1894,6 @@ function connect(url) {
         error: new Set(),
     };
     // --- helpers ---
-    // frame a user message for the wire. returns a Uint8Array ready to ws.send().
-    function frameUserMessage(message) {
-        if (typeof message === 'string')
-            return packUserText(message);
-        if (message instanceof ArrayBuffer)
-            return packUserBinary(message);
-        if (message instanceof Blob) {
-            // blob should have been converted before reaching here — this is a
-            // fallback that shouldn't happen in practice. callers should await
-            // blob.arrayBuffer() first.
-            throw new Error('Blob must be converted to ArrayBuffer before framing');
-        }
-        // ArrayBufferView (Uint8Array, Float32Array, etc.)
-        return packUserBinary(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
-    }
     // estimate byte size of a message for buffer accounting
     function estimateByteSize(message) {
         if (typeof message === 'string')
