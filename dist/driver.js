@@ -1,7 +1,89 @@
 import { EventEmitter } from 'node:events';
-import { InvalidTagError, ServerNotFoundError, RoomNotFoundError, RoomNotRunningError, jwtSign, RoomTimeoutError, DriverConfigError, log, RoomStartError } from 'gatho/common';
+import { createHmac } from 'node:crypto';
 import postgres from 'postgres';
 import Redis from 'ioredis';
+
+// minimal hmac-sha256 jwt — no external deps.
+// single source of truth for sign + verify across drivers and room workers.
+// static header — always the same, computed once
+const JWT_HEADER = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+/** sign a payload with hs256, returns a compact jwt string */
+function jwtSign(payload, secret) {
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signature = createHmac('sha256', secret).update(`${JWT_HEADER}.${body}`).digest('base64url');
+    return `${JWT_HEADER}.${body}.${signature}`;
+}
+
+// typed domain errors for gatho
+// all driver-layer errors extend GathoError so callers can catch broadly
+// or narrowly via instanceof / .code switches.
+/** base class for all gatho domain errors */
+class GathoError extends Error {
+    code;
+    constructor(code, message) {
+        super(message);
+        this.code = code;
+        this.name = this.constructor.name;
+    }
+}
+/** thrown when a server id doesn't exist in the registry */
+class ServerNotFoundError extends GathoError {
+    serverId;
+    constructor(serverId) {
+        super('server-not-found', `server not found: ${serverId}`);
+        this.serverId = serverId;
+    }
+}
+/** thrown when a room id doesn't exist in the registry */
+class RoomNotFoundError extends GathoError {
+    roomId;
+    constructor(roomId) {
+        super('room-not-found', `room not found: ${roomId}`);
+        this.roomId = roomId;
+    }
+}
+/** thrown when a room exists but isn't in 'running' status yet */
+class RoomNotRunningError extends GathoError {
+    roomId;
+    constructor(roomId) {
+        super('room-not-running', `room is not running yet: ${roomId}`);
+        this.roomId = roomId;
+    }
+}
+/** thrown when waitForRoom times out before the room becomes running */
+class RoomTimeoutError extends GathoError {
+    roomId;
+    timeoutMs;
+    constructor(roomId, timeoutMs) {
+        super('room-timeout', `room ${roomId} did not become running within ${timeoutMs}ms`);
+        this.roomId = roomId;
+        this.timeoutMs = timeoutMs;
+    }
+}
+/** thrown when a room was confirmed running but its data couldn't be fetched (race condition) */
+class RoomStartError extends GathoError {
+    roomId;
+    constructor(roomId) {
+        super('room-start-failed', `room ${roomId} was ready but could not be retrieved`);
+        this.roomId = roomId;
+    }
+}
+/** thrown when a tag key or value fails validation */
+class InvalidTagError extends GathoError {
+    detail;
+    constructor(detail) {
+        super('invalid-tag', detail);
+        this.detail = detail;
+    }
+}
+/** thrown when a driver receives invalid configuration (bad schema name, prefix, etc.) */
+class DriverConfigError extends GathoError {
+    detail;
+    constructor(detail) {
+        super('driver-config', detail);
+        this.detail = detail;
+    }
+}
 
 // --- tag validation ---
 const VALID_TAG_RE = /^[a-zA-Z0-9_-]+$/;
@@ -382,6 +464,69 @@ function createMemoryDriver() {
         },
     };
 }
+
+// structured json line logger
+// emits ndjson to stdout/stderr, supports child loggers for scoped context
+const LEVEL_VALUES = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3,
+};
+function resolveLevel() {
+    const env = (typeof process !== 'undefined' && process.env?.GATHO_LOG_LEVEL) || '';
+    const lower = env.toLowerCase();
+    if (lower in LEVEL_VALUES)
+        return lower;
+    return 'info';
+}
+// serialize a value, handling Error instances that JSON.stringify turns into {}
+function serializeValue(value) {
+    if (value instanceof Error) {
+        return { message: value.message, stack: value.stack };
+    }
+    return value;
+}
+function buildLine(level, msg, context, fields) {
+    const entry = { ts: Date.now(), level, msg };
+    for (const key in context) {
+        entry[key] = serializeValue(context[key]);
+    }
+    if (fields) {
+        for (const key in fields) {
+            entry[key] = serializeValue(fields[key]);
+        }
+    }
+    return JSON.stringify(entry);
+}
+function createLoggerInternal(minLevel, context) {
+    function log(level, msg, fields) {
+        if (LEVEL_VALUES[level] < minLevel)
+            return;
+        const line = buildLine(level, msg, context, fields);
+        if (level === 'error') {
+            process.stderr.write(`${line}\n`);
+        }
+        else {
+            process.stdout.write(`${line}\n`);
+        }
+    }
+    return {
+        debug: (msg, fields) => log('debug', msg, fields),
+        info: (msg, fields) => log('info', msg, fields),
+        warn: (msg, fields) => log('warn', msg, fields),
+        error: (msg, fields) => log('error', msg, fields),
+        child(fields) {
+            return createLoggerInternal(minLevel, { ...context, ...fields });
+        },
+    };
+}
+function createLogger(options) {
+    const level = resolveLevel();
+    return createLoggerInternal(LEVEL_VALUES[level], {});
+}
+// module-scope singleton — reads GATHO_LOG_LEVEL at import time
+const log = createLogger();
 
 /**
  * postgres driver implementation using porsager/postgres
@@ -1532,5 +1677,5 @@ function createKeys(prefix) {
     };
 }
 
-export { createMemoryDriver, createPostgresDriver, createRedisDriver };
+export { DriverConfigError, GathoError, InvalidTagError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, createMemoryDriver, createPostgresDriver, createRedisDriver };
 //# sourceMappingURL=driver.js.map

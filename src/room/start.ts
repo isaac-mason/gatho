@@ -1,13 +1,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import {
-    createLogger,
-    frameUserMessage,
-    jwtVerify,
-    type Logger,
-    packProtocol,
-    type RoomMessage,
-    unpackFrame,
-} from 'gatho/common';
+import { jwtVerify } from '../common/jwt';
+import { createLogger, type Logger } from '../common/logger';
+import { frameUserMessage, packProtocol, unpackFrame } from '../common/protocol';
+import type { RoomMessage } from '../common/uds';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
 import { connectToSocket } from './ipc';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';

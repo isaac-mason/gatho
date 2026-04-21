@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname } from 'node:path';
-import { createFrameReader, log, type RoomMessage, type UdsConnection } from 'gatho/common';
+import { log } from '../../common/logger';
+import { createFrameReader, type RoomMessage, type UdsConnection } from '../../common/uds';
 
 export function listenOnSocket(
     socketPath: string,

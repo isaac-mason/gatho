@@ -1,16 +1,16 @@
 // tests that driver methods throw typed GathoError subclasses
 // with correct .code, instanceof behavior, and contextual fields
 
+import type { Driver } from 'gatho/driver';
 import {
+    createMemoryDriver,
     GathoError,
     InvalidTagError,
     RoomNotFoundError,
     RoomNotRunningError,
     RoomTimeoutError,
     ServerNotFoundError,
-} from 'gatho/common';
-import type { Driver } from 'gatho/driver';
-import { createMemoryDriver } from 'gatho/driver';
+} from 'gatho/driver';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 describe('typed errors', () => {

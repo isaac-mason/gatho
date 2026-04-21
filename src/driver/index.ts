@@ -16,3 +16,13 @@ export type {
     ServerInfo,
     TagFilter,
 } from './types';
+export {
+    DriverConfigError,
+    GathoError,
+    InvalidTagError,
+    RoomNotFoundError,
+    RoomNotRunningError,
+    RoomStartError,
+    RoomTimeoutError,
+    ServerNotFoundError,
+} from './errors';

@@ -31,10 +31,6 @@
             "import": "./dist/driver.js",
             "types": "./dist/driver/index.d.ts"
         },
-        "./common": {
-            "import": "./dist/common.js",
-            "types": "./dist/common/index.d.ts"
-        },
         "./client": {
             "import": "./dist/client.js",
             "types": "./dist/client/index.d.ts"
@@ -61,7 +57,7 @@
         "test:e2e": "cd tst && ./e2e.sh",
         "typecheck-docs": "tsc --project docs/tsconfig.json --noEmit",
         "docs": "(cd docs && node ./build.js)",
-        "typedoc": "typedoc --tsconfig ./tsconfig.json --name \"gatho docs\" --out ./dist-typedoc ./src/sdk/index.ts ./src/room/index.ts ./src/server/index.ts ./src/driver/index.ts ./src/client/index.ts ./src/common/index.ts"
+        "typedoc": "typedoc --tsconfig ./tsconfig.json --name \"gatho docs\" --out ./dist-typedoc ./src/sdk/index.ts ./src/room/index.ts ./src/server/index.ts ./src/driver/index.ts ./src/client/index.ts"
     },
     "packageManager": "pnpm@8.15.2+sha1.798034f615aa211c6c2ae00010cc20be5fc102ee",
     "dependencies": {

@@ -54,6 +54,6 @@ export type GathoSDK = {
     removeServerTags(serverId: string, keys: string[]): Promise<void>;
 };
 export type { ClientInfo, ClientReservation, ListRoomsFilter, ListServersFilter, RoomInfo, RoomStatus, ServerInfo, TagFilter };
-export { GathoError, InvalidTagError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, } from 'gatho/common';
+export { GathoError, InvalidTagError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, } from 'gatho/driver';
 /** create a new gatho sdk instance with the given options */
 export declare function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK;

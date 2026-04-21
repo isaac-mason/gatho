@@ -3,7 +3,8 @@
 // used by 'gatho dev' where server and sdk are in the same process
 
 import { EventEmitter } from 'node:events';
-import { jwtSign, RoomNotFoundError, RoomNotRunningError, RoomTimeoutError, ServerNotFoundError } from 'gatho/common';
+import { jwtSign } from '../common/jwt';
+import { RoomNotFoundError, RoomNotRunningError, RoomTimeoutError, ServerNotFoundError } from './errors';
 import type {
     ClientInfo,
     ClientReservation,

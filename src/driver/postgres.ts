@@ -1,13 +1,13 @@
+import { jwtSign } from '../common/jwt';
+import { log } from '../common/logger';
 import {
     DriverConfigError,
-    jwtSign,
-    log,
     RoomNotFoundError,
     RoomNotRunningError,
     RoomStartError,
     RoomTimeoutError,
     ServerNotFoundError,
-} from 'gatho/common';
+} from './errors';
 import type { Fragment, Sql } from 'postgres';
 import postgres from 'postgres';
 import type {

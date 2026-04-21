@@ -1,5 +1,6 @@
 import Redis, { type Cluster } from 'ioredis';
-import { jwtSign, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from 'gatho/common';
+import { jwtSign } from '../common/jwt';
+import { RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from './errors';
 import type {
     ClientInfo,
     ClientReservation,

@@ -87,7 +87,8 @@ export type GathoSDK = {
 
 export type { ClientInfo, ClientReservation, ListRoomsFilter, ListServersFilter, RoomInfo, RoomStatus, ServerInfo, TagFilter };
 
-// errors thrown by sdk calls — re-exported so consumers don't have to reach into `gatho/common`
+// errors thrown by sdk calls — re-exported from `gatho/driver` (canonical home)
+// so consumers don't have to import the driver module just to `instanceof` them.
 export {
     GathoError,
     InvalidTagError,
@@ -96,7 +97,7 @@ export {
     RoomStartError,
     RoomTimeoutError,
     ServerNotFoundError,
-} from 'gatho/common';
+} from 'gatho/driver';
 
 /** create a new gatho sdk instance with the given options */
 export function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK {
