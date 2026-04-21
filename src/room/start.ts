@@ -7,16 +7,7 @@ import { connectToSocket } from './ipc';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
 import { wsTransport } from './transport/ws';
-import { unpackFrame, packProtocol, packUserText, packUserBinary } from '../common/protocol';
-
-// frame a user message for the wire. strings become [0x01, ...utf8],
-// binary becomes [0x02, ...raw bytes]. ArrayBufferView is normalized to Uint8Array.
-function frameUserMessage(msg: string | ArrayBuffer | ArrayBufferView): Uint8Array {
-    if (typeof msg === 'string') return packUserText(msg);
-    if (msg instanceof ArrayBuffer) return packUserBinary(msg);
-    // ArrayBufferView (Uint8Array, Float32Array, etc.)
-    return packUserBinary(new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength));
-}
+import { unpackFrame, packProtocol, frameUserMessage } from '../common/protocol';
 
 const HEARTBEAT_INTERVAL_MS = 3000;
 

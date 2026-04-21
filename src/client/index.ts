@@ -1,4 +1,4 @@
-import { packProtocol, packUserBinary, packUserText, unpackFrame } from '../common/protocol';
+import { frameUserMessage, packProtocol, packUserBinary, packUserText, unpackFrame } from '../common/protocol';
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
@@ -112,20 +112,6 @@ export function connect(url: string): RoomConnection {
     };
 
     // --- helpers ---
-
-    // frame a user message for the wire. returns a Uint8Array ready to ws.send().
-    function frameUserMessage(message: SendMessage): Uint8Array<ArrayBuffer> {
-        if (typeof message === 'string') return packUserText(message);
-        if (message instanceof ArrayBuffer) return packUserBinary(message);
-        if (message instanceof Blob) {
-            // blob should have been converted before reaching here — this is a
-            // fallback that shouldn't happen in practice. callers should await
-            // blob.arrayBuffer() first.
-            throw new Error('Blob must be converted to ArrayBuffer before framing');
-        }
-        // ArrayBufferView (Uint8Array, Float32Array, etc.)
-        return packUserBinary(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
-    }
 
     // estimate byte size of a message for buffer accounting
     function estimateByteSize(message: SendMessage): number {
