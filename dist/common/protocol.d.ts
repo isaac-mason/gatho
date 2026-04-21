@@ -52,4 +52,5 @@ export declare function packProtocol(msg: ProtocolMessage): Uint8Array<ArrayBuff
 export declare function packUserText(text: string): Uint8Array<ArrayBuffer>;
 export declare function packUserBinary(data: ArrayBuffer | Uint8Array): Uint8Array<ArrayBuffer>;
 export declare function unpackFrame(data: ArrayBuffer | Uint8Array): Frame;
+export declare function frameUserMessage(message: string | ArrayBuffer | ArrayBufferView | Blob): Uint8Array<ArrayBuffer>;
 export {};

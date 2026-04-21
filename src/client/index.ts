@@ -1,4 +1,4 @@
-import { frameUserMessage, packProtocol, packUserBinary, packUserText, unpackFrame } from '../common/protocol';
+import { frameUserMessage, packProtocol, unpackFrame } from '../common/protocol';
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
