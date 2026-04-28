@@ -9,7 +9,7 @@ export type {
     Driver,
     ListRoomsFilter,
     ListServersFilter,
-    RegisterServerOptions,
+    HeartbeatOptions,
     RoomData,
     RoomInfo,
     RoomStatus,

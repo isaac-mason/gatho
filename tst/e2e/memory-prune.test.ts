@@ -23,7 +23,7 @@ describe('memoryDriver prune', () => {
 
     it('prunes stale servers and their rooms after STALE_MS', async () => {
         // register a server
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -50,7 +50,7 @@ describe('memoryDriver prune', () => {
     });
 
     it('does not prune servers that heartbeat regularly', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -59,7 +59,12 @@ describe('memoryDriver prune', () => {
 
         // heartbeat halfway through the stale window, then advance past stale
         vi.advanceTimersByTime(STALE_MS / 2);
-        await driver._internal.heartbeat('s1');
+        await driver._internal.heartbeat({
+            serverId: 's1',
+            endpoint: 'http://localhost:3000',
+            tags: {},
+            roomTypes: ['game'],
+        });
         vi.advanceTimersByTime(STALE_MS / 2 + PRUNE_INTERVAL_MS);
 
         // server renewed — should still be alive
@@ -68,7 +73,7 @@ describe('memoryDriver prune', () => {
     });
 
     it('prunes expired client reservations', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -90,7 +95,12 @@ describe('memoryDriver prune', () => {
         // advance past ttl + prune interval (but keep server alive)
         vi.advanceTimersByTime(ttl + PRUNE_INTERVAL_MS);
         // heartbeat to keep the server alive
-        await driver._internal.heartbeat('s1');
+        await driver._internal.heartbeat({
+            serverId: 's1',
+            endpoint: 'http://localhost:3000',
+            tags: {},
+            roomTypes: ['game'],
+        });
 
         // the expired reservation should be pruned
         const infoAfter = await driver._internal.getRoomInfo('r1');
@@ -98,7 +108,7 @@ describe('memoryDriver prune', () => {
     });
 
     it('does not prune connected clients', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -114,7 +124,12 @@ describe('memoryDriver prune', () => {
         // advance in steps, heartbeating to keep the server alive
         for (let i = 0; i < 6; i++) {
             vi.advanceTimersByTime(PRUNE_INTERVAL_MS);
-            await driver._internal.heartbeat('s1');
+            await driver._internal.heartbeat({
+            serverId: 's1',
+            endpoint: 'http://localhost:3000',
+            tags: {},
+            roomTypes: ['game'],
+        });
         }
 
         // connected client should still be there
@@ -124,7 +139,7 @@ describe('memoryDriver prune', () => {
     });
 
     it('prunes clients belonging to stale servers rooms', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -150,7 +165,7 @@ describe('memoryDriver prune', () => {
     });
 
     it('destroy() stops the prune interval', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},

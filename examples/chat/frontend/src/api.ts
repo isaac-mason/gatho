@@ -1,6 +1,6 @@
 // api client for the example server
 
-const API_URL = 'http://localhost:3001';
+const API_URL = 'http://localhost:3100';
 
 export interface RoomListItem {
     roomId: string;

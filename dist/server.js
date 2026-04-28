@@ -146,6 +146,64 @@ function createLogger(options) {
 // module-scope singleton — reads GATHO_LOG_LEVEL at import time
 const log = createLogger();
 
+/** race a promise against a timeout. rejects with `${label} timeout` if it doesn't settle in time. */
+async function withTimeout(p, ms, label) {
+    let timer;
+    try {
+        return await Promise.race([
+            p,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
+            }),
+        ]);
+    }
+    finally {
+        if (timer)
+            clearTimeout(timer);
+    }
+}
+/**
+ * schedule async work on a self-pacing cadence.
+ *
+ * the first tick runs eagerly and is awaited before this function returns; the
+ * caller can rely on `run` having executed once (success or caught error) by
+ * the time the resulting Punctuator handle is in hand. each subsequent tick is
+ * scheduled `intervalMs` after the previous one's start (or immediately if the
+ * previous run exceeded the interval). avoids both pending-promise pile-up
+ * (no overlap by construction) and the "skip a full interval" gap that
+ * setInterval + skip-on-overlap produces when a run runs long.
+ */
+async function punctuate(label, run, opts) {
+    const log$1 = opts.logger ?? log;
+    let stopped = false;
+    let timer;
+    function stop() {
+        stopped = true;
+        if (timer) {
+            clearTimeout(timer);
+            timer = undefined;
+        }
+    }
+    async function tick() {
+        if (stopped)
+            return;
+        const startedAt = Date.now();
+        try {
+            await withTimeout(run(), opts.timeoutMs, label);
+        }
+        catch (err) {
+            log$1.error(`${label} error`, { err });
+        }
+        if (stopped)
+            return;
+        const elapsed = Date.now() - startedAt;
+        const delay = Math.max(0, opts.intervalMs - elapsed);
+        timer = setTimeout(tick, delay);
+    }
+    await tick();
+    return { stop };
+}
+
 /* lightweight helpers that just return objects */
 /**
  * Boolean schema - stores true/false values using 1 byte.
@@ -2105,11 +2163,12 @@ async function createUdsServer(socketPath, onMessage, options) {
 // room config is passed via env vars (GATHO_ROOM_ID, GATHO_ROOM_TYPE, etc.).
 // all ipc flows over that socket — child-to-parent only.
 /* constants */
-const DEFAULT_RECONCILE_INTERVAL_MS = 5000;
-const HEARTBEAT_TIMEOUT_MS = 10_000;
-const LEADER_ELECTION_INTERVAL_MS = 15_000;
-const LEADER_RENEWAL_INTERVAL_MS = 10_000;
-const SERVER_HEARTBEAT_INTERVAL_MS = 10_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
+const LEADER_LOOP_INTERVAL_MS = 10_000;
+const LEADER_LOOP_TIMEOUT_MS = 5_000;
+const HEARTBEAT_TICK_TIMEOUT_MS = 5_000;
+/** how long a room process can go without a heartbeat before we consider it stalled and kill it. */
+const ROOM_STALL_TIMEOUT_MS = 10_000;
 function cleanupRoom(s, roomId, reason) {
     const proc = s.processes.get(roomId);
     if (!proc)
@@ -2330,7 +2389,7 @@ function shutdownAllWorkers(s) {
 function checkHeartbeats(s) {
     const now = Date.now();
     for (const [roomId, lastBeat] of s.lastHeartbeats) {
-        if (now - lastBeat > HEARTBEAT_TIMEOUT_MS) {
+        if (now - lastBeat > ROOM_STALL_TIMEOUT_MS) {
             const roomProcess = s.processes.get(roomId);
             if (roomProcess) {
                 log.warn('process stalled, killing', { roomId, stalledMs: now - lastBeat });
@@ -2372,43 +2431,50 @@ function stopRoomSubscription(s) {
         s.unsubscribeRoomAssignments = null;
     }
 }
-/* reconciliation */
-async function reconcileOnce(s) {
-    if (s.reconciling)
+/* heartbeat loop — heartbeat + room reconciliation in one tick */
+// every tick: send a heartbeat (which doubles as registration if our record was
+// reaped), refresh the cached tag state from what the driver returns, sweep local
+// process heartbeats, and kill any rooms that are no longer in the desired set
+// returned by the heartbeat. push-based subscribeRoomAssignments handles new
+// assignments instantly; this loop is the safety net for missed pushes plus the
+// authoritative source for "which rooms should this server be running right now".
+async function heartbeatTick(s, adminEndpoint) {
+    const result = await s.driver.heartbeat({
+        serverId: s.serverId,
+        endpoint: adminEndpoint,
+        tags: s.serverTags,
+        roomTypes: Array.from(s.knownRoomTypes),
+    });
+    if (result.registered && s.previouslyRegistered) {
+        log.warn('restored missing server entry — record was reaped while alive', {
+            serverId: s.serverId,
+            tags: s.serverTags,
+        });
+    }
+    s.serverTags = result.tags;
+    s.lastDriverHeartbeatAt = Date.now();
+    s.previouslyRegistered = true;
+    checkHeartbeats(s);
+    const desiredIds = new Set(result.desiredRooms.map((r) => r.roomId));
+    for (const roomId of s.processes.keys()) {
+        if (!desiredIds.has(roomId)) {
+            destroyWorker(s, roomId);
+        }
+    }
+}
+async function startHeartbeatLoop(s, adminEndpoint, intervalMs) {
+    if (s.heartbeatPunctuator)
         return;
-    s.reconciling = true;
-    try {
-        checkHeartbeats(s);
-        const desiredIds = new Set((await s.driver.getDesiredState(s.serverId)).map((r) => r.roomId));
-        // kill rooms that shouldn't be running
-        for (const roomId of s.processes.keys()) {
-            if (!desiredIds.has(roomId)) {
-                destroyWorker(s, roomId);
-            }
-        }
-    }
-    finally {
-        s.reconciling = false;
-    }
+    s.heartbeatPunctuator = await punctuate('heartbeat loop', () => heartbeatTick(s, adminEndpoint), {
+        intervalMs,
+        timeoutMs: HEARTBEAT_TICK_TIMEOUT_MS,
+        logger: log.child({ serverId: s.serverId }),
+    });
 }
-function startReconciler(s, pollIntervalMs) {
-    if (s.reconcileRunning)
-        return Promise.resolve();
-    s.reconcileRunning = true;
-    s.reconcilePollInterval = setInterval(() => {
-        if (s.reconcileRunning) {
-            reconcileOnce(s).catch((err) => {
-                log.error('reconcile error', { err });
-            });
-        }
-    }, pollIntervalMs);
-    return reconcileOnce(s);
-}
-function stopReconciler(s) {
-    s.reconcileRunning = false;
-    if (s.reconcilePollInterval) {
-        clearInterval(s.reconcilePollInterval);
-        s.reconcilePollInterval = null;
+function stopHeartbeatLoop(s) {
+    if (s.heartbeatPunctuator) {
+        s.heartbeatPunctuator.stop();
+        s.heartbeatPunctuator = null;
     }
 }
 /* leader election & duties */
@@ -2448,56 +2514,38 @@ async function runLeaderDuties(s) {
     await reapStaleServers(s);
     await cleanOrphanedRoomEntries(s);
 }
-async function attemptLeaderElection(s) {
-    if (s.isLeader) {
-        await runLeaderDuties(s);
-        return;
-    }
-    const acquired = await s.driver.tryAcquireLeader(s.serverId);
-    if (acquired) {
-        s.isLeader = true;
-        log.info('acquired leadership', { serverId: s.serverId });
-        s.leaderRenewalInterval = setInterval(() => {
-            s.driver
-                .renewLeader(s.serverId)
-                .then((renewed) => {
-                if (!renewed) {
-                    log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
-                    s.isLeader = false;
-                    if (s.leaderRenewalInterval) {
-                        clearInterval(s.leaderRenewalInterval);
-                        s.leaderRenewalInterval = null;
-                    }
-                }
-            })
-                .catch((err) => {
-                // driver error during renewal — log and keep trying next tick.
-                // we do not flip isLeader here: the lock ttl may still be live,
-                // and the next successful renewal will confirm or lose it.
-                log.error('leader renewal error', { serverId: s.serverId, err });
-            });
-        }, LEADER_RENEWAL_INTERVAL_MS);
-        await runLeaderDuties(s);
-    }
-}
-function startLeaderLoop(s) {
-    attemptLeaderElection(s).catch((err) => {
-        log.error('leader election error', { err });
+// single loop covering both election and renewal: branches on s.isLeader.
+// errors/timeouts log under 'leader loop error' and retry next tick — we
+// don't flip isLeader on driver error because the lock ttl may still be live.
+async function startLeaderLoop(s) {
+    s.leaderPunctuator = await punctuate('leader loop', async () => {
+        if (s.isLeader) {
+            const renewed = await s.driver.renewLeader(s.serverId);
+            if (!renewed) {
+                log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
+                s.isLeader = false;
+                return;
+            }
+            await runLeaderDuties(s);
+        }
+        else {
+            const acquired = await s.driver.tryAcquireLeader(s.serverId);
+            if (acquired) {
+                s.isLeader = true;
+                log.info('acquired leadership', { serverId: s.serverId });
+                await runLeaderDuties(s);
+            }
+        }
+    }, {
+        intervalMs: LEADER_LOOP_INTERVAL_MS,
+        timeoutMs: LEADER_LOOP_TIMEOUT_MS,
+        logger: log.child({ serverId: s.serverId }),
     });
-    s.leaderLoopInterval = setInterval(() => {
-        attemptLeaderElection(s).catch((err) => {
-            log.error('leader election error', { err });
-        });
-    }, LEADER_ELECTION_INTERVAL_MS);
 }
 function stopLeaderLoop(s) {
-    if (s.leaderLoopInterval) {
-        clearInterval(s.leaderLoopInterval);
-        s.leaderLoopInterval = null;
-    }
-    if (s.leaderRenewalInterval) {
-        clearInterval(s.leaderRenewalInterval);
-        s.leaderRenewalInterval = null;
+    if (s.leaderPunctuator) {
+        s.leaderPunctuator.stop();
+        s.leaderPunctuator = null;
     }
 }
 /* http handling */
@@ -2541,44 +2589,34 @@ async function startInternal(s) {
     s.httpServer.on('error', (err) => {
         log.error('http server error', { err });
     });
-    const adminHost = s.currentAddress?.host ?? s.host;
-    const adminPort = s.currentAddress?.port ?? s.port;
-    const adminEndpoint = s.options.serverEndpoint ?? `http://${adminHost}:${adminPort}`;
-    // subscribe to room assignments before registering — if we register first,
-    // an sdk could assign a room before we're listening and the message is lost
+    const serverHost = s.currentAddress?.host ?? s.host;
+    const serverPort = s.currentAddress?.port ?? s.port;
+    const serverEndpoint = s.options.serverEndpoint ?? `http://${serverHost}:${serverPort}`;
+    // subscribe to room assignments before the first heartbeat — registering
+    // first would let an sdk assign a room before we're listening, dropping the
+    // notification. push delivers new assignments instantly; the heartbeat loop
+    // is the safety net for missed pushes plus the periodic kill-stale-rooms.
     await startRoomSubscription(s);
-    await s.driver.registerServer({
-        serverId: s.serverId,
-        endpoint: adminEndpoint,
-        tags: s.options.tags ?? {},
-        roomTypes: Array.from(s.knownRoomTypes),
-    });
-    s.serverHeartbeatInterval = setInterval(() => {
-        s.driver.heartbeat(s.serverId).catch((err) => {
-            log.error('server heartbeat error', { err });
-        });
-    }, SERVER_HEARTBEAT_INTERVAL_MS);
-    startLeaderLoop(s);
-    await startReconciler(s, s.options.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS);
+    // start the heartbeat loop. punctuate runs the first tick eagerly, so the
+    // initial heartbeat (and therefore registration) is awaited before this
+    // returns. transient driver failure on the first tick is logged and
+    // retried by the loop — startup completes and self-heals in-process.
+    await startHeartbeatLoop(s, serverEndpoint, s.options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS);
+    await startLeaderLoop(s);
 }
 async function stop(s) {
     s.alive = false;
     // 1. stop room assignment subscription — no new spawns
     stopRoomSubscription(s);
-    // 2. stop reconciliation
-    stopReconciler(s);
+    // 2. stop the heartbeat loop (heartbeat + reconcile)
+    stopHeartbeatLoop(s);
     // 3. stop leader loop and release leader lock
     stopLeaderLoop(s);
     if (s.isLeader) {
         await s.driver.releaseLeader(s.serverId);
         s.isLeader = false;
     }
-    // 4. stop server heartbeat
-    if (s.serverHeartbeatInterval) {
-        clearInterval(s.serverHeartbeatInterval);
-        s.serverHeartbeatInterval = null;
-    }
-    // 5. unregister server from driver
+    // 4. unregister server from driver
     await s.driver.unregisterServer(s.serverId);
     // 6. terminate all room processes and wait for them to exit.
     // snapshot exit promises before killing — cleanupRoom deletes entries from s.processes.
@@ -2647,16 +2685,15 @@ async function start(options) {
         spawning: new Set(),
         alive: true,
         openSockets: new Set(),
-        reconciling: false,
-        reconcileRunning: false,
-        reconcilePollInterval: null,
+        heartbeatPunctuator: null,
+        serverTags: options.tags ?? {},
+        previouslyRegistered: false,
         unsubscribeRoomAssignments: null,
         isLeader: false,
-        leaderLoopInterval: null,
-        leaderRenewalInterval: null,
+        leaderPunctuator: null,
         httpServer: null,
         currentAddress: null,
-        serverHeartbeatInterval: null,
+        lastDriverHeartbeatAt: Date.now(),
     };
     await startInternal(s);
     return {

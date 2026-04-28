@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
-import { runner } from '../../src/server/runner/runner';
+import { describe, expect, it, vi } from 'vitest';
+import { type RunnerSpawnFn, runner } from '../../src/server/runner/runner';
 import type { SpawnContext } from '../../src/server/runner/types';
 
 function makeCtx(overrides?: Partial<SpawnContext>): SpawnContext {
@@ -39,14 +39,14 @@ describe('runner ctx.env', () => {
 
 describe('runner', () => {
     it('calls spawn function with context and stopped callback', () => {
-        const spawnFn = vi.fn(() => () => {});
+        const spawnFn = vi.fn<RunnerSpawnFn>(() => () => {});
         const r = runner(spawnFn);
         const ctx = makeCtx();
 
         r.spawn(ctx);
 
         expect(spawnFn).toHaveBeenCalledOnce();
-        const received = spawnFn.mock.calls[0][0];
+        const received = spawnFn.mock.calls[0]![0];
         expect(received.roomId).toBe('room-1');
         expect(received.roomType).toBe('game');
         expect(typeof received.stopped).toBe('function');

@@ -3,7 +3,7 @@ import { createMemoryDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
 import { runner, start, subprocess } from 'gatho/server';
 
-const API_PORT = 3001;
+const API_PORT = 3100;
 
 // shared in-memory driver — one process, no redis needed
 const driver = createMemoryDriver();

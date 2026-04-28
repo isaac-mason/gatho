@@ -14,6 +14,7 @@ import type { Socket } from 'net';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { log } from '../common/logger';
+import { type Punctuator, punctuate } from '../common/punctuate';
 import type { RoomMessage } from '../common/uds';
 import type { Driver, RoomData } from '../driver/types';
 import type { RoomRunner } from './runner/types';
@@ -30,17 +31,21 @@ export type CreateServerOptions = {
     driver: Driver;
     /** returns the full ws:// or wss:// URL clients will connect to for a room */
     roomEndpoint: RoomEndpointFn;
-    /** port to listen on for admin HTTP endpoint (health, ping) and driver communication */
+    /** port to listen on for server HTTP endpoint (health, ping) and driver communication */
     port?: number;
-    /** host to listen on for admin HTTP endpoint and driver communication */
+    /** host to listen on for server HTTP endpoint and driver communication */
     host?: string;
-    /** interval for reconciliation loop in milliseconds @default 5000 */
-    reconcileIntervalMs?: number;
+    /**
+     * cadence of the heartbeat loop (heartbeat + room reconciliation) in milliseconds.
+     * note this does not control the timing of room startup, only teardown.
+     * @default 5000
+     **/
+    heartbeatIntervalMs?: number;
     /** tags for this server instance (defaults to `{}`) */
     tags?: Record<string, string>;
     /** timeout for draining rooms in milliseconds */
     drainTimeoutMs?: number;
-    /** full URL for this server's admin HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
+    /** full URL for this server's HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
      *  if not set, defaults to "http://{host}:{port}" using the bound address. */
     serverEndpoint?: string;
     /** directory for the per-room UDS sockets used for server↔room IPC. defaults to
@@ -99,32 +104,41 @@ type ServerState = {
     // network
     openSockets: Set<Socket>;
 
-    // reconciliation
-    reconciling: boolean;
-    reconcileRunning: boolean;
-    reconcilePollInterval: ReturnType<typeof setInterval> | null;
-
     // room assignment subscription
     unsubscribeRoomAssignments: (() => void) | null;
 
     // leader election
     isLeader: boolean;
-    leaderLoopInterval: ReturnType<typeof setInterval> | null;
-    leaderRenewalInterval: ReturnType<typeof setInterval> | null;
+    leaderPunctuator: Punctuator | null;
 
     // http
     httpServer: http.Server | null;
     currentAddress: { host: string; port: number } | null;
-    serverHeartbeatInterval: ReturnType<typeof setInterval> | null;
+
+    // heartbeat loop — single punctuator that drives a heartbeat tick: send a
+    // heartbeat (server liveness + first-insert registration) and then reconcile
+    // local processes against the desired-rooms set returned by the driver.
+    // serverTags caches the authoritative tag state returned from the most recent
+    // heartbeat so that if our record gets reaped while we're alive, the next
+    // first-insert recovery uses the latest known tags rather than the boot snapshot.
+    heartbeatPunctuator: Punctuator | null;
+    serverTags: Record<string, string>;
+    lastDriverHeartbeatAt: number;
+    // true once the first heartbeat has succeeded — used to distinguish initial
+    // registration (expected) from reap-recovery (re-registration after we've
+    // already been alive, which we warn about).
+    previouslyRegistered: boolean;
 };
 
 /* constants */
 
-const DEFAULT_RECONCILE_INTERVAL_MS = 5000;
-const HEARTBEAT_TIMEOUT_MS = 10_000;
-const LEADER_ELECTION_INTERVAL_MS = 15_000;
-const LEADER_RENEWAL_INTERVAL_MS = 10_000;
-const SERVER_HEARTBEAT_INTERVAL_MS = 10_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
+const LEADER_LOOP_INTERVAL_MS = 10_000;
+const LEADER_LOOP_TIMEOUT_MS = 5_000;
+const HEARTBEAT_TICK_TIMEOUT_MS = 5_000;
+
+/** how long a room process can go without a heartbeat before we consider it stalled and kill it. */
+const ROOM_STALL_TIMEOUT_MS = 10_000;
 
 /* centralized room cleanup */
 
@@ -380,7 +394,7 @@ function shutdownAllWorkers(s: ServerState): void {
 function checkHeartbeats(s: ServerState): void {
     const now = Date.now();
     for (const [roomId, lastBeat] of s.lastHeartbeats) {
-        if (now - lastBeat > HEARTBEAT_TIMEOUT_MS) {
+        if (now - lastBeat > ROOM_STALL_TIMEOUT_MS) {
             const roomProcess = s.processes.get(roomId);
             if (roomProcess) {
                 log.warn('process stalled, killing', { roomId, stalledMs: now - lastBeat });
@@ -424,48 +438,55 @@ function stopRoomSubscription(s: ServerState): void {
     }
 }
 
-/* reconciliation */
+/* heartbeat loop — heartbeat + room reconciliation in one tick */
 
-async function reconcileOnce(s: ServerState): Promise<void> {
-    if (s.reconciling) return;
-    s.reconciling = true;
+// every tick: send a heartbeat (which doubles as registration if our record was
+// reaped), refresh the cached tag state from what the driver returns, sweep local
+// process heartbeats, and kill any rooms that are no longer in the desired set
+// returned by the heartbeat. push-based subscribeRoomAssignments handles new
+// assignments instantly; this loop is the safety net for missed pushes plus the
+// authoritative source for "which rooms should this server be running right now".
+async function heartbeatTick(s: ServerState, adminEndpoint: string): Promise<void> {
+    const result = await s.driver.heartbeat({
+        serverId: s.serverId,
+        endpoint: adminEndpoint,
+        tags: s.serverTags,
+        roomTypes: Array.from(s.knownRoomTypes),
+    });
+    if (result.registered && s.previouslyRegistered) {
+        log.warn('restored missing server entry — record was reaped while alive', {
+            serverId: s.serverId,
+            tags: s.serverTags,
+        });
+    }
+    s.serverTags = result.tags;
+    s.lastDriverHeartbeatAt = Date.now();
+    s.previouslyRegistered = true;
 
-    try {
-        checkHeartbeats(s);
+    checkHeartbeats(s);
 
-        const desiredIds = new Set((await s.driver.getDesiredState(s.serverId)).map((r) => r.roomId));
-
-        // kill rooms that shouldn't be running
-        for (const roomId of s.processes.keys()) {
-            if (!desiredIds.has(roomId)) {
-                destroyWorker(s, roomId);
-            }
+    const desiredIds = new Set(result.desiredRooms.map((r) => r.roomId));
+    for (const roomId of s.processes.keys()) {
+        if (!desiredIds.has(roomId)) {
+            destroyWorker(s, roomId);
         }
-    } finally {
-        s.reconciling = false;
     }
 }
 
-function startReconciler(s: ServerState, pollIntervalMs: number): Promise<void> {
-    if (s.reconcileRunning) return Promise.resolve();
-    s.reconcileRunning = true;
+async function startHeartbeatLoop(s: ServerState, adminEndpoint: string, intervalMs: number): Promise<void> {
+    if (s.heartbeatPunctuator) return;
 
-    s.reconcilePollInterval = setInterval(() => {
-        if (s.reconcileRunning) {
-            reconcileOnce(s).catch((err) => {
-                log.error('reconcile error', { err });
-            });
-        }
-    }, pollIntervalMs);
-
-    return reconcileOnce(s);
+    s.heartbeatPunctuator = await punctuate('heartbeat loop', () => heartbeatTick(s, adminEndpoint), {
+        intervalMs,
+        timeoutMs: HEARTBEAT_TICK_TIMEOUT_MS,
+        logger: log.child({ serverId: s.serverId }),
+    });
 }
 
-function stopReconciler(s: ServerState): void {
-    s.reconcileRunning = false;
-    if (s.reconcilePollInterval) {
-        clearInterval(s.reconcilePollInterval);
-        s.reconcilePollInterval = null;
+function stopHeartbeatLoop(s: ServerState): void {
+    if (s.heartbeatPunctuator) {
+        s.heartbeatPunctuator.stop();
+        s.heartbeatPunctuator = null;
     }
 }
 
@@ -515,62 +536,42 @@ async function runLeaderDuties(s: ServerState): Promise<void> {
     await cleanOrphanedRoomEntries(s);
 }
 
-async function attemptLeaderElection(s: ServerState): Promise<void> {
-    if (s.isLeader) {
-        await runLeaderDuties(s);
-        return;
-    }
-
-    const acquired = await s.driver.tryAcquireLeader(s.serverId);
-    if (acquired) {
-        s.isLeader = true;
-        log.info('acquired leadership', { serverId: s.serverId });
-
-        s.leaderRenewalInterval = setInterval(() => {
-            s.driver
-                .renewLeader(s.serverId)
-                .then((renewed) => {
-                    if (!renewed) {
-                        log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
-                        s.isLeader = false;
-                        if (s.leaderRenewalInterval) {
-                            clearInterval(s.leaderRenewalInterval);
-                            s.leaderRenewalInterval = null;
-                        }
-                    }
-                })
-                .catch((err) => {
-                    // driver error during renewal — log and keep trying next tick.
-                    // we do not flip isLeader here: the lock ttl may still be live,
-                    // and the next successful renewal will confirm or lose it.
-                    log.error('leader renewal error', { serverId: s.serverId, err });
-                });
-        }, LEADER_RENEWAL_INTERVAL_MS);
-
-        await runLeaderDuties(s);
-    }
-}
-
-function startLeaderLoop(s: ServerState): void {
-    attemptLeaderElection(s).catch((err) => {
-        log.error('leader election error', { err });
-    });
-
-    s.leaderLoopInterval = setInterval(() => {
-        attemptLeaderElection(s).catch((err) => {
-            log.error('leader election error', { err });
-        });
-    }, LEADER_ELECTION_INTERVAL_MS);
+// single loop covering both election and renewal: branches on s.isLeader.
+// errors/timeouts log under 'leader loop error' and retry next tick — we
+// don't flip isLeader on driver error because the lock ttl may still be live.
+async function startLeaderLoop(s: ServerState): Promise<void> {
+    s.leaderPunctuator = await punctuate(
+        'leader loop',
+        async () => {
+            if (s.isLeader) {
+                const renewed = await s.driver.renewLeader(s.serverId);
+                if (!renewed) {
+                    log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
+                    s.isLeader = false;
+                    return;
+                }
+                await runLeaderDuties(s);
+            } else {
+                const acquired = await s.driver.tryAcquireLeader(s.serverId);
+                if (acquired) {
+                    s.isLeader = true;
+                    log.info('acquired leadership', { serverId: s.serverId });
+                    await runLeaderDuties(s);
+                }
+            }
+        },
+        {
+            intervalMs: LEADER_LOOP_INTERVAL_MS,
+            timeoutMs: LEADER_LOOP_TIMEOUT_MS,
+            logger: log.child({ serverId: s.serverId }),
+        },
+    );
 }
 
 function stopLeaderLoop(s: ServerState): void {
-    if (s.leaderLoopInterval) {
-        clearInterval(s.leaderLoopInterval);
-        s.leaderLoopInterval = null;
-    }
-    if (s.leaderRenewalInterval) {
-        clearInterval(s.leaderRenewalInterval);
-        s.leaderRenewalInterval = null;
+    if (s.leaderPunctuator) {
+        s.leaderPunctuator.stop();
+        s.leaderPunctuator = null;
     }
 }
 
@@ -624,30 +625,23 @@ async function startInternal(s: ServerState): Promise<void> {
         log.error('http server error', { err });
     });
 
-    const adminHost = s.currentAddress?.host ?? s.host;
-    const adminPort = s.currentAddress?.port ?? s.port;
-    const adminEndpoint = s.options.serverEndpoint ?? `http://${adminHost}:${adminPort}`;
+    const serverHost = s.currentAddress?.host ?? s.host;
+    const serverPort = s.currentAddress?.port ?? s.port;
+    const serverEndpoint = s.options.serverEndpoint ?? `http://${serverHost}:${serverPort}`;
 
-    // subscribe to room assignments before registering — if we register first,
-    // an sdk could assign a room before we're listening and the message is lost
+    // subscribe to room assignments before the first heartbeat — registering
+    // first would let an sdk assign a room before we're listening, dropping the
+    // notification. push delivers new assignments instantly; the heartbeat loop
+    // is the safety net for missed pushes plus the periodic kill-stale-rooms.
     await startRoomSubscription(s);
 
-    await s.driver.registerServer({
-        serverId: s.serverId,
-        endpoint: adminEndpoint,
-        tags: s.options.tags ?? {},
-        roomTypes: Array.from(s.knownRoomTypes),
-    });
+    // start the heartbeat loop. punctuate runs the first tick eagerly, so the
+    // initial heartbeat (and therefore registration) is awaited before this
+    // returns. transient driver failure on the first tick is logged and
+    // retried by the loop — startup completes and self-heals in-process.
+    await startHeartbeatLoop(s, serverEndpoint, s.options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS);
 
-    s.serverHeartbeatInterval = setInterval(() => {
-        s.driver.heartbeat(s.serverId).catch((err) => {
-            log.error('server heartbeat error', { err });
-        });
-    }, SERVER_HEARTBEAT_INTERVAL_MS);
-
-    startLeaderLoop(s);
-
-    await startReconciler(s, s.options.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS);
+    await startLeaderLoop(s);
 }
 
 async function stop(s: ServerState): Promise<void> {
@@ -656,8 +650,8 @@ async function stop(s: ServerState): Promise<void> {
     // 1. stop room assignment subscription — no new spawns
     stopRoomSubscription(s);
 
-    // 2. stop reconciliation
-    stopReconciler(s);
+    // 2. stop the heartbeat loop (heartbeat + reconcile)
+    stopHeartbeatLoop(s);
 
     // 3. stop leader loop and release leader lock
     stopLeaderLoop(s);
@@ -666,13 +660,7 @@ async function stop(s: ServerState): Promise<void> {
         s.isLeader = false;
     }
 
-    // 4. stop server heartbeat
-    if (s.serverHeartbeatInterval) {
-        clearInterval(s.serverHeartbeatInterval);
-        s.serverHeartbeatInterval = null;
-    }
-
-    // 5. unregister server from driver
+    // 4. unregister server from driver
     await s.driver.unregisterServer(s.serverId);
 
     // 6. terminate all room processes and wait for them to exit.
@@ -755,19 +743,18 @@ export async function start(options: CreateServerOptions): Promise<Server> {
 
         openSockets: new Set(),
 
-        reconciling: false,
-        reconcileRunning: false,
-        reconcilePollInterval: null,
+        heartbeatPunctuator: null,
+        serverTags: options.tags ?? {},
+        previouslyRegistered: false,
 
         unsubscribeRoomAssignments: null,
 
         isLeader: false,
-        leaderLoopInterval: null,
-        leaderRenewalInterval: null,
+        leaderPunctuator: null,
 
         httpServer: null,
         currentAddress: null,
-        serverHeartbeatInterval: null,
+        lastDriverHeartbeatAt: Date.now(),
     };
 
     await startInternal(s);

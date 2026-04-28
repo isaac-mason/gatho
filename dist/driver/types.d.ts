@@ -90,13 +90,16 @@ export type ServerInfo = {
     /** room types this server can start */
     roomTypes: string[];
 };
-/** options for registering a server with the driver */
-export type RegisterServerOptions = {
+/** options for a server heartbeat. on first heartbeat (no existing record) the
+ *  driver inserts a new server with the supplied identity (endpoint/tags/roomTypes);
+ *  on subsequent heartbeats it refreshes lastHeartbeat and updates endpoint/roomTypes,
+ *  but `tags` are not overwritten (mutated separately via addServerTags/removeServerTags). */
+export type HeartbeatOptions = {
     /** unique identifier for this server */
     serverId: string;
     /** full URL for this server's admin HTTP endpoint, e.g. "http://localhost:3000" */
     endpoint: string;
-    /** string key/value tags for userland metadata (e.g. region, draining status) */
+    /** string key/value tags applied only when the server record is first created. */
     tags: Record<string, string>;
     /** room types this server can start */
     roomTypes: string[];
@@ -106,6 +109,20 @@ export type DesiredRoom = {
     roomId: string;
     roomType: string;
     data: RoomData;
+};
+/** authoritative state returned by a heartbeat tick — used by the server's
+ *  control loop to refresh its tag cache and reconcile local processes. */
+export type HeartbeatResult = {
+    /** current tag state for this server (may differ from `options.tags` if
+     *  addServerTags/removeServerTags was called since the last heartbeat). */
+    tags: Record<string, string>;
+    /** rooms currently assigned to this server. */
+    desiredRooms: DesiredRoom[];
+    /** true if this heartbeat created the server record (no prior row existed).
+     *  expected on the first heartbeat from a server process; if the server has
+     *  already heartbeat'd before, `registered: true` indicates the record was
+     *  reaped while we were alive and we just self-recovered. */
+    registered: boolean;
 };
 /** driver interface — all methods are internal to gatho.
  *  use start() or createGathoSDK() instead of calling these directly. */
@@ -135,8 +152,6 @@ export type Driver = {
          *  or rejects if the room doesn't become ready within timeoutMs.
          *  implementations should check initial state (already running) before subscribing. */
         waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo>;
-        /** returns rooms assigned to a server */
-        getDesiredState(serverId: string): Promise<DesiredRoom[]>;
         /** allocates a spot for a client, mints a jwt signed with the room's secret.
          *  optional data bag is included in the jwt payload and delivered to onAuth as joinData.
          *  keep data small — the jwt travels in a url query param (~2-3KB practical limit). */
@@ -145,10 +160,12 @@ export type Driver = {
         connectClient(clientId: string): Promise<void>;
         /** marks a client as disconnected — called by server when room reports client-disconnected over ipc */
         disconnectClient(clientId: string): Promise<void>;
-        /** register a server to receive room assignments and client reservations */
-        registerServer(options: RegisterServerOptions): Promise<void>;
-        /** send a heartbeat to indicate this server is alive — should be called at regular intervals (e.g. every 10s) */
-        heartbeat(serverId: string): Promise<void>;
+        /** send a heartbeat to indicate this server is alive — should be called at regular intervals (e.g. every 5s).
+         *  doubles as registration: the first heartbeat creates the server record; subsequent calls
+         *  refresh lastHeartbeat and update endpoint/roomTypes. tags are written only on first insert.
+         *  returns the current authoritative tag state and the rooms currently assigned to this server,
+         *  so the caller's control loop can reconcile in the same round-trip. */
+        heartbeat(options: HeartbeatOptions): Promise<HeartbeatResult>;
         /** unregister a server, e.g. on graceful shutdown */
         unregisterServer(serverId: string): Promise<void>;
         /** add tags to a server */

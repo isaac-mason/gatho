@@ -12,7 +12,8 @@ import type {
     Driver,
     ListRoomsFilter,
     ListServersFilter,
-    RegisterServerOptions,
+    HeartbeatOptions,
+    HeartbeatResult,
     RoomData,
     RoomInfo,
     RoomStatus,
@@ -258,16 +259,6 @@ export function createMemoryDriver(): Driver {
         for (const key of keys) delete r.tags[key];
     }
 
-    async function getDesiredState(serverId: string): Promise<DesiredRoom[]> {
-        const result: DesiredRoom[] = [];
-        for (const r of rooms.values()) {
-            if (r.serverId === serverId) {
-                result.push({ roomId: r.roomId, roomType: r.roomType, data: r.data });
-            }
-        }
-        return result;
-    }
-
     async function reserveClient(
         roomId: string,
         ttl: number,
@@ -308,35 +299,53 @@ export function createMemoryDriver(): Driver {
         clients.delete(clientId);
     }
 
-    async function registerServer(options: RegisterServerOptions): Promise<void> {
-        validateTags(options.tags);
+    // heartbeat doubles as registration: the first call inserts a new record with
+    // the supplied tags; subsequent calls refresh lastHeartbeat and update
+    // endpoint/roomTypes, but leave tags untouched (see addServerTags/removeServerTags).
+    // returns the current authoritative tag state and rooms assigned to this server
+    // so the caller can reconcile in the same round-trip.
+    async function heartbeat(options: HeartbeatOptions): Promise<HeartbeatResult> {
+        const existing = servers.get(options.serverId);
+        const registered = !existing;
+        if (existing) {
+            existing.lastHeartbeat = Date.now();
+            existing.endpoint = options.endpoint;
+            existing.roomTypes = [...options.roomTypes];
+        } else {
+            validateTags(options.tags);
 
-        // evict previous servers on the same endpoint (handles restarts)
-        for (const [id, s] of servers) {
-            if (s.endpoint === options.endpoint && id !== options.serverId) {
-                // delete rooms for the stale server
-                for (const [roomId, r] of rooms) {
-                    if (r.serverId === id) {
-                        deleteClientsForRoom(roomId);
-                        rooms.delete(roomId);
+            // evict previous servers on the same endpoint (handles restarts)
+            for (const [id, s] of servers) {
+                if (s.endpoint === options.endpoint) {
+                    for (const [roomId, r] of rooms) {
+                        if (r.serverId === id) {
+                            deleteClientsForRoom(roomId);
+                            rooms.delete(roomId);
+                        }
                     }
+                    servers.delete(id);
                 }
-                servers.delete(id);
             }
+
+            servers.set(options.serverId, {
+                serverId: options.serverId,
+                endpoint: options.endpoint,
+                tags: { ...options.tags },
+                roomTypes: [...options.roomTypes],
+                lastHeartbeat: Date.now(),
+            });
         }
 
-        servers.set(options.serverId, {
-            serverId: options.serverId,
-            endpoint: options.endpoint,
-            tags: { ...options.tags },
-            roomTypes: [...options.roomTypes],
-            lastHeartbeat: Date.now(),
-        });
-    }
-
-    async function heartbeat(serverId: string): Promise<void> {
-        const s = servers.get(serverId);
-        if (s) s.lastHeartbeat = Date.now();
+        // record always exists at this point — either it already did, or we just inserted it.
+        // biome-ignore lint/style/noNonNullAssertion: invariant from the branch above
+        const current = servers.get(options.serverId)!;
+        const desiredRooms: DesiredRoom[] = [];
+        for (const r of rooms.values()) {
+            if (r.serverId === options.serverId) {
+                desiredRooms.push({ roomId: r.roomId, roomType: r.roomType, data: r.data });
+            }
+        }
+        return { tags: { ...current.tags }, desiredRooms, registered };
     }
 
     async function unregisterServer(serverId: string): Promise<void> {
@@ -431,11 +440,9 @@ export function createMemoryDriver(): Driver {
             listRooms,
             addRoomTags,
             removeRoomTags,
-            getDesiredState,
             reserveClient,
             connectClient,
             disconnectClient,
-            registerServer,
             heartbeat,
             unregisterServer,
             addServerTags,

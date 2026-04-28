@@ -1,5 +1,6 @@
 import Redis, { type Cluster } from 'ioredis';
 import { jwtSign } from '../common/jwt';
+import { log } from '../common/logger';
 import { RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from './errors';
 import type {
     ClientInfo,
@@ -8,13 +9,21 @@ import type {
     Driver,
     ListRoomsFilter,
     ListServersFilter,
-    RegisterServerOptions,
+    HeartbeatOptions,
+    HeartbeatResult,
     RoomData,
     RoomInfo,
     RoomStatus,
     ServerInfo,
 } from './types';
 import { validateTags } from './types';
+
+function attachLifecycleLogging(c: Redis | Cluster, name: 'main' | 'subscriber'): void {
+    c.on('error', (err: Error) => log.error('redis connection error', { connection: name, err }));
+    c.on('end', () => log.warn('redis connection ended', { connection: name }));
+    c.on('reconnecting', (ms: number) => log.warn('redis reconnecting', { connection: name, delayMs: ms }));
+    c.on('ready', () => log.info('redis ready', { connection: name }));
+}
 
 /**
  * redis driver implementation using ioredis
@@ -28,6 +37,11 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
 
     const client = options.client ?? new Redis(options.url ?? process.env.GATHO_REDIS_URL ?? 'redis://localhost:6379');
 
+    // surface connection lifecycle so transient outages are observable.
+    // ioredis swallows 'error' events into its own handler — without this we
+    // have zero signal when the underlying socket flaps.
+    attachLifecycleLogging(client, 'main');
+
     // shared subscriber connection — lazily created on first waitForRoom call.
     // ioredis requires a dedicated connection for subscriptions (subscribed
     // clients can't issue normal commands). instead of creating one per call,
@@ -38,6 +52,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
     function getSubscriber(): Redis | Cluster {
         if (!subscriber) {
             subscriber = client.duplicate();
+            attachLifecycleLogging(subscriber, 'subscriber');
             subscriber.on('message', (ch: string, msg: string) => {
                 const listeners = channelListeners.get(ch);
                 if (!listeners) return;
@@ -362,29 +377,6 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         await client.hset(keys.room(roomId), { tags: JSON.stringify(existing) });
     }
 
-    async function getDesiredState(serverId: string): Promise<DesiredRoom[]> {
-        const roomIds = await client.smembers(keys.roomsByServerId(serverId));
-        if (roomIds.length === 0) return [];
-
-        const rooms = await Promise.all(
-            roomIds.map(async (roomId) => {
-                const data = await client.hgetall(keys.room(roomId));
-                if (!data || !data.roomId) {
-                    // stale index entry
-                    await client.srem(keys.roomsByServerId(serverId), roomId);
-                    return null;
-                }
-                return {
-                    roomId: data.roomId,
-                    roomType: data.roomType,
-                    data: JSON.parse(data.data || '{}') as RoomData,
-                };
-            }),
-        );
-
-        return rooms.filter((r): r is DesiredRoom => r !== null);
-    }
-
     async function reserveClient(
         roomId: string,
         ttl: number,
@@ -455,27 +447,85 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         await client.del(keys.client(clientId));
     }
 
-    async function registerServer(options: RegisterServerOptions): Promise<void> {
-        validateTags(options.tags);
+    // heartbeat doubles as registration. on first call the server hash doesn't
+    // exist, so we validate tags, evict any prior server on the same endpoint
+    // (restart case), and write the full record. on subsequent calls we just
+    // refresh lastHeartbeat plus endpoint/roomTypes — `tags` is HSETNX'd so
+    // mutations from addServerTags/removeServerTags survive intact.
+    // returns the authoritative tag state (post-write) and the rooms currently
+    // assigned to this server, so the caller's control loop can reconcile in
+    // the same round-trip.
+    let schemaVersionEnsured = false;
+    async function heartbeat(options: HeartbeatOptions): Promise<HeartbeatResult> {
+        if (!schemaVersionEnsured) {
+            await ensureSchemaVersion();
+            schemaVersionEnsured = true;
+        }
 
-        // ensure redis data matches our schema — flushes all prefixed keys on mismatch
-        await ensureSchemaVersion();
+        const key = keys.server(options.serverId);
+        const exists = (await client.exists(key)) === 1;
+        const registered = !exists;
 
-        await client.hset(keys.server(options.serverId), {
+        if (!exists) {
+            validateTags(options.tags);
+
+            // evict any previous server registered on the same endpoint —
+            // handles restarts where the new process picks a fresh serverId
+            const serverIds = await client.smembers(keys.servers);
+            for (const id of serverIds) {
+                if (id === options.serverId) continue;
+                const ep = await client.hget(keys.server(id), 'endpoint');
+                if (ep === options.endpoint) {
+                    await unregisterServer(id);
+                }
+            }
+        }
+
+        const tx = client.multi();
+        // first-insert-only tags — preserves later add/removeServerTags writes
+        tx.hsetnx(key, 'tags', JSON.stringify(options.tags));
+        tx.hset(key, {
             serverId: options.serverId,
             endpoint: options.endpoint,
-            tags: JSON.stringify(options.tags),
             roomTypes: JSON.stringify(options.roomTypes),
             lastHeartbeat: String(Date.now()),
         });
+        tx.sadd(keys.servers, options.serverId);
+        // last command in the transaction reads the post-write tags so the
+        // caller can refresh its in-memory cache without a second round-trip.
+        tx.hget(key, 'tags');
+        const txResults = await tx.exec();
 
-        await client.sadd(keys.servers, options.serverId);
-    }
+        // tx.exec() returns null only if the transaction was discarded (e.g.,
+        // WATCH conflict — we don't use WATCH, so this should not happen).
+        const tagsRaw = (txResults?.[3]?.[1] ?? null) as string | null;
+        const tags = tagsRaw ? (JSON.parse(tagsRaw) as Record<string, string>) : {};
 
-    async function heartbeat(serverId: string): Promise<void> {
-        await client.hset(keys.server(serverId), {
-            lastHeartbeat: String(Date.now()),
-        });
+        // collect desired rooms in the same call. paying for the second
+        // round-trip here vs on a separate reconcile tick — net halves the
+        // control-plane round-trip count.
+        const roomIds = await client.smembers(keys.roomsByServerId(options.serverId));
+        const desiredRooms: DesiredRoom[] = [];
+        if (roomIds.length > 0) {
+            const rooms = await Promise.all(
+                roomIds.map(async (roomId) => {
+                    const data = await client.hgetall(keys.room(roomId));
+                    if (!data || !data.roomId) {
+                        // stale index entry
+                        await client.srem(keys.roomsByServerId(options.serverId), roomId);
+                        return null;
+                    }
+                    return {
+                        roomId: data.roomId,
+                        roomType: data.roomType,
+                        data: JSON.parse(data.data || '{}') as RoomData,
+                    };
+                }),
+            );
+            for (const r of rooms) if (r) desiredRooms.push(r);
+        }
+
+        return { tags, desiredRooms, registered };
     }
 
     async function unregisterServer(serverId: string): Promise<void> {
@@ -632,11 +682,9 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
             listRooms,
             addRoomTags,
             removeRoomTags,
-            getDesiredState,
             reserveClient,
             connectClient,
             disconnectClient,
-            registerServer,
             heartbeat,
             unregisterServer,
             addServerTags,

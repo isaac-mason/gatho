@@ -8,6 +8,7 @@
 //   POST /api/join               join a room (body: { roomId })
 //   POST /api/rooms/:id/dispose  dispose a room if empty
 
+import Bun from 'bun';
 import { createRedisDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
 

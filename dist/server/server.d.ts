@@ -11,17 +11,21 @@ export type CreateServerOptions = {
     driver: Driver;
     /** returns the full ws:// or wss:// URL clients will connect to for a room */
     roomEndpoint: RoomEndpointFn;
-    /** port to listen on for admin HTTP endpoint (health, ping) and driver communication */
+    /** port to listen on for server HTTP endpoint (health, ping) and driver communication */
     port?: number;
-    /** host to listen on for admin HTTP endpoint and driver communication */
+    /** host to listen on for server HTTP endpoint and driver communication */
     host?: string;
-    /** interval for reconciliation loop in milliseconds @default 5000 */
-    reconcileIntervalMs?: number;
+    /**
+     * cadence of the heartbeat loop (heartbeat + room reconciliation) in milliseconds.
+     * note this does not control the timing of room startup, only teardown.
+     * @default 5000
+     **/
+    heartbeatIntervalMs?: number;
     /** tags for this server instance (defaults to `{}`) */
     tags?: Record<string, string>;
     /** timeout for draining rooms in milliseconds */
     drainTimeoutMs?: number;
-    /** full URL for this server's admin HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
+    /** full URL for this server's HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
      *  if not set, defaults to "http://{host}:{port}" using the bound address. */
     serverEndpoint?: string;
     /** directory for the per-room UDS sockets used for server↔room IPC. defaults to

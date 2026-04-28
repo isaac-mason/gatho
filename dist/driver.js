@@ -296,15 +296,6 @@ function createMemoryDriver() {
         for (const key of keys)
             delete r.tags[key];
     }
-    async function getDesiredState(serverId) {
-        const result = [];
-        for (const r of rooms.values()) {
-            if (r.serverId === serverId) {
-                result.push({ roomId: r.roomId, roomType: r.roomType, data: r.data });
-            }
-        }
-        return result;
-    }
     async function reserveClient(roomId, ttl, data, tags) {
         const r = rooms.get(roomId);
         if (!r)
@@ -333,33 +324,51 @@ function createMemoryDriver() {
     async function disconnectClient(clientId) {
         clients.delete(clientId);
     }
-    async function registerServer(options) {
-        validateTags(options.tags);
-        // evict previous servers on the same endpoint (handles restarts)
-        for (const [id, s] of servers) {
-            if (s.endpoint === options.endpoint && id !== options.serverId) {
-                // delete rooms for the stale server
-                for (const [roomId, r] of rooms) {
-                    if (r.serverId === id) {
-                        deleteClientsForRoom(roomId);
-                        rooms.delete(roomId);
+    // heartbeat doubles as registration: the first call inserts a new record with
+    // the supplied tags; subsequent calls refresh lastHeartbeat and update
+    // endpoint/roomTypes, but leave tags untouched (see addServerTags/removeServerTags).
+    // returns the current authoritative tag state and rooms assigned to this server
+    // so the caller can reconcile in the same round-trip.
+    async function heartbeat(options) {
+        const existing = servers.get(options.serverId);
+        const registered = !existing;
+        if (existing) {
+            existing.lastHeartbeat = Date.now();
+            existing.endpoint = options.endpoint;
+            existing.roomTypes = [...options.roomTypes];
+        }
+        else {
+            validateTags(options.tags);
+            // evict previous servers on the same endpoint (handles restarts)
+            for (const [id, s] of servers) {
+                if (s.endpoint === options.endpoint) {
+                    for (const [roomId, r] of rooms) {
+                        if (r.serverId === id) {
+                            deleteClientsForRoom(roomId);
+                            rooms.delete(roomId);
+                        }
                     }
+                    servers.delete(id);
                 }
-                servers.delete(id);
+            }
+            servers.set(options.serverId, {
+                serverId: options.serverId,
+                endpoint: options.endpoint,
+                tags: { ...options.tags },
+                roomTypes: [...options.roomTypes],
+                lastHeartbeat: Date.now(),
+            });
+        }
+        // record always exists at this point — either it already did, or we just inserted it.
+        // biome-ignore lint/style/noNonNullAssertion: invariant from the branch above
+        const current = servers.get(options.serverId);
+        const desiredRooms = [];
+        for (const r of rooms.values()) {
+            if (r.serverId === options.serverId) {
+                desiredRooms.push({ roomId: r.roomId, roomType: r.roomType, data: r.data });
             }
         }
-        servers.set(options.serverId, {
-            serverId: options.serverId,
-            endpoint: options.endpoint,
-            tags: { ...options.tags },
-            roomTypes: [...options.roomTypes],
-            lastHeartbeat: Date.now(),
-        });
-    }
-    async function heartbeat(serverId) {
-        const s = servers.get(serverId);
-        if (s)
-            s.lastHeartbeat = Date.now();
+        return { tags: { ...current.tags }, desiredRooms, registered };
     }
     async function unregisterServer(serverId) {
         // delete all rooms for this server
@@ -445,11 +454,9 @@ function createMemoryDriver() {
             listRooms,
             addRoomTags,
             removeRoomTags,
-            getDesiredState,
             reserveClient,
             connectClient,
             disconnectClient,
-            registerServer,
             heartbeat,
             unregisterServer,
             addServerTags,
@@ -729,17 +736,6 @@ async function createPostgresDriver(options = {}) {
         if (result.count === 0)
             throw new RoomNotFoundError(roomId);
     }
-    async function getDesiredState(serverId) {
-        const rows = await db `
-            select room_id, room_type, data
-            from ${db.unsafe(t.rooms)} where server_id = ${serverId}
-        `;
-        return rows.map((r) => ({
-            roomId: r.room_id,
-            roomType: r.room_type,
-            data: r.data,
-        }));
-    }
     async function reserveClient(roomId, ttl, data, tags) {
         const rooms = await db `
             select room_id, status, room_secret, endpoint
@@ -773,30 +769,46 @@ async function createPostgresDriver(options = {}) {
     async function disconnectClient(clientId) {
         await db `delete from ${db.unsafe(t.clients)} where client_id = ${clientId}`;
     }
-    async function registerServer(opts) {
-        validateTags(opts.tags);
-        // evict any existing server with the same endpoint (stale from previous run)
-        await db `
-            delete from ${db.unsafe(t.servers)}
-            where endpoint = ${opts.endpoint} and server_id != ${opts.serverId}
+    // heartbeat doubles as registration. on first call (no row for this serverId)
+    // we validate tags and evict any prior server bound to the same endpoint —
+    // handles restart-with-fresh-id. the upsert below intentionally omits `tags`
+    // from the update list so subsequent heartbeats don't clobber tag mutations
+    // from addServerTags/removeServerTags. returns the post-write authoritative
+    // tag state and the rooms currently assigned to this server, so the caller's
+    // control loop can reconcile in the same round-trip.
+    async function heartbeat(opts) {
+        const existing = await db `
+            select 1 from ${db.unsafe(t.servers)} where server_id = ${opts.serverId} limit 1
         `;
+        const registered = existing.length === 0;
+        if (registered) {
+            validateTags(opts.tags);
+            await db `
+                delete from ${db.unsafe(t.servers)}
+                where endpoint = ${opts.endpoint} and server_id != ${opts.serverId}
+            `;
+        }
         const now = Date.now();
-        await db `
+        const upserted = await db `
             insert into ${db.unsafe(t.servers)} (server_id, endpoint, tags, room_types, last_heartbeat)
             values (${opts.serverId}, ${opts.endpoint}, ${JSON.stringify(opts.tags)}::jsonb, ${opts.roomTypes}, ${now})
             on conflict (server_id) do update set
                 endpoint = excluded.endpoint,
-                tags = excluded.tags,
                 room_types = excluded.room_types,
                 last_heartbeat = excluded.last_heartbeat
+            returning tags
         `;
-    }
-    async function heartbeat(serverId) {
-        const now = Date.now();
-        await db `
-            update ${db.unsafe(t.servers)} set last_heartbeat = ${now}
-            where server_id = ${serverId}
+        const tags = upserted[0]?.tags ?? {};
+        const desiredRows = await db `
+            select room_id, room_type, data
+            from ${db.unsafe(t.rooms)} where server_id = ${opts.serverId}
         `;
+        const desiredRooms = desiredRows.map((r) => ({
+            roomId: r.room_id,
+            roomType: r.room_type,
+            data: r.data,
+        }));
+        return { tags, desiredRooms, registered };
     }
     async function unregisterServer(serverId) {
         // cascade deletes rooms -> clients via FK
@@ -919,11 +931,9 @@ async function createPostgresDriver(options = {}) {
             listRooms,
             addRoomTags,
             removeRoomTags,
-            getDesiredState,
             reserveClient,
             connectClient,
             disconnectClient,
-            registerServer,
             heartbeat,
             unregisterServer,
             addServerTags,
@@ -1099,6 +1109,12 @@ function buildTagFilters(sql, tags, column) {
     return conditions;
 }
 
+function attachLifecycleLogging(c, name) {
+    c.on('error', (err) => log.error('redis connection error', { connection: name, err }));
+    c.on('end', () => log.warn('redis connection ended', { connection: name }));
+    c.on('reconnecting', (ms) => log.warn('redis reconnecting', { connection: name, delayMs: ms }));
+    c.on('ready', () => log.info('redis ready', { connection: name }));
+}
 /**
  * redis driver implementation using ioredis
  * multi-server production driver backed by redis
@@ -1109,6 +1125,10 @@ function createRedisDriver(options = {}) {
     const prefix = options.prefix ?? 'gatho:{gatho}:';
     const keys = createKeys(prefix);
     const client = options.client ?? new Redis(options.url ?? process.env.GATHO_REDIS_URL ?? 'redis://localhost:6379');
+    // surface connection lifecycle so transient outages are observable.
+    // ioredis swallows 'error' events into its own handler — without this we
+    // have zero signal when the underlying socket flaps.
+    attachLifecycleLogging(client, 'main');
     // shared subscriber connection — lazily created on first waitForRoom call.
     // ioredis requires a dedicated connection for subscriptions (subscribed
     // clients can't issue normal commands). instead of creating one per call,
@@ -1118,6 +1138,7 @@ function createRedisDriver(options = {}) {
     function getSubscriber() {
         if (!subscriber) {
             subscriber = client.duplicate();
+            attachLifecycleLogging(subscriber, 'subscriber');
             subscriber.on('message', (ch, msg) => {
                 const listeners = channelListeners.get(ch);
                 if (!listeners)
@@ -1405,25 +1426,6 @@ function createRedisDriver(options = {}) {
         }
         await client.hset(keys.room(roomId), { tags: JSON.stringify(existing) });
     }
-    async function getDesiredState(serverId) {
-        const roomIds = await client.smembers(keys.roomsByServerId(serverId));
-        if (roomIds.length === 0)
-            return [];
-        const rooms = await Promise.all(roomIds.map(async (roomId) => {
-            const data = await client.hgetall(keys.room(roomId));
-            if (!data || !data.roomId) {
-                // stale index entry
-                await client.srem(keys.roomsByServerId(serverId), roomId);
-                return null;
-            }
-            return {
-                roomId: data.roomId,
-                roomType: data.roomType,
-                data: JSON.parse(data.data || '{}'),
-            };
-        }));
-        return rooms.filter((r) => r !== null);
-    }
     async function reserveClient(roomId, ttl, data, tags) {
         // look up room to get endpoint and roomSecret for jwt minting
         const roomData = await client.hgetall(keys.room(roomId));
@@ -1478,23 +1480,79 @@ function createRedisDriver(options = {}) {
         }
         await client.del(keys.client(clientId));
     }
-    async function registerServer(options) {
-        validateTags(options.tags);
-        // ensure redis data matches our schema — flushes all prefixed keys on mismatch
-        await ensureSchemaVersion();
-        await client.hset(keys.server(options.serverId), {
+    // heartbeat doubles as registration. on first call the server hash doesn't
+    // exist, so we validate tags, evict any prior server on the same endpoint
+    // (restart case), and write the full record. on subsequent calls we just
+    // refresh lastHeartbeat plus endpoint/roomTypes — `tags` is HSETNX'd so
+    // mutations from addServerTags/removeServerTags survive intact.
+    // returns the authoritative tag state (post-write) and the rooms currently
+    // assigned to this server, so the caller's control loop can reconcile in
+    // the same round-trip.
+    let schemaVersionEnsured = false;
+    async function heartbeat(options) {
+        if (!schemaVersionEnsured) {
+            await ensureSchemaVersion();
+            schemaVersionEnsured = true;
+        }
+        const key = keys.server(options.serverId);
+        const exists = (await client.exists(key)) === 1;
+        const registered = !exists;
+        if (!exists) {
+            validateTags(options.tags);
+            // evict any previous server registered on the same endpoint —
+            // handles restarts where the new process picks a fresh serverId
+            const serverIds = await client.smembers(keys.servers);
+            for (const id of serverIds) {
+                if (id === options.serverId)
+                    continue;
+                const ep = await client.hget(keys.server(id), 'endpoint');
+                if (ep === options.endpoint) {
+                    await unregisterServer(id);
+                }
+            }
+        }
+        const tx = client.multi();
+        // first-insert-only tags — preserves later add/removeServerTags writes
+        tx.hsetnx(key, 'tags', JSON.stringify(options.tags));
+        tx.hset(key, {
             serverId: options.serverId,
             endpoint: options.endpoint,
-            tags: JSON.stringify(options.tags),
             roomTypes: JSON.stringify(options.roomTypes),
             lastHeartbeat: String(Date.now()),
         });
-        await client.sadd(keys.servers, options.serverId);
-    }
-    async function heartbeat(serverId) {
-        await client.hset(keys.server(serverId), {
-            lastHeartbeat: String(Date.now()),
-        });
+        tx.sadd(keys.servers, options.serverId);
+        // last command in the transaction reads the post-write tags so the
+        // caller can refresh its in-memory cache without a second round-trip.
+        tx.hget(key, 'tags');
+        const txResults = await tx.exec();
+        // tx.exec() returns null only if the transaction was discarded (e.g.,
+        // WATCH conflict — we don't use WATCH, so this should not happen).
+        const tagsRaw = (txResults?.[3]?.[1] ?? null);
+        const tags = tagsRaw ? JSON.parse(tagsRaw) : {};
+        // collect desired rooms in the same call. paying for the second
+        // round-trip here vs on a separate reconcile tick — net halves the
+        // control-plane round-trip count.
+        const roomIds = await client.smembers(keys.roomsByServerId(options.serverId));
+        const desiredRooms = [];
+        if (roomIds.length > 0) {
+            const rooms = await Promise.all(roomIds.map(async (roomId) => {
+                const data = await client.hgetall(keys.room(roomId));
+                if (!data || !data.roomId) {
+                    // stale index entry
+                    await client.srem(keys.roomsByServerId(options.serverId), roomId);
+                    return null;
+                }
+                return {
+                    roomId: data.roomId,
+                    roomType: data.roomType,
+                    data: JSON.parse(data.data || '{}'),
+                };
+            }));
+            for (const r of rooms)
+                if (r)
+                    desiredRooms.push(r);
+        }
+        return { tags, desiredRooms, registered };
     }
     async function unregisterServer(serverId) {
         // clean up all rooms owned by this server
@@ -1621,11 +1679,9 @@ function createRedisDriver(options = {}) {
             listRooms,
             addRoomTags,
             removeRoomTags,
-            getDesiredState,
             reserveClient,
             connectClient,
             disconnectClient,
-            registerServer,
             heartbeat,
             unregisterServer,
             addServerTags,

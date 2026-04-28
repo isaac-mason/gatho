@@ -95,7 +95,7 @@ describe('typed errors', () => {
     // -- InvalidTagError --
 
     it('registerRoom throws InvalidTagError for bad tag key', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -108,7 +108,7 @@ describe('typed errors', () => {
     });
 
     it('registerRoom throws InvalidTagError for bad tag value', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -120,7 +120,7 @@ describe('typed errors', () => {
     });
 
     it('registerRoom throws InvalidTagError for reserved tag key (starts with _)', async () => {
-        await driver._internal.registerServer({
+        await driver._internal.heartbeat({
             serverId: 's1',
             endpoint: 'http://localhost:3000',
             tags: {},
@@ -162,7 +162,7 @@ describe('typed errors', () => {
 // -- helpers --
 
 async function registerServerAndRoom(driver: Driver): Promise<void> {
-    await driver._internal.registerServer({
+    await driver._internal.heartbeat({
         serverId: 's1',
         endpoint: 'http://localhost:3000',
         tags: {},

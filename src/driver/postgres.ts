@@ -17,7 +17,8 @@ import type {
     Driver,
     ListRoomsFilter,
     ListServersFilter,
-    RegisterServerOptions,
+    HeartbeatOptions,
+    HeartbeatResult,
     RoomData,
     RoomInfo,
     RoomStatus,
@@ -253,18 +254,6 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
         if (result.count === 0) throw new RoomNotFoundError(roomId);
     }
 
-    async function getDesiredState(serverId: string): Promise<DesiredRoom[]> {
-        const rows = await db`
-            select room_id, room_type, data
-            from ${db.unsafe(t.rooms)} where server_id = ${serverId}
-        `;
-        return rows.map((r) => ({
-            roomId: r.room_id as string,
-            roomType: r.room_type as string,
-            data: r.data as RoomData,
-        }));
-    }
-
     async function reserveClient(
         roomId: string,
         ttl: number,
@@ -310,33 +299,49 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
         await db`delete from ${db.unsafe(t.clients)} where client_id = ${clientId}`;
     }
 
-    async function registerServer(opts: RegisterServerOptions): Promise<void> {
-        validateTags(opts.tags);
-
-        // evict any existing server with the same endpoint (stale from previous run)
-        await db`
-            delete from ${db.unsafe(t.servers)}
-            where endpoint = ${opts.endpoint} and server_id != ${opts.serverId}
+    // heartbeat doubles as registration. on first call (no row for this serverId)
+    // we validate tags and evict any prior server bound to the same endpoint —
+    // handles restart-with-fresh-id. the upsert below intentionally omits `tags`
+    // from the update list so subsequent heartbeats don't clobber tag mutations
+    // from addServerTags/removeServerTags. returns the post-write authoritative
+    // tag state and the rooms currently assigned to this server, so the caller's
+    // control loop can reconcile in the same round-trip.
+    async function heartbeat(opts: HeartbeatOptions): Promise<HeartbeatResult> {
+        const existing = await db`
+            select 1 from ${db.unsafe(t.servers)} where server_id = ${opts.serverId} limit 1
         `;
+        const registered = existing.length === 0;
+        if (registered) {
+            validateTags(opts.tags);
+            await db`
+                delete from ${db.unsafe(t.servers)}
+                where endpoint = ${opts.endpoint} and server_id != ${opts.serverId}
+            `;
+        }
 
         const now = Date.now();
-        await db`
+        const upserted = await db<{ tags: Record<string, string> }[]>`
             insert into ${db.unsafe(t.servers)} (server_id, endpoint, tags, room_types, last_heartbeat)
             values (${opts.serverId}, ${opts.endpoint}, ${JSON.stringify(opts.tags)}::jsonb, ${opts.roomTypes}, ${now})
             on conflict (server_id) do update set
                 endpoint = excluded.endpoint,
-                tags = excluded.tags,
                 room_types = excluded.room_types,
                 last_heartbeat = excluded.last_heartbeat
+            returning tags
         `;
-    }
+        const tags = upserted[0]?.tags ?? {};
 
-    async function heartbeat(serverId: string): Promise<void> {
-        const now = Date.now();
-        await db`
-            update ${db.unsafe(t.servers)} set last_heartbeat = ${now}
-            where server_id = ${serverId}
+        const desiredRows = await db`
+            select room_id, room_type, data
+            from ${db.unsafe(t.rooms)} where server_id = ${opts.serverId}
         `;
+        const desiredRooms: DesiredRoom[] = desiredRows.map((r) => ({
+            roomId: r.room_id as string,
+            roomType: r.room_type as string,
+            data: r.data as RoomData,
+        }));
+
+        return { tags, desiredRooms, registered };
     }
 
     async function unregisterServer(serverId: string): Promise<void> {
@@ -474,11 +479,9 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
             listRooms,
             addRoomTags,
             removeRoomTags,
-            getDesiredState,
             reserveClient,
             connectClient,
             disconnectClient,
-            registerServer,
             heartbeat,
             unregisterServer,
             addServerTags,
