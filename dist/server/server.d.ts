@@ -50,4 +50,8 @@ export type Server = {
     getRoomDetails(roomId: string): RoomDetails | null;
     getAllRoomDetails(): RoomDetails[];
 };
+export declare function reconcileClients(driver: Driver['_internal'], roomId: string, roomClients: {
+    clientId: string;
+    tags: Record<string, string>;
+}[], heartbeatTimestamp: number): Promise<void>;
 export declare function start(options: CreateServerOptions): Promise<Server>;

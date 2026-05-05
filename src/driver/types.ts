@@ -80,6 +80,13 @@ export type ClientInfo = {
 
     /** immutable string key/value tags set at join time */
     tags: Record<string, string>;
+
+    /** wall-clock ms when the driver first observed this client as connected.
+     *  0 while status is 'reserved'. used by the heartbeat reconciler to
+     *  distinguish truly-stale clients (connectedAt < heartbeat.timestamp)
+     *  from freshly-connected clients that the heartbeat couldn't yet have
+     *  seen (connectedAt > heartbeat.timestamp). */
+    connectedAt: number;
 };
 
 /** client reservation information */

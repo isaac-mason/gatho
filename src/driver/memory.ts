@@ -39,6 +39,7 @@ type ClientRecord = {
     status: 'reserved' | 'connected';
     expiresAt: number;
     tags: Record<string, string>;
+    connectedAt: number;
 };
 
 type ServerRecord = {
@@ -67,7 +68,12 @@ export function createMemoryDriver(): Driver {
         const result: ClientInfo[] = [];
         for (const c of clients.values()) {
             if (c.roomId === roomId) {
-                result.push({ clientId: c.clientId, status: c.status, tags: c.tags });
+                result.push({
+                    clientId: c.clientId,
+                    status: c.status,
+                    tags: c.tags,
+                    connectedAt: c.connectedAt,
+                });
             }
         }
         return result;
@@ -284,7 +290,14 @@ export function createMemoryDriver(): Driver {
             r.roomSecret,
         );
 
-        clients.set(clientId, { clientId, roomId, status: 'reserved', expiresAt, tags: clientTags });
+        clients.set(clientId, {
+            clientId,
+            roomId,
+            status: 'reserved',
+            expiresAt,
+            tags: clientTags,
+            connectedAt: 0,
+        });
 
         // build full websocket url with token baked in as query param
         const url = new URL(r.endpoint);
@@ -308,6 +321,7 @@ export function createMemoryDriver(): Driver {
             status: 'connected',
             expiresAt: 0,
             tags,
+            connectedAt: Date.now(),
         });
     }
 

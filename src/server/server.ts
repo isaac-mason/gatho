@@ -194,12 +194,22 @@ function cleanupRoom(s: ServerState, roomId: string, reason: CleanupReason): voi
 // each entry carries the tags forwarded from the reservation jwt so we can
 // pass them to driver.connectClient — required for an upsert that doesn't
 // half-resurrect an evicted record.
-async function reconcileClients(
-    s: ServerState,
+//
+// heartbeatTimestamp is the wall-clock at which the room captured `roomClients`.
+// the disconnect path gates on `driver.connectedAt < heartbeatTimestamp` so a
+// client that connected after the snapshot was captured (and therefore couldn't
+// possibly appear in `roomClients`) isn't mistaken for stale state and removed.
+// without that gate, the heartbeat handler races client-connected ipc: under
+// load the room admits a client between snapshot capture and heartbeat arrival,
+// the driver writes it as connected before the reconciler reads, and the
+// reconciler then disconnects a live peer.
+export async function reconcileClients(
+    driver: Driver['_internal'],
     roomId: string,
     roomClients: { clientId: string; tags: Record<string, string> }[],
+    heartbeatTimestamp: number,
 ): Promise<void> {
-    const roomInfo = await s.driver.getRoomInfo(roomId);
+    const roomInfo = await driver.getRoomInfo(roomId);
     if (!roomInfo) return; // room already gone
 
     const roomSet = new Set(roomClients.map((c) => c.clientId));
@@ -209,17 +219,23 @@ async function reconcileClients(
         const driverClient = roomInfo.clients.find((c) => c.clientId === clientId);
         if (!driverClient || driverClient.status !== 'connected') {
             log.info('reconcile: connecting client missing from driver', { roomId, clientId });
-            await s.driver.connectClient(clientId, roomId, tags).catch((err) => {
+            await driver.connectClient(clientId, roomId, tags).catch((err) => {
                 log.error('reconcile: failed to connect client', { roomId, clientId, err });
             });
         }
     }
 
-    // clients the driver thinks are connected but the room doesn't have
+    // clients the driver thinks are connected but the room doesn't have.
+    // skip clients whose connectedAt is after the heartbeat snapshot — the room
+    // couldn't have known about them yet, so absence is not evidence of staleness.
     for (const driverClient of roomInfo.clients) {
-        if (driverClient.status === 'connected' && !roomSet.has(driverClient.clientId)) {
+        if (
+            driverClient.status === 'connected' &&
+            !roomSet.has(driverClient.clientId) &&
+            driverClient.connectedAt < heartbeatTimestamp
+        ) {
             log.info('reconcile: disconnecting stale client from driver', { roomId, clientId: driverClient.clientId });
-            await s.driver.disconnectClient(driverClient.clientId).catch((err) => {
+            await driver.disconnectClient(driverClient.clientId).catch((err) => {
                 log.error('reconcile: failed to disconnect client', { roomId, clientId: driverClient.clientId, err });
             });
         }
@@ -245,7 +261,7 @@ function handleIpcMessage(s: ServerState, roomId: string, msg: RoomMessage): voi
             });
 
             // reconcile client state in the background — don't block the heartbeat path
-            reconcileClients(s, roomId, msg.clients).catch((err) => {
+            reconcileClients(s.driver, roomId, msg.clients, msg.timestamp).catch((err) => {
                 log.error('client reconciliation failed', { roomId, err });
             });
             break;

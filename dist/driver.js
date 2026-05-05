@@ -167,7 +167,12 @@ function createMemoryDriver() {
         const result = [];
         for (const c of clients.values()) {
             if (c.roomId === roomId) {
-                result.push({ clientId: c.clientId, status: c.status, tags: c.tags });
+                result.push({
+                    clientId: c.clientId,
+                    status: c.status,
+                    tags: c.tags,
+                    connectedAt: c.connectedAt,
+                });
             }
         }
         return result;
@@ -349,7 +354,14 @@ function createMemoryDriver() {
         // mint jwt signed with the room's secret. tags travel as a separate
         // claim from user data so the room can forward them back over ipc.
         const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, r.roomSecret);
-        clients.set(clientId, { clientId, roomId, status: 'reserved', expiresAt, tags: clientTags });
+        clients.set(clientId, {
+            clientId,
+            roomId,
+            status: 'reserved',
+            expiresAt,
+            tags: clientTags,
+            connectedAt: 0,
+        });
         // build full websocket url with token baked in as query param
         const url = new URL(r.endpoint);
         url.searchParams.set('token', token);
@@ -366,6 +378,7 @@ function createMemoryDriver() {
             status: 'connected',
             expiresAt: 0,
             tags,
+            connectedAt: Date.now(),
         });
     }
     async function disconnectClient(clientId) {
@@ -595,13 +608,14 @@ async function createPostgresDriver(options = {}) {
     // helper: get clients for a room
     async function getClientsForRoom(db, roomId) {
         const rows = await db `
-            select client_id, status, tags from ${db.unsafe(t.clients)}
+            select client_id, status, tags, connected_at from ${db.unsafe(t.clients)}
             where room_id = ${roomId}
         `;
         return rows.map((r) => ({
             clientId: r.client_id,
             status: r.status,
             tags: r.tags,
+            connectedAt: Number(r.connected_at),
         }));
     }
     // helper: build RoomInfo from a row
@@ -803,8 +817,8 @@ async function createPostgresDriver(options = {}) {
         // forward them back over ipc to connectClient (mirrors redis driver).
         const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, room.room_secret);
         await db `
-            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
-            values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)})
+            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags, connected_at)
+            values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)}, 0)
         `;
         const url = new URL(room.endpoint);
         url.searchParams.set('token', token);
@@ -817,14 +831,16 @@ async function createPostgresDriver(options = {}) {
         // parity. on conflict we still rewrite roomId/tags so a half-evicted
         // hash that the redis driver self-heals would also be self-healed
         // here if the same race were possible.
+        const now = Date.now();
         await db `
-            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
-            values (${clientId}, ${roomId}, 'connected', 0, ${db.json(tags)})
+            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags, connected_at)
+            values (${clientId}, ${roomId}, 'connected', 0, ${db.json(tags)}, ${now})
             on conflict (client_id) do update
             set room_id = excluded.room_id,
                 status = 'connected',
                 expires_at = 0,
-                tags = excluded.tags
+                tags = excluded.tags,
+                connected_at = excluded.connected_at
         `;
     }
     async function disconnectClient(clientId) {
@@ -1011,7 +1027,7 @@ async function createPostgresDriver(options = {}) {
 }
 // bump this when the schema changes. on mismatch the driver drops and
 // recreates all gatho tables — all data is ephemeral, no migration needed.
-const SCHEMA_VERSION$1 = 2;
+const SCHEMA_VERSION$1 = 3;
 // hardcoded staleness threshold — servers older than this are considered dead
 const STALE_MS$1 = 30_000;
 // leader lock ttl — if not renewed within this window, another server can take over
@@ -1122,11 +1138,12 @@ async function ensureSchema(sql, t) {
         `;
         await tx `
             create unlogged table ${tx.unsafe(t.clients)} (
-                client_id   text primary key,
-                room_id     text not null references ${tx.unsafe(t.rooms)}(room_id) on delete cascade,
-                status      text not null default 'reserved',
-                expires_at  bigint not null default 0,
-                tags        jsonb not null default '{}'::jsonb
+                client_id    text primary key,
+                room_id      text not null references ${tx.unsafe(t.rooms)}(room_id) on delete cascade,
+                status       text not null default 'reserved',
+                expires_at   bigint not null default 0,
+                tags         jsonb not null default '{}'::jsonb,
+                connected_at bigint not null default 0
             )
         `;
         // index for fast lookups by room_id (used by getClientsForRoom)
@@ -1269,6 +1286,7 @@ function createRedisDriver(options = {}) {
                     clientId: clientData.clientId,
                     status: clientData.status,
                     tags: clientData.tags ? JSON.parse(clientData.tags) : {},
+                    connectedAt: clientData.connectedAt ? Number(clientData.connectedAt) : 0,
                 });
             }
             else {
@@ -1514,6 +1532,7 @@ function createRedisDriver(options = {}) {
             status: 'reserved',
             expiresAt: String(expiresAt),
             tags: JSON.stringify(clientTags),
+            connectedAt: '0',
         });
         // set TTL on the client key — auto-expires if never connected
         await client.pexpire(keys.client(clientId), ttl);
@@ -1546,6 +1565,7 @@ function createRedisDriver(options = {}) {
             status: 'connected',
             expiresAt: '0',
             tags: JSON.stringify(tags),
+            connectedAt: String(Date.now()),
         })
             .persist(keys.client(clientId))
             .sadd(keys.clientsByRoom(roomId), clientId)

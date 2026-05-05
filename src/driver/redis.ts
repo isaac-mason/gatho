@@ -129,6 +129,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
                     clientId: clientData.clientId,
                     status: clientData.status as ClientInfo['status'],
                     tags: clientData.tags ? (JSON.parse(clientData.tags) as Record<string, string>) : {},
+                    connectedAt: clientData.connectedAt ? Number(clientData.connectedAt) : 0,
                 });
             } else {
                 // stale index entry — client key expired/deleted
@@ -416,6 +417,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
             status: 'reserved',
             expiresAt: String(expiresAt),
             tags: JSON.stringify(clientTags),
+            connectedAt: '0',
         });
 
         // set TTL on the client key — auto-expires if never connected
@@ -456,6 +458,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
                 status: 'connected',
                 expiresAt: '0',
                 tags: JSON.stringify(tags),
+                connectedAt: String(Date.now()),
             })
             .persist(keys.client(clientId))
             .sadd(keys.clientsByRoom(roomId), clientId)

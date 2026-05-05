@@ -39,14 +39,17 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
 
     // helper: get clients for a room
     async function getClientsForRoom(db: Sql, roomId: string): Promise<ClientInfo[]> {
-        const rows = await db<{ client_id: string; status: string; tags: Record<string, string> }[]>`
-            select client_id, status, tags from ${db.unsafe(t.clients)}
+        const rows = await db<
+            { client_id: string; status: string; tags: Record<string, string>; connected_at: string }[]
+        >`
+            select client_id, status, tags, connected_at from ${db.unsafe(t.clients)}
             where room_id = ${roomId}
         `;
         return rows.map((r) => ({
             clientId: r.client_id,
             status: r.status as ClientInfo['status'],
             tags: r.tags,
+            connectedAt: Number(r.connected_at),
         }));
     }
 
@@ -284,8 +287,8 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
         );
 
         await db`
-            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
-            values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)})
+            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags, connected_at)
+            values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)}, 0)
         `;
 
         const url = new URL(room.endpoint);
@@ -305,14 +308,16 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
         // parity. on conflict we still rewrite roomId/tags so a half-evicted
         // hash that the redis driver self-heals would also be self-healed
         // here if the same race were possible.
+        const now = Date.now();
         await db`
-            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
-            values (${clientId}, ${roomId}, 'connected', 0, ${db.json(tags)})
+            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags, connected_at)
+            values (${clientId}, ${roomId}, 'connected', 0, ${db.json(tags)}, ${now})
             on conflict (client_id) do update
             set room_id = excluded.room_id,
                 status = 'connected',
                 expires_at = 0,
-                tags = excluded.tags
+                tags = excluded.tags,
+                connected_at = excluded.connected_at
         `;
     }
 
@@ -540,7 +545,7 @@ type ServerRow = {
 
 // bump this when the schema changes. on mismatch the driver drops and
 // recreates all gatho tables — all data is ephemeral, no migration needed.
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 // hardcoded staleness threshold — servers older than this are considered dead
 const STALE_MS = 30_000;
@@ -697,11 +702,12 @@ async function ensureSchema(sql: Sql, t: SchemaTable): Promise<void> {
 
         await tx`
             create unlogged table ${tx.unsafe(t.clients)} (
-                client_id   text primary key,
-                room_id     text not null references ${tx.unsafe(t.rooms)}(room_id) on delete cascade,
-                status      text not null default 'reserved',
-                expires_at  bigint not null default 0,
-                tags        jsonb not null default '{}'::jsonb
+                client_id    text primary key,
+                room_id      text not null references ${tx.unsafe(t.rooms)}(room_id) on delete cascade,
+                status       text not null default 'reserved',
+                expires_at   bigint not null default 0,
+                tags         jsonb not null default '{}'::jsonb,
+                connected_at bigint not null default 0
             )
         `;
 
