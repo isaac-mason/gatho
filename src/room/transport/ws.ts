@@ -62,6 +62,7 @@ export function wsTransport(config?: WsTransportConfig): Transport {
 
                     const { clientId, reconnecting } = result;
                     const joinData = result.joinData ?? {};
+                    const tags = result.tags ?? {};
 
                     wss.handleUpgrade(req, socket, head, (ws) => {
                         // if reconnecting, clean up the old socket for this clientId
@@ -115,7 +116,7 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                         if (reconnecting) {
                             handlers.reconnect(clientId, wsSocket);
                         } else {
-                            handlers.open(clientId, wsSocket, joinData);
+                            handlers.open(clientId, wsSocket, joinData, tags);
                         }
 
                         ws.on('message', (data: Buffer | ArrayBuffer | Buffer[], isBinary: boolean) => {

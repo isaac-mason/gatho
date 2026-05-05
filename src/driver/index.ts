@@ -20,9 +20,11 @@ export {
     DriverConfigError,
     GathoError,
     InvalidTagError,
+    PayloadTooLargeError,
     RoomNotFoundError,
     RoomNotRunningError,
     RoomStartError,
     RoomTimeoutError,
     ServerNotFoundError,
 } from './errors';
+export { RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES } from './types';

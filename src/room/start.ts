@@ -31,6 +31,11 @@ type TrackedClient = {
     reliableBuffer: BufferedMessage[];
     reliableBufferBytes: number;
     disconnectTimer: ReturnType<typeof setTimeout> | null;
+    // driver-internal tags forwarded from the reservation jwt. opaque to
+    // user code — echoed back over ipc on client-connected/heartbeat so
+    // the server can pass them to driver.connectClient. enables self-heal
+    // if the driver's client record was evicted between reserve and connect.
+    tags: Record<string, string>;
 };
 
 type BufferedMessage = {
@@ -344,13 +349,16 @@ function startHeartbeat(state: RoomState): void {
     state.heartbeatInterval = setInterval(() => {
         if (!state.alive) return;
 
-        // collect ids of clients with an active socket — these are the
-        // ground truth for who is connected. clients in the reconnection
-        // window (socket === null) have already been reported as disconnected.
-        const clientIds: string[] = [];
+        // collect clients with an active socket — these are the ground truth
+        // for who is connected. clients in the reconnection window
+        // (socket === null) have already been reported as disconnected.
+        // include tags so the server's reconciler has the same context as the
+        // fast path; otherwise the reconciler's connectClient call would
+        // resurrect a partially-evicted driver record without tags.
+        const clients: { clientId: string; tags: Record<string, string> }[] = [];
         for (const [id, tracked] of state.clients) {
             if (tracked.socket !== null) {
-                clientIds.push(id);
+                clients.push({ clientId: id, tags: tracked.tags });
             }
         }
 
@@ -366,7 +374,7 @@ function startHeartbeat(state: RoomState): void {
                 cpuUser: cpu.user,
                 cpuSystem: cpu.system,
             },
-            clientIds,
+            clients,
         });
     }, HEARTBEAT_INTERVAL_MS);
 }
@@ -431,18 +439,19 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 const clientId = payload.clientId as string;
                 const roomId = payload.roomId as string;
                 const joinData = (payload.data as Record<string, unknown> | undefined) ?? {};
+                const tags = (payload.tags as Record<string, string> | undefined) ?? {};
 
                 // verify the token is for this room
                 if (roomId !== state.roomId) return null;
 
-                return { clientId, joinData };
+                return { clientId, joinData, tags };
             }
 
             // dev mode — no jwt verification, generate identity
-            return { clientId: randomUUID(), joinData: {} };
+            return { clientId: randomUUID(), joinData: {}, tags: {} };
         },
 
-        open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>) {
+        open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>) {
             socket.subscribe(BROADCAST_TOPIC);
 
             (async () => {
@@ -478,14 +487,18 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                     reliableBuffer: [],
                     reliableBufferBytes: 0,
                     disconnectTimer: null,
+                    tags,
                 };
                 state.clients.set(clientId, tracked);
 
                 // send session token to client
                 socket.send(packProtocol({ type: 'session', token: sessionToken }), true);
 
-                // notify server for driver bookkeeping (managed mode only)
-                state.ipc?.send({ type: 'client-connected', clientId });
+                // notify server for driver bookkeeping (managed mode only).
+                // forward roomId + tags so driver.connectClient can perform a
+                // full upsert — covers the case where the driver's client
+                // record was evicted between reserveClient and now.
+                state.ipc?.send({ type: 'client-connected', clientId, roomId: state.roomId, tags });
 
                 // run onJoin
                 if (options.onJoin) {
@@ -564,8 +577,9 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 safeCall(state.log, 'onReconnect', () => options.onReconnect!(room, createClient<ClientData>(tracked)));
             }
 
-            // notify driver: client is connected again
-            state.ipc?.send({ type: 'client-connected', clientId });
+            // notify driver: client is connected again. forward roomId + the
+            // tags we cached at original open() — same upsert path as fast.
+            state.ipc?.send({ type: 'client-connected', clientId, roomId: state.roomId, tags: tracked.tags });
         },
 
         close(clientId: string, code: number) {

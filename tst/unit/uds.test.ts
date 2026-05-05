@@ -17,7 +17,10 @@ describe('uds ipc codec', () => {
                 cpuUser: 1500000,
                 cpuSystem: 300000,
             },
-            clientIds: ['abc-123', 'def-456'],
+            clients: [
+                { clientId: 'abc-123', tags: { region: 'us-east' } },
+                { clientId: 'def-456', tags: {} },
+            ],
         },
         {
             type: 'heartbeat',
@@ -29,9 +32,10 @@ describe('uds ipc codec', () => {
                 cpuUser: 0,
                 cpuSystem: 0,
             },
-            clientIds: [],
+            clients: [],
         },
-        { type: 'client-connected', clientId: 'user-abc' },
+        { type: 'client-connected', clientId: 'user-abc', roomId: 'room-1', tags: { team: 'red' } },
+        { type: 'client-connected', clientId: 'user-def', roomId: 'room-2', tags: {} },
         { type: 'client-disconnected', clientId: 'user-abc' },
         { type: 'error', message: 'something went wrong' },
         { type: 'stopped' },
@@ -48,8 +52,11 @@ describe('uds ipc codec', () => {
         });
     }
 
-    it('heartbeat with many client ids', () => {
-        const clientIds = Array.from({ length: 200 }, (_, i) => `client-${i}`);
+    it('heartbeat with many clients', () => {
+        const clients = Array.from({ length: 200 }, (_, i) => ({
+            clientId: `client-${i}`,
+            tags: { idx: String(i) },
+        }));
         const msg: RoomMessage = {
             type: 'heartbeat',
             timestamp: 1713300000000,
@@ -60,11 +67,11 @@ describe('uds ipc codec', () => {
                 cpuUser: 1e7,
                 cpuSystem: 2e6,
             },
-            clientIds,
+            clients,
         };
         const unpacked = ipcCodec.unpack(ipcCodec.pack(msg));
         expect(unpacked).toEqual(msg);
-        expect((unpacked as { clientIds: string[] }).clientIds).toHaveLength(200);
+        expect((unpacked as { clients: unknown[] }).clients).toHaveLength(200);
     });
 
     it('port uses uint16 — max value 65535', () => {
@@ -79,7 +86,7 @@ describe('uds ipc codec', () => {
             type: 'heartbeat',
             timestamp: ts,
             metrics: { memoryRss: 0, memoryHeapUsed: 0, memoryHeapTotal: 0, cpuUser: 0, cpuSystem: 0 },
-            clientIds: [],
+            clients: [],
         };
         const unpacked = ipcCodec.unpack(ipcCodec.pack(msg));
         expect((unpacked as { timestamp: number }).timestamp).toBe(ts);
@@ -113,7 +120,7 @@ describe('createFrameReader', () => {
 
         const msgs: RoomMessage[] = [
             { type: 'ready', port: 3000 },
-            { type: 'client-connected', clientId: 'a' },
+            { type: 'client-connected', clientId: 'a', roomId: 'room-1', tags: {} },
             { type: 'stopped' },
         ];
 
@@ -130,7 +137,7 @@ describe('createFrameReader', () => {
         const received: RoomMessage[] = [];
         const push = createFrameReader((msg) => received.push(msg));
 
-        const msg: RoomMessage = { type: 'client-connected', clientId: 'test-user-123' };
+        const msg: RoomMessage = { type: 'client-connected', clientId: 'test-user-123', roomId: 'room-1', tags: {} };
         const frame = buildFrame(msg);
 
         // split at an arbitrary point in the middle

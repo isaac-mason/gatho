@@ -22,16 +22,23 @@ const Ready = pack.object({
     port: pack.uint16(),
 });
 
+const HeartbeatClient = pack.object({
+    clientId: pack.string(),
+    tags: pack.record(pack.string()),
+});
+
 const Heartbeat = pack.object({
     type: pack.literal('heartbeat'),
     timestamp: pack.float64(),
     metrics: ProcessMetrics,
-    clientIds: pack.list(pack.string()),
+    clients: pack.list(HeartbeatClient),
 });
 
 const ClientConnected = pack.object({
     type: pack.literal('client-connected'),
     clientId: pack.string(),
+    roomId: pack.string(),
+    tags: pack.record(pack.string()),
 });
 
 const ClientDisconnected = pack.object({

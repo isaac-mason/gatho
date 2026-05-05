@@ -27,12 +27,12 @@ describe('client reconciliation via heartbeat', () => {
         // this simulates a transient driver error on the fast-path ipc handler.
         let blockConnect = true;
         const originalConnect = driver._internal.connectClient.bind(driver._internal);
-        driver._internal.connectClient = async (clientId: string) => {
+        driver._internal.connectClient = async (clientId: string, roomId: string, tags: Record<string, string>) => {
             if (blockConnect) {
                 blockConnect = false;
                 throw new Error('simulated transient failure');
             }
-            return originalConnect(clientId);
+            return originalConnect(clientId, roomId, tags);
         };
 
         server = await start({
@@ -182,9 +182,9 @@ describe('client reconciliation via heartbeat', () => {
         const originalConnect = driver._internal.connectClient.bind(driver._internal);
         const originalDisconnect = driver._internal.disconnectClient.bind(driver._internal);
 
-        driver._internal.connectClient = async (clientId: string) => {
+        driver._internal.connectClient = async (clientId: string, roomId: string, tags: Record<string, string>) => {
             if (tracking) connectCalls.push(clientId);
-            return originalConnect(clientId);
+            return originalConnect(clientId, roomId, tags);
         };
         driver._internal.disconnectClient = async (clientId: string) => {
             if (tracking) disconnectCalls.push(clientId);

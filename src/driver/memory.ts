@@ -19,7 +19,7 @@ import type {
     RoomStatus,
     ServerInfo,
 } from './types';
-import { validateTags } from './types';
+import { validateTags, validateReserveData, validateReserveTagsSize } from './types';
 
 type RoomRecord = {
     roomId: string;
@@ -271,12 +271,18 @@ export function createMemoryDriver(): Driver {
 
         const clientTags = tags ?? {};
         validateTags(clientTags);
+        validateReserveData(data);
+        validateReserveTagsSize(clientTags);
 
         const clientId = crypto.randomUUID();
         const expiresAt = Date.now() + ttl;
 
-        // mint jwt signed with the room's secret
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, r.roomSecret);
+        // mint jwt signed with the room's secret. tags travel as a separate
+        // claim from user data so the room can forward them back over ipc.
+        const token = jwtSign(
+            { clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags },
+            r.roomSecret,
+        );
 
         clients.set(clientId, { clientId, roomId, status: 'reserved', expiresAt, tags: clientTags });
 
@@ -287,12 +293,22 @@ export function createMemoryDriver(): Driver {
         return { clientId, url: url.toString(), roomId, expiresAt };
     }
 
-    async function connectClient(clientId: string): Promise<void> {
-        const c = clients.get(clientId);
-        if (c) {
-            c.status = 'connected';
-            c.expiresAt = 0;
-        }
+    async function connectClient(
+        clientId: string,
+        roomId: string,
+        tags: Record<string, string>,
+    ): Promise<void> {
+        // upsert: write every field reserveClient writes, mirroring the redis
+        // driver's MULTI semantics. memory isn't subject to TTL eviction so the
+        // record will normally exist, but we treat the ipc payload as the
+        // authoritative source either way for cross-driver behavioural parity.
+        clients.set(clientId, {
+            clientId,
+            roomId,
+            status: 'connected',
+            expiresAt: 0,
+            tags,
+        });
     }
 
     async function disconnectClient(clientId: string): Promise<void> {

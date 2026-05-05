@@ -84,6 +84,19 @@ class DriverConfigError extends GathoError {
         this.detail = detail;
     }
 }
+/** thrown when reserveClient receives a `data` or `tags` argument whose serialized
+ *  size would push the resulting jwt past url/header limits on the upgrade request. */
+class PayloadTooLargeError extends GathoError {
+    field;
+    sizeBytes;
+    limitBytes;
+    constructor(field, sizeBytes, limitBytes) {
+        super('payload-too-large', `${field} too large: ${sizeBytes}B exceeds limit of ${limitBytes}B`);
+        this.field = field;
+        this.sizeBytes = sizeBytes;
+        this.limitBytes = limitBytes;
+    }
+}
 
 // --- tag validation ---
 const VALID_TAG_RE = /^[a-zA-Z0-9_-]+$/;
@@ -107,6 +120,31 @@ function validateTags(tags) {
     for (const [key, value] of Object.entries(tags)) {
         validateTagKey(key);
         validateTagValue(value);
+    }
+}
+// --- payload size validation ---
+//
+// the reservation jwt travels as a `?token=...` query param on the ws upgrade url.
+// proxies (cloudflare, nginx) and browsers cluster around 8KB request-line limits.
+// fail eagerly here so callers see a typed error instead of a silent upgrade failure
+// in some environments. limits are conservative defaults — bump them in code (and
+// update the matching tests) if a legitimate use case needs more.
+/** maximum serialized size of the user-supplied `data` claim on a reservation jwt. */
+const RESERVE_DATA_MAX_BYTES = 2048;
+/** maximum serialized size of the driver-internal `tags` record on a reservation jwt. */
+const RESERVE_TAGS_MAX_BYTES = 512;
+/** validate that `data` will fit in the reservation jwt without blowing url limits. */
+function validateReserveData(data) {
+    const size = Buffer.byteLength(JSON.stringify(data ?? {}));
+    if (size > RESERVE_DATA_MAX_BYTES) {
+        throw new PayloadTooLargeError('data', size, RESERVE_DATA_MAX_BYTES);
+    }
+}
+/** validate that `tags` will fit in the reservation jwt without blowing url limits. */
+function validateReserveTagsSize(tags) {
+    const size = Buffer.byteLength(JSON.stringify(tags));
+    if (size > RESERVE_TAGS_MAX_BYTES) {
+        throw new PayloadTooLargeError('tags', size, RESERVE_TAGS_MAX_BYTES);
     }
 }
 
@@ -304,22 +342,31 @@ function createMemoryDriver() {
             throw new RoomNotRunningError(roomId);
         const clientTags = tags ?? {};
         validateTags(clientTags);
+        validateReserveData(data);
+        validateReserveTagsSize(clientTags);
         const clientId = crypto.randomUUID();
         const expiresAt = Date.now() + ttl;
-        // mint jwt signed with the room's secret
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, r.roomSecret);
+        // mint jwt signed with the room's secret. tags travel as a separate
+        // claim from user data so the room can forward them back over ipc.
+        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, r.roomSecret);
         clients.set(clientId, { clientId, roomId, status: 'reserved', expiresAt, tags: clientTags });
         // build full websocket url with token baked in as query param
         const url = new URL(r.endpoint);
         url.searchParams.set('token', token);
         return { clientId, url: url.toString(), roomId, expiresAt };
     }
-    async function connectClient(clientId) {
-        const c = clients.get(clientId);
-        if (c) {
-            c.status = 'connected';
-            c.expiresAt = 0;
-        }
+    async function connectClient(clientId, roomId, tags) {
+        // upsert: write every field reserveClient writes, mirroring the redis
+        // driver's MULTI semantics. memory isn't subject to TTL eviction so the
+        // record will normally exist, but we treat the ipc payload as the
+        // authoritative source either way for cross-driver behavioural parity.
+        clients.set(clientId, {
+            clientId,
+            roomId,
+            status: 'connected',
+            expiresAt: 0,
+            tags,
+        });
     }
     async function disconnectClient(clientId) {
         clients.delete(clientId);
@@ -748,9 +795,13 @@ async function createPostgresDriver(options = {}) {
             throw new RoomNotRunningError(roomId);
         const clientTags = tags ?? {};
         validateTags(clientTags);
+        validateReserveData(data);
+        validateReserveTagsSize(clientTags);
         const clientId = crypto.randomUUID();
         const expiresAt = Date.now() + ttl;
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, room.room_secret);
+        // tags travel as a separate jwt claim from user data so the room can
+        // forward them back over ipc to connectClient (mirrors redis driver).
+        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, room.room_secret);
         await db `
             insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
             values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)})
@@ -759,11 +810,21 @@ async function createPostgresDriver(options = {}) {
         url.searchParams.set('token', token);
         return { clientId, url: url.toString(), roomId, expiresAt };
     }
-    async function connectClient(clientId) {
+    async function connectClient(clientId, roomId, tags) {
+        // upsert: matches redis MULTI semantics. postgres rows aren't subject
+        // to TTL eviction the way redis hashes are, but we treat the ipc
+        // payload as the authoritative source for cross-driver behavioural
+        // parity. on conflict we still rewrite roomId/tags so a half-evicted
+        // hash that the redis driver self-heals would also be self-healed
+        // here if the same race were possible.
         await db `
-            update ${db.unsafe(t.clients)}
-            set status = 'connected', expires_at = 0
-            where client_id = ${clientId}
+            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
+            values (${clientId}, ${roomId}, 'connected', 0, ${db.json(tags)})
+            on conflict (client_id) do update
+            set room_id = excluded.room_id,
+                status = 'connected',
+                expires_at = 0,
+                tags = excluded.tags
         `;
     }
     async function disconnectClient(clientId) {
@@ -1437,10 +1498,15 @@ function createRedisDriver(options = {}) {
         }
         const clientTags = tags ?? {};
         validateTags(clientTags);
+        validateReserveData(data);
+        validateReserveTagsSize(clientTags);
         const clientId = crypto.randomUUID();
         const expiresAt = Date.now() + ttl;
-        // mint jwt signed with the room's secret — room verifies locally, zero ipc
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, roomData.roomSecret);
+        // mint jwt signed with the room's secret — room verifies locally, zero ipc.
+        // tags travel as a separate claim from user data: rooms are untrusted and
+        // must forward tags back over ipc so connectClient can reconstitute the
+        // hash if redis evicted it during the reserve→connect window.
+        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, roomData.roomSecret);
         // store client record
         await client.hset(keys.client(clientId), {
             clientId,
@@ -1464,14 +1530,26 @@ function createRedisDriver(options = {}) {
             expiresAt,
         };
     }
-    async function connectClient(clientId) {
-        // update status to connected and remove TTL (connected clients persist until disconnect)
-        await client.hset(keys.client(clientId), {
+    async function connectClient(clientId, roomId, tags) {
+        // atomic upsert: write every field reserveClient writes, persist the key,
+        // and ensure the room's client set contains us. self-healing — if the
+        // hash was evicted (TTL fired during the reserve→connect ipc window) or
+        // partially mutated, this restores it from authoritative state forwarded
+        // by the room over ipc. MULTI gives single-round-trip atomicity without
+        // the EVAL/EVALSHA script-cache overhead — we have no read-conditional
+        // logic, just a fixed sequence of writes.
+        await client
+            .multi()
+            .hset(keys.client(clientId), {
+            clientId,
+            roomId,
             status: 'connected',
             expiresAt: '0',
-        });
-        // remove TTL — connected clients don't expire
-        await client.persist(keys.client(clientId));
+            tags: JSON.stringify(tags),
+        })
+            .persist(keys.client(clientId))
+            .sadd(keys.clientsByRoom(roomId), clientId)
+            .exec();
     }
     async function disconnectClient(clientId) {
         const clientData = await client.hgetall(keys.client(clientId));
@@ -1733,5 +1811,5 @@ function createKeys(prefix) {
     };
 }
 
-export { DriverConfigError, GathoError, InvalidTagError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, createMemoryDriver, createPostgresDriver, createRedisDriver };
+export { DriverConfigError, GathoError, InvalidTagError, PayloadTooLargeError, RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, createMemoryDriver, createPostgresDriver, createRedisDriver };
 //# sourceMappingURL=driver.js.map

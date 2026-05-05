@@ -209,8 +209,11 @@ export type Driver = {
             tags?: Record<string, string>,
         ): Promise<ClientReservation>;
 
-        /** marks a client as connected — called by server when room reports client-connected over ipc */
-        connectClient(clientId: string): Promise<void>;
+        /** marks a client as connected — called by server when room reports client-connected over ipc.
+         *  idempotent upsert: writes the full client record (clientId, roomId, status, tags) regardless
+         *  of prior state, so a hash that was evicted between reservation and connection is reconstituted
+         *  rather than half-resurrected. tags travel from reserveClient → jwt → room → ipc to reach here. */
+        connectClient(clientId: string, roomId: string, tags: Record<string, string>): Promise<void>;
 
         /** marks a client as disconnected — called by server when room reports client-disconnected over ipc */
         disconnectClient(clientId: string): Promise<void>;
@@ -258,7 +261,7 @@ export type Driver = {
 
 // --- tag validation ---
 
-import { InvalidTagError } from './errors';
+import { InvalidTagError, PayloadTooLargeError } from './errors';
 
 const VALID_TAG_RE = /^[a-zA-Z0-9_-]+$/;
 
@@ -284,5 +287,35 @@ export function validateTags(tags: Record<string, string>): void {
     for (const [key, value] of Object.entries(tags)) {
         validateTagKey(key);
         validateTagValue(value);
+    }
+}
+
+// --- payload size validation ---
+//
+// the reservation jwt travels as a `?token=...` query param on the ws upgrade url.
+// proxies (cloudflare, nginx) and browsers cluster around 8KB request-line limits.
+// fail eagerly here so callers see a typed error instead of a silent upgrade failure
+// in some environments. limits are conservative defaults — bump them in code (and
+// update the matching tests) if a legitimate use case needs more.
+
+/** maximum serialized size of the user-supplied `data` claim on a reservation jwt. */
+export const RESERVE_DATA_MAX_BYTES = 2048;
+
+/** maximum serialized size of the driver-internal `tags` record on a reservation jwt. */
+export const RESERVE_TAGS_MAX_BYTES = 512;
+
+/** validate that `data` will fit in the reservation jwt without blowing url limits. */
+export function validateReserveData(data: unknown): void {
+    const size = Buffer.byteLength(JSON.stringify(data ?? {}));
+    if (size > RESERVE_DATA_MAX_BYTES) {
+        throw new PayloadTooLargeError('data', size, RESERVE_DATA_MAX_BYTES);
+    }
+}
+
+/** validate that `tags` will fit in the reservation jwt without blowing url limits. */
+export function validateReserveTagsSize(tags: Record<string, string>): void {
+    const size = Buffer.byteLength(JSON.stringify(tags));
+    if (size > RESERVE_TAGS_MAX_BYTES) {
+        throw new PayloadTooLargeError('tags', size, RESERVE_TAGS_MAX_BYTES);
     }
 }

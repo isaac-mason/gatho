@@ -152,6 +152,27 @@ const object = (fields) => ({
     fields,
 });
 /**
+ * Record schema - dynamic key-value map with homogeneous values.
+ *
+ * Keys are strings, all values share the same schema.
+ * Stored as varuint count followed by [key, value] pairs.
+ *
+ * @param field Schema for all values
+ * @returns A record schema definition
+ *
+ * @example
+ * // Map of player IDs to scores
+ * record(uint32())
+ *
+ * @example
+ * // Map of item names to quantities
+ * record(varuint())
+ */
+const record = (field) => ({
+    type: 'record',
+    field,
+});
+/**
  * Literal schema - constant value that doesn't need to be serialized.
  *
  * The value is part of the schema definition and takes 0 bytes to encode.
@@ -1979,15 +2000,21 @@ const Ready = object({
     type: literal('ready'),
     port: uint16(),
 });
+const HeartbeatClient = object({
+    clientId: string(),
+    tags: record(string()),
+});
 const Heartbeat = object({
     type: literal('heartbeat'),
     timestamp: float64(),
     metrics: ProcessMetrics,
-    clientIds: list(string()),
+    clients: list(HeartbeatClient),
 });
 const ClientConnected = object({
     type: literal('client-connected'),
     clientId: string(),
+    roomId: string(),
+    tags: record(string()),
 });
 const ClientDisconnected = object({
     type: literal('client-disconnected'),
@@ -2088,6 +2115,7 @@ function wsTransport(config) {
                     }
                     const { clientId, reconnecting } = result;
                     const joinData = result.joinData ?? {};
+                    const tags = result.tags ?? {};
                     wss.handleUpgrade(req, socket, head, (ws) => {
                         // if reconnecting, clean up the old socket for this clientId
                         // (it may already be gone if the old connection closed cleanly)
@@ -2138,7 +2166,7 @@ function wsTransport(config) {
                             handlers.reconnect(clientId, wsSocket);
                         }
                         else {
-                            handlers.open(clientId, wsSocket, joinData);
+                            handlers.open(clientId, wsSocket, joinData, tags);
                         }
                         ws.on('message', (data, isBinary) => {
                             // normalize to arraybuffer — consistent with transport interface.
@@ -2371,13 +2399,16 @@ function startHeartbeat(state) {
     state.heartbeatInterval = setInterval(() => {
         if (!state.alive)
             return;
-        // collect ids of clients with an active socket — these are the
-        // ground truth for who is connected. clients in the reconnection
-        // window (socket === null) have already been reported as disconnected.
-        const clientIds = [];
+        // collect clients with an active socket — these are the ground truth
+        // for who is connected. clients in the reconnection window
+        // (socket === null) have already been reported as disconnected.
+        // include tags so the server's reconciler has the same context as the
+        // fast path; otherwise the reconciler's connectClient call would
+        // resurrect a partially-evicted driver record without tags.
+        const clients = [];
         for (const [id, tracked] of state.clients) {
             if (tracked.socket !== null) {
-                clientIds.push(id);
+                clients.push({ clientId: id, tags: tracked.tags });
             }
         }
         const mem = process.memoryUsage();
@@ -2392,7 +2423,7 @@ function startHeartbeat(state) {
                 cpuUser: cpu.user,
                 cpuSystem: cpu.system,
             },
-            clientIds,
+            clients,
         });
     }, HEARTBEAT_INTERVAL_MS);
 }
@@ -2438,15 +2469,16 @@ function startRoom(state, transport, options) {
                 const clientId = payload.clientId;
                 const roomId = payload.roomId;
                 const joinData = payload.data ?? {};
+                const tags = payload.tags ?? {};
                 // verify the token is for this room
                 if (roomId !== state.roomId)
                     return null;
-                return { clientId, joinData };
+                return { clientId, joinData, tags };
             }
             // dev mode — no jwt verification, generate identity
-            return { clientId: randomUUID(), joinData: {} };
+            return { clientId: randomUUID(), joinData: {}, tags: {} };
         },
-        open(clientId, socket, joinData) {
+        open(clientId, socket, joinData, tags) {
             socket.subscribe(BROADCAST_TOPIC);
             (async () => {
                 let result;
@@ -2477,12 +2509,16 @@ function startRoom(state, transport, options) {
                     reliableBuffer: [],
                     reliableBufferBytes: 0,
                     disconnectTimer: null,
+                    tags,
                 };
                 state.clients.set(clientId, tracked);
                 // send session token to client
                 socket.send(packProtocol({ type: 'session', token: sessionToken }), true);
-                // notify server for driver bookkeeping (managed mode only)
-                state.ipc?.send({ type: 'client-connected', clientId });
+                // notify server for driver bookkeeping (managed mode only).
+                // forward roomId + tags so driver.connectClient can perform a
+                // full upsert — covers the case where the driver's client
+                // record was evicted between reserveClient and now.
+                state.ipc?.send({ type: 'client-connected', clientId, roomId: state.roomId, tags });
                 // run onJoin
                 if (options.onJoin) {
                     await Promise.resolve(options.onJoin(room, createClient(tracked)));
@@ -2545,8 +2581,9 @@ function startRoom(state, transport, options) {
             if (options.onReconnect) {
                 safeCall(state.log, 'onReconnect', () => options.onReconnect(room, createClient(tracked)));
             }
-            // notify driver: client is connected again
-            state.ipc?.send({ type: 'client-connected', clientId });
+            // notify driver: client is connected again. forward roomId + the
+            // tags we cached at original open() — same upsert path as fast.
+            state.ipc?.send({ type: 'client-connected', clientId, roomId: state.roomId, tags: tracked.tags });
         },
         close(clientId, code) {
             const tracked = state.clients.get(clientId);

@@ -271,6 +271,27 @@ const object = (fields) => ({
     fields,
 });
 /**
+ * Record schema - dynamic key-value map with homogeneous values.
+ *
+ * Keys are strings, all values share the same schema.
+ * Stored as varuint count followed by [key, value] pairs.
+ *
+ * @param field Schema for all values
+ * @returns A record schema definition
+ *
+ * @example
+ * // Map of player IDs to scores
+ * record(uint32())
+ *
+ * @example
+ * // Map of item names to quantities
+ * record(varuint())
+ */
+const record = (field) => ({
+    type: 'record',
+    field,
+});
+/**
  * Literal schema - constant value that doesn't need to be serialized.
  *
  * The value is part of the schema definition and takes 0 bytes to encode.
@@ -2007,15 +2028,21 @@ const Ready = object({
     type: literal('ready'),
     port: uint16(),
 });
+const HeartbeatClient = object({
+    clientId: string(),
+    tags: record(string()),
+});
 const Heartbeat = object({
     type: literal('heartbeat'),
     timestamp: float64(),
     metrics: ProcessMetrics,
-    clientIds: list(string()),
+    clients: list(HeartbeatClient),
 });
 const ClientConnected = object({
     type: literal('client-connected'),
     clientId: string(),
+    roomId: string(),
+    tags: record(string()),
 });
 const ClientDisconnected = object({
     type: literal('client-disconnected'),
@@ -2208,19 +2235,22 @@ function cleanupRoom(s, roomId, reason) {
 }
 /* ipc message handling */
 // reconcile driver client state against the room's ground truth (from heartbeat).
-// the room's clientIds are authoritative — if a fast-path connect/disconnect
+// the room's client list is authoritative — if a fast-path connect/disconnect
 // message was lost (e.g. transient driver error), this corrects the drift.
-async function reconcileClients(s, roomId, roomClientIds) {
+// each entry carries the tags forwarded from the reservation jwt so we can
+// pass them to driver.connectClient — required for an upsert that doesn't
+// half-resurrect an evicted record.
+async function reconcileClients(s, roomId, roomClients) {
     const roomInfo = await s.driver.getRoomInfo(roomId);
     if (!roomInfo)
         return; // room already gone
-    const roomSet = new Set(roomClientIds);
+    const roomSet = new Set(roomClients.map((c) => c.clientId));
     // clients the room says are connected but the driver doesn't have as 'connected'
-    for (const clientId of roomClientIds) {
+    for (const { clientId, tags } of roomClients) {
         const driverClient = roomInfo.clients.find((c) => c.clientId === clientId);
         if (!driverClient || driverClient.status !== 'connected') {
             log.info('reconcile: connecting client missing from driver', { roomId, clientId });
-            await s.driver.connectClient(clientId).catch((err) => {
+            await s.driver.connectClient(clientId, roomId, tags).catch((err) => {
                 log.error('reconcile: failed to connect client', { roomId, clientId, err });
             });
         }
@@ -2249,10 +2279,10 @@ function handleIpcMessage(s, roomId, msg) {
                 memoryHeapUsed: msg.metrics.memoryHeapUsed,
                 cpuUser: msg.metrics.cpuUser,
                 cpuSystem: msg.metrics.cpuSystem,
-                clientCount: msg.clientIds.length,
+                clientCount: msg.clients.length,
             });
             // reconcile client state in the background — don't block the heartbeat path
-            reconcileClients(s, roomId, msg.clientIds).catch((err) => {
+            reconcileClients(s, roomId, msg.clients).catch((err) => {
                 log.error('client reconciliation failed', { roomId, err });
             });
             break;
@@ -2272,7 +2302,7 @@ function handleIpcMessage(s, roomId, msg) {
             break;
         }
         case 'client-connected': {
-            s.driver.connectClient(msg.clientId).catch((err) => {
+            s.driver.connectClient(msg.clientId, msg.roomId, msg.tags).catch((err) => {
                 log.error('failed to connect client in driver', { roomId, clientId: msg.clientId, err });
             });
             break;

@@ -39,3 +39,11 @@ export declare class DriverConfigError extends GathoError {
     readonly detail: string;
     constructor(detail: string);
 }
+/** thrown when reserveClient receives a `data` or `tags` argument whose serialized
+ *  size would push the resulting jwt past url/header limits on the upgrade request. */
+export declare class PayloadTooLargeError extends GathoError {
+    readonly field: 'data' | 'tags';
+    readonly sizeBytes: number;
+    readonly limitBytes: number;
+    constructor(field: 'data' | 'tags', sizeBytes: number, limitBytes: number);
+}

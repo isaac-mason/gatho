@@ -24,7 +24,7 @@ import type {
     RoomStatus,
     ServerInfo,
 } from './types';
-import { validateTags } from './types';
+import { validateTags, validateReserveData, validateReserveTagsSize } from './types';
 
 /**
  * postgres driver implementation using porsager/postgres
@@ -270,11 +270,18 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
 
         const clientTags = tags ?? {};
         validateTags(clientTags);
+        validateReserveData(data);
+        validateReserveTagsSize(clientTags);
 
         const clientId = crypto.randomUUID();
         const expiresAt = Date.now() + ttl;
 
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, room.room_secret);
+        // tags travel as a separate jwt claim from user data so the room can
+        // forward them back over ipc to connectClient (mirrors redis driver).
+        const token = jwtSign(
+            { clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags },
+            room.room_secret,
+        );
 
         await db`
             insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
@@ -287,11 +294,25 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
         return { clientId, url: url.toString(), roomId, expiresAt };
     }
 
-    async function connectClient(clientId: string): Promise<void> {
+    async function connectClient(
+        clientId: string,
+        roomId: string,
+        tags: Record<string, string>,
+    ): Promise<void> {
+        // upsert: matches redis MULTI semantics. postgres rows aren't subject
+        // to TTL eviction the way redis hashes are, but we treat the ipc
+        // payload as the authoritative source for cross-driver behavioural
+        // parity. on conflict we still rewrite roomId/tags so a half-evicted
+        // hash that the redis driver self-heals would also be self-healed
+        // here if the same race were possible.
         await db`
-            update ${db.unsafe(t.clients)}
-            set status = 'connected', expires_at = 0
-            where client_id = ${clientId}
+            insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags)
+            values (${clientId}, ${roomId}, 'connected', 0, ${db.json(tags)})
+            on conflict (client_id) do update
+            set room_id = excluded.room_id,
+                status = 'connected',
+                expires_at = 0,
+                tags = excluded.tags
         `;
     }
 

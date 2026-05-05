@@ -13,6 +13,9 @@ export type UpgradeResult = {
     clientId: string;
     reconnecting?: boolean;
     joinData?: Record<string, unknown>;
+    // driver-internal tags, forwarded from the jwt so the room can echo them
+    // back over ipc when reporting client-connected. opaque to room code.
+    tags?: Record<string, string>;
 };
 
 export type TransportHandlers = {
@@ -22,7 +25,13 @@ export type TransportHandlers = {
 
     // called when a new ws connection opens. socket is the opaque handle.
     // joinData is the arbitrary data from sdk.join({ data }), extracted from the jwt.
-    open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>): void;
+    // tags is the driver-internal tag bag from the jwt — opaque, forwarded over ipc.
+    open(
+        clientId: string,
+        socket: ClientSocket,
+        joinData: Record<string, unknown>,
+        tags: Record<string, string>,
+    ): void;
 
     // called when a reconnecting client's ws connection opens.
     // the transport swaps internal maps and calls this instead of open().

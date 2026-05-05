@@ -119,7 +119,7 @@ describe('memoryDriver prune', () => {
 
         const reservation = await driver._internal.reserveClient('r1', 5_000);
         // client connects before expiry
-        await driver._internal.connectClient(reservation.clientId);
+        await driver._internal.connectClient(reservation.clientId, 'r1', {});
 
         // advance in steps, heartbeating to keep the server alive
         for (let i = 0; i < 6; i++) {
@@ -149,7 +149,7 @@ describe('memoryDriver prune', () => {
         await driver._internal.roomReady('r1', 'ws://localhost:9001', 'secret123');
 
         const reservation = await driver._internal.reserveClient('r1', 60_000);
-        await driver._internal.connectClient(reservation.clientId);
+        await driver._internal.connectClient(reservation.clientId, 'r1', {});
 
         // let server go stale
         vi.advanceTimersByTime(STALE_MS + PRUNE_INTERVAL_MS);

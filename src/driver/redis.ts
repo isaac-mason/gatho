@@ -16,7 +16,7 @@ import type {
     RoomStatus,
     ServerInfo,
 } from './types';
-import { validateTags } from './types';
+import { validateTags, validateReserveData, validateReserveTagsSize } from './types';
 
 function attachLifecycleLogging(c: Redis | Cluster, name: 'main' | 'subscriber'): void {
     c.on('error', (err: Error) => log.error('redis connection error', { connection: name, err }));
@@ -394,12 +394,20 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
 
         const clientTags = tags ?? {};
         validateTags(clientTags);
+        validateReserveData(data);
+        validateReserveTagsSize(clientTags);
 
         const clientId = crypto.randomUUID();
         const expiresAt = Date.now() + ttl;
 
-        // mint jwt signed with the room's secret — room verifies locally, zero ipc
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {} }, roomData.roomSecret);
+        // mint jwt signed with the room's secret — room verifies locally, zero ipc.
+        // tags travel as a separate claim from user data: rooms are untrusted and
+        // must forward tags back over ipc so connectClient can reconstitute the
+        // hash if redis evicted it during the reserve→connect window.
+        const token = jwtSign(
+            { clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags },
+            roomData.roomSecret,
+        );
 
         // store client record
         await client.hset(keys.client(clientId), {
@@ -428,15 +436,30 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         };
     }
 
-    async function connectClient(clientId: string): Promise<void> {
-        // update status to connected and remove TTL (connected clients persist until disconnect)
-        await client.hset(keys.client(clientId), {
-            status: 'connected',
-            expiresAt: '0',
-        });
-
-        // remove TTL — connected clients don't expire
-        await client.persist(keys.client(clientId));
+    async function connectClient(
+        clientId: string,
+        roomId: string,
+        tags: Record<string, string>,
+    ): Promise<void> {
+        // atomic upsert: write every field reserveClient writes, persist the key,
+        // and ensure the room's client set contains us. self-healing — if the
+        // hash was evicted (TTL fired during the reserve→connect ipc window) or
+        // partially mutated, this restores it from authoritative state forwarded
+        // by the room over ipc. MULTI gives single-round-trip atomicity without
+        // the EVAL/EVALSHA script-cache overhead — we have no read-conditional
+        // logic, just a fixed sequence of writes.
+        await client
+            .multi()
+            .hset(keys.client(clientId), {
+                clientId,
+                roomId,
+                status: 'connected',
+                expiresAt: '0',
+                tags: JSON.stringify(tags),
+            })
+            .persist(keys.client(clientId))
+            .sadd(keys.clientsByRoom(roomId), clientId)
+            .exec();
     }
 
     async function disconnectClient(clientId: string): Promise<void> {

@@ -62,10 +62,21 @@ declare const Heartbeat: {
                 };
             };
         };
-        clientIds: {
+        clients: {
             type: "list";
             of: {
-                type: "string";
+                type: "object";
+                fields: {
+                    clientId: {
+                        type: "string";
+                    };
+                    tags: {
+                        type: "record";
+                        field: {
+                            type: "string";
+                        };
+                    };
+                };
             };
         };
     };
@@ -79,6 +90,15 @@ declare const ClientConnected: {
         };
         clientId: {
             type: "string";
+        };
+        roomId: {
+            type: "string";
+        };
+        tags: {
+            type: "record";
+            field: {
+                type: "string";
+            };
         };
     };
 };
@@ -159,10 +179,21 @@ declare const RoomMessageSchema: {
                     };
                 };
             };
-            clientIds: {
+            clients: {
                 type: "list";
                 of: {
-                    type: "string";
+                    type: "object";
+                    fields: {
+                        clientId: {
+                            type: "string";
+                        };
+                        tags: {
+                            type: "record";
+                            field: {
+                                type: "string";
+                            };
+                        };
+                    };
                 };
             };
         };
@@ -175,6 +206,15 @@ declare const RoomMessageSchema: {
             };
             clientId: {
                 type: "string";
+            };
+            roomId: {
+                type: "string";
+            };
+            tags: {
+                type: "record";
+                field: {
+                    type: "string";
+                };
             };
         };
     }, {
@@ -223,10 +263,15 @@ export declare const ipcCodec: {
             cpuUser: number;
             cpuSystem: number;
         };
-        clientIds: string[];
+        clients: {
+            clientId: string;
+            tags: Record<string, string>;
+        }[];
     } | {
         type: "client-connected";
         clientId: string;
+        roomId: string;
+        tags: Record<string, string>;
     } | {
         type: "client-disconnected";
         clientId: string;
@@ -249,10 +294,15 @@ export declare const ipcCodec: {
             cpuUser: number;
             cpuSystem: number;
         };
-        clientIds: string[];
+        clients: {
+            clientId: string;
+            tags: Record<string, string>;
+        }[];
     } | {
         type: "client-connected";
         clientId: string;
+        roomId: string;
+        tags: Record<string, string>;
     } | {
         type: "client-disconnected";
         clientId: string;
@@ -275,10 +325,15 @@ export declare const ipcCodec: {
             cpuUser: number;
             cpuSystem: number;
         };
-        clientIds: string[];
+        clients: {
+            clientId: string;
+            tags: Record<string, string>;
+        }[];
     } | {
         type: "client-connected";
         clientId: string;
+        roomId: string;
+        tags: Record<string, string>;
     } | {
         type: "client-disconnected";
         clientId: string;
@@ -301,10 +356,15 @@ export declare const ipcCodec: {
             cpuUser: number;
             cpuSystem: number;
         };
-        clientIds: string[];
+        clients: {
+            clientId: string;
+            tags: Record<string, string>;
+        }[];
     } | {
         type: "client-connected";
         clientId: string;
+        roomId: string;
+        tags: Record<string, string>;
     } | {
         type: "client-disconnected";
         clientId: string;

@@ -156,8 +156,11 @@ export type Driver = {
          *  optional data bag is included in the jwt payload and delivered to onAuth as joinData.
          *  keep data small — the jwt travels in a url query param (~2-3KB practical limit). */
         reserveClient(roomId: string, ttl: number, data?: Record<string, unknown>, tags?: Record<string, string>): Promise<ClientReservation>;
-        /** marks a client as connected — called by server when room reports client-connected over ipc */
-        connectClient(clientId: string): Promise<void>;
+        /** marks a client as connected — called by server when room reports client-connected over ipc.
+         *  idempotent upsert: writes the full client record (clientId, roomId, status, tags) regardless
+         *  of prior state, so a hash that was evicted between reservation and connection is reconstituted
+         *  rather than half-resurrected. tags travel from reserveClient → jwt → room → ipc to reach here. */
+        connectClient(clientId: string, roomId: string, tags: Record<string, string>): Promise<void>;
         /** marks a client as disconnected — called by server when room reports client-disconnected over ipc */
         disconnectClient(clientId: string): Promise<void>;
         /** send a heartbeat to indicate this server is alive — should be called at regular intervals (e.g. every 5s).
@@ -196,3 +199,11 @@ export declare function validateTagKey(key: string): void;
 export declare function validateTagValue(value: string): void;
 /** validate all keys and values in a tags record */
 export declare function validateTags(tags: Record<string, string>): void;
+/** maximum serialized size of the user-supplied `data` claim on a reservation jwt. */
+export declare const RESERVE_DATA_MAX_BYTES = 2048;
+/** maximum serialized size of the driver-internal `tags` record on a reservation jwt. */
+export declare const RESERVE_TAGS_MAX_BYTES = 512;
+/** validate that `data` will fit in the reservation jwt without blowing url limits. */
+export declare function validateReserveData(data: unknown): void;
+/** validate that `tags` will fit in the reservation jwt without blowing url limits. */
+export declare function validateReserveTagsSize(tags: Record<string, string>): void;

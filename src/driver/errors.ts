@@ -84,3 +84,18 @@ export class DriverConfigError extends GathoError {
         this.detail = detail;
     }
 }
+
+/** thrown when reserveClient receives a `data` or `tags` argument whose serialized
+ *  size would push the resulting jwt past url/header limits on the upgrade request. */
+export class PayloadTooLargeError extends GathoError {
+    readonly field: 'data' | 'tags';
+    readonly sizeBytes: number;
+    readonly limitBytes: number;
+
+    constructor(field: 'data' | 'tags', sizeBytes: number, limitBytes: number) {
+        super('payload-too-large', `${field} too large: ${sizeBytes}B exceeds limit of ${limitBytes}B`);
+        this.field = field;
+        this.sizeBytes = sizeBytes;
+        this.limitBytes = limitBytes;
+    }
+}
