@@ -27,6 +27,14 @@ export type SpawnContext = {
 
     /** full UDS socket path — the spawn function passes this to the room process */
     socket: string;
+
+    /**
+     * this room's own socket directory — `socket` lives directly inside it
+     * (`socketDir/sock`). A container runner mounts just this directory into
+     * the room so it can reach its own socket but not any sibling room's, isolating
+     * the server↔room IPC channel. The directory name is the room's id.
+     */
+    socketDir: string;
 };
 
 /** Handle returned by RoomRunner.spawn() for managing the room process. */

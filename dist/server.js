@@ -1,7 +1,7 @@
 import { randomUUID, randomBytes } from 'crypto';
 import * as http from 'http';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, dirname as dirname$1 } from 'path';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname } from 'node:path';
@@ -2337,8 +2337,31 @@ function handleIpcMessage(s, roomId, msg) {
     }
 }
 /* room lifecycle */
+/**
+ * Build the per-room UDS socket path: `socketDir/<roomId>/sock`.
+ *
+ * The per-room subdirectory (rather than a flat `socketDir/<roomId>.sock`) is what
+ * lets a container runner mount each room only its own socket dir, isolating the
+ * IPC channel from sibling rooms. `roomId` becomes a path segment, so reject
+ * anything that could escape `socketDir`.
+ *
+ * The socket filename is kept to `sock` (not e.g. `room.sock`) on purpose: unix
+ * socket paths have a hard length limit (~104 bytes on macOS) and the per-room
+ * subdir already costs the `roomId` segment. `<roomId>/sock` is the same length as
+ * the old flat `<roomId>.sock`, so we don't regress paths that used to fit. Don't
+ * lengthen this filename without re-checking that limit on the longest socketDir.
+ */
+function roomSocketPath(socketDir, roomId) {
+    if (roomId.includes('/') || roomId.includes('\\') || roomId === '.' || roomId === '..') {
+        throw new Error(`invalid roomId for socket path: ${JSON.stringify(roomId)}`);
+    }
+    return join(socketDir, roomId, 'sock');
+}
 // spawn a new room subprocess via the injected runner.
-// 1. creates a UDS socket at socketDir/roomId.sock and starts listening
+// 1. creates a UDS socket at socketDir/roomId/sock and starts listening.
+//    the per-room subdirectory (rather than a flat socketDir/roomId.sock) lets
+//    container runners mount each room only its own socket dir, isolating the
+//    IPC channel from sibling rooms — see SpawnContext.socketDir.
 // 2. calls runner.spawn() to start the process (which connects back)
 // 3. ipc messages from the child are handled by handleIpcMessage()
 // 4. when the room sends 'ready' with wsPort, computes endpoint and registers with driver
@@ -2348,7 +2371,7 @@ async function createRoom(s, roomId, roomType, data) {
         throw new Error(`no runner for room type "${roomType}"`);
     }
     const roomSecret = randomBytes(32).toString('base64url');
-    const socketPath = join(s.socketDir, `${roomId}.sock`);
+    const socketPath = roomSocketPath(s.socketDir, roomId);
     let resolveExited;
     const exited = new Promise((r) => {
         resolveExited = r;
@@ -2383,6 +2406,7 @@ async function createRoom(s, roomId, roomType, data) {
         roomSecret,
         data,
         socket: socketPath,
+        socketDir: dirname$1(socketPath),
     });
     // race UDS connection against child exit — if the child crashes before
     // connecting (bad path, syntax error, etc.), we reject immediately instead

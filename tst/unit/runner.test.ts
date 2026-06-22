@@ -9,7 +9,8 @@ function makeCtx(overrides?: Partial<SpawnContext>): SpawnContext {
         serverId: 'server-1',
         roomSecret: 'secret-abc',
         data: {},
-        socket: '/tmp/gatho-ipc/room-1.sock',
+        socket: '/tmp/gatho-ipc/room-1/sock',
+        socketDir: '/tmp/gatho-ipc/room-1',
         ...overrides,
     };
 }
@@ -19,7 +20,7 @@ describe('runner ctx.env', () => {
         runner((ctx) => {
             expect(ctx.env).toEqual({
                 GATHO_ROOM_ID: 'room-1',
-                GATHO_SOCKET: '/tmp/gatho-ipc/room-1.sock',
+                GATHO_SOCKET: '/tmp/gatho-ipc/room-1/sock',
                 GATHO_ROOM_TYPE: 'game',
                 GATHO_SERVER_ID: 'server-1',
                 GATHO_ROOM_SECRET: 'secret-abc',

@@ -54,4 +54,19 @@ export declare function reconcileClients(driver: Driver['_internal'], roomId: st
     clientId: string;
     tags: Record<string, string>;
 }[], heartbeatTimestamp: number): Promise<void>;
+/**
+ * Build the per-room UDS socket path: `socketDir/<roomId>/sock`.
+ *
+ * The per-room subdirectory (rather than a flat `socketDir/<roomId>.sock`) is what
+ * lets a container runner mount each room only its own socket dir, isolating the
+ * IPC channel from sibling rooms. `roomId` becomes a path segment, so reject
+ * anything that could escape `socketDir`.
+ *
+ * The socket filename is kept to `sock` (not e.g. `room.sock`) on purpose: unix
+ * socket paths have a hard length limit (~104 bytes on macOS) and the per-room
+ * subdir already costs the `roomId` segment. `<roomId>/sock` is the same length as
+ * the old flat `<roomId>.sock`, so we don't regress paths that used to fit. Don't
+ * lengthen this filename without re-checking that limit on the longest socketDir.
+ */
+export declare function roomSocketPath(socketDir: string, roomId: string): string;
 export declare function start(options: CreateServerOptions): Promise<Server>;

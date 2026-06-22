@@ -20,8 +20,10 @@ const dockerRunner = runner((ctx) => {
         '--memory', '512m',
         // limit CPU
         '--cpus', '1',
-        // mount the socket dir so the room can communicate with the server
-        '-v', `${SOCKET_DIR}:${SOCKET_DIR}`,
+        // mount only THIS room's socket dir so the room can talk to the server
+        // but can't reach sibling rooms' sockets. ctx.socketDir is the room's
+        // own directory; mount it where the room expects to find GATHO_SOCKET.
+        '-v', `${ctx.socketDir}:${ctx.socketDir}`,
         // forward gatho default env vars to the container
         ...Object.entries(ctx.env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
         // set a game mode env var for the container based on ctx.data
