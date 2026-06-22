@@ -14,6 +14,6 @@ echo "starting docker compose..."
 docker compose up -d --wait
 
 echo "running e2e tests..."
-pnpm vitest run tst/e2e/run.test.ts --run
+pnpm vitest run e2e
 
 echo "done."
