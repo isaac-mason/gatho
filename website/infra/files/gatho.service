@@ -1,0 +1,15 @@
+[Unit]
+Description=gatho website backend (compiled bun binary)
+After=network.target
+
+[Service]
+Type=simple
+# PUBLIC_URL + ROOM_BIN are written by deploy.sh
+EnvironmentFile=/opt/gatho/gatho.env
+ExecStart=/opt/gatho/server
+WorkingDirectory=/opt/gatho
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

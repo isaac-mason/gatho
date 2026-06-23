@@ -1,0 +1,21 @@
+# __SITE_HOST__ / __ACME_EMAIL__ are substituted by deploy.sh before shipping.
+{
+	email __ACME_EMAIL__
+}
+
+__SITE_HOST__ {
+	encode zstd gzip
+
+	# gatho room websockets. the backend hands clients wss://<host>/room/<port>,
+	# where <port> is a room subprocess's os-assigned port on localhost. the
+	# 5-digit match keeps this off the api (:7100) and 22/80/443. reverse_proxy
+	# upgrades websockets automatically; `rewrite /` strips the /room/<port>
+	# prefix (the ?token=... query is preserved).
+	@roomws path_regexp roomws ^/room/([0-9]{5})$
+	reverse_proxy @roomws localhost:{re.roomws.1} {
+		rewrite /
+	}
+
+	# everything else (/api/*) -> the backend.
+	reverse_proxy localhost:7100
+}

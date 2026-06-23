@@ -1,0 +1,13 @@
+# secrets + tokens
+.env
+files/.env
+
+# generated ssh key
+.ssh/
+
+# tofu working dir + state (local state for a single-box demo)
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+!*.tfvars.example

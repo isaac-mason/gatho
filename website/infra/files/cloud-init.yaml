@@ -1,0 +1,11 @@
+#cloud-config
+# minimal bootstrap. caddy + the backend service are installed by provision.sh
+# (shipped by deploy.sh), so this just preps the box.
+package_update: true
+
+packages:
+  - curl
+  - gnupg
+
+runcmd:
+  - mkdir -p /opt/gatho
