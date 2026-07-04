@@ -21,7 +21,9 @@ export type UpgradeResult = {
 export type TransportHandlers = {
     // called during http upgrade. returns client identity if auth passes, null to reject.
     // query is the raw query string (e.g. "token=abc123").
-    upgrade(query: string): UpgradeResult | null;
+    // may be async (jwt verification uses WebCrypto) — transports must await it
+    // before completing the upgrade.
+    upgrade(query: string): UpgradeResult | null | Promise<UpgradeResult | null>;
 
     // called when a new ws connection opens. socket is the opaque handle.
     // joinData is the arbitrary data from sdk.join({ data }), extracted from the jwt.

@@ -1,6 +1,6 @@
 import { dirname } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { roomSocketPath } from '../../src/server/server';
+import { roomSocketPath } from '../../src/server/runner/notify';
 
 describe('roomSocketPath', () => {
     it('nests each room socket under its own per-room subdirectory', () => {

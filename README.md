@@ -50,7 +50,7 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 
 A **room** (`gatho/room`) is a shared multiplayer session — a game match, a lobby, a collaborative space. Organise your application and state however you like, use `start` to initialize the room.
 
-A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — the built-in `subprocess()` helper spawns each room as its own child process, but you can run rooms in the same process, in a container, whatever you want. Rooms report their health and status back to the server over a Unix domain socket. Running multiple servers gives you horizontal scale.
+A **server** (`gatho/server`) hosts rooms. You run one or more — each registers itself with the driver so the SDK knows it exists and can place rooms on it. You tell the server how to run rooms — the built-in `subprocess()` runner spawns each room as its own child process, but you can run rooms in the same process, in a container, whatever you want. Rooms report their health and status back to the server over a one-way notify channel (a Unix domain socket by default); the runner owns that channel, so a custom runner can carry it however its runtime needs. Running multiple servers gives you horizontal scale.
 
 Your backend uses the **SDK** (`gatho/sdk`) to manage rooms — create, query, and destroy them, tag them for filtering, and call `join()` to mint a short-lived token URL you hand to your client. Tags and client data make it flexible enough to build whatever matchmaking logic you need.
 
@@ -94,13 +94,13 @@ Start a gatho server with a driver and tell it how to run your rooms:
 ```ts
 // server.ts
 import { createRedisDriver } from 'gatho/driver';
-import { runner, start, subprocess } from 'gatho/server';
+import { start, subprocess } from 'gatho/server';
 
 const driver = createRedisDriver({ url: 'redis://localhost:6379' });
 
 await start({
     rooms: {
-        counter: runner((ctx) => subprocess(ctx, ['bun', 'run', './counter-room.ts'])),
+        counter: subprocess(['bun', 'run', './counter-room.ts']),
     },
     driver,
     roomEndpoint: ({ port }) => `ws://localhost:${port}`,
@@ -167,33 +167,32 @@ room.send(JSON.stringify({ type: 'increment' }));
 
 ### Runners
 
-A runner is a function that knows how to start and stop a single room. The server calls it once per room assignment. The callback you pass to `runner()`:
+A runner knows how to start and stop a single room. The server calls it once per room assignment. The callback you pass to `runner()`:
 
-1. Receives a context with room metadata (`ctx.roomId`, `ctx.data`, `ctx.env`) and a `ctx.stopped(code)` callback.
-2. Spawns the room however you like — child process, container, in-process worker, whatever.
-3. Returns a destructor that the server invokes to stop the room.
+1. Receives a context with room metadata (`ctx.roomId`, `ctx.data`, `ctx.env`), an `onMessage(msg)` callback (the server's notify-message handler), and a `stopped(code)` callback.
+2. Establishes a notify channel the room reports back on — compose a helper like `notify.uds(ctx)` (see below), or call `ctx.onMessage` directly to synthesize messages on the room's behalf (e.g. an `error` when a spawn fails).
+3. Spawns the room however you like — child process, container, in-process worker, whatever.
+4. Returns a destructor that the server invokes to stop the room.
 
 Call `ctx.stopped(code)` whenever the room exits (crash, clean exit, killed) so the server can reconcile. The destructor owns the shutdown strategy — graceful escalation, a single API call, whatever fits your runtime.
 
-`ctx.env` contains the standard `GATHO_*` environment variables pre-built for the room, ready to spread into a process env or pass as docker `-e` flags.
+`ctx.env` contains the standard `GATHO_*` environment variables pre-built for the room (room id, type, server id, secret), ready to spread into a process env or pass as docker `-e` flags. The notify channel contributes its own env (`GATHO_NOTIFY_SOCKET`) via the channel helper — spread `chan.env` alongside `ctx.env`.
 
 #### `subprocess()` — child processes
 
-`subprocess()` is a helper for the common case: spawn a node/bun child process. It's called from inside a `runner()` callback, forwards `ctx.env`, wires exit signalling, and handles graceful shutdown (SIGTERM → SIGKILL escalation). Use `options.env` to pass extra env vars or forward fields from `ctx.data`.
+`subprocess()` is a factory for the common case: give it the argv and it returns a runner that spawns a node/bun child process. It sets up a `notify.uds` channel, forwards the standard `GATHO_*` env, wires exit signalling, and handles graceful shutdown (SIGTERM → SIGKILL escalation). Use `options.env` for extra env vars, and `options.socketDir` / `options.killTimeoutMs` to tune the channel and shutdown. Per-room `ctx.data` isn't forwarded automatically — reach for a custom runner when you need that.
 
 ```ts
 import { createMemoryDriver } from 'gatho/driver';
-import { runner, start, subprocess } from 'gatho/server';
+import { start, subprocess } from 'gatho/server';
 
 await start({
     rooms: {
-        game: runner((ctx) =>
-            subprocess(ctx, ['bun', 'run', './game-room.ts'], {
-                env: {
-                    GAMEMODE: ctx.data.gamemode as string,
-                },
-            }),
-        ),
+        // subprocess() is a factory: give it the argv and it returns a runner.
+        // options.env adds extra env vars alongside the standard GATHO_* set.
+        game: subprocess(['bun', 'run', './game-room.ts'], {
+            env: { REGION: 'eu-west' },
+        }),
     },
     driver: createMemoryDriver(),
     roomEndpoint: ({ port }) => `ws://localhost:${port}`,
@@ -202,18 +201,24 @@ await start({
 
 #### Custom runners
 
-For Docker, microVMs, or any other runtime, write the runner body directly. The destructor only needs to stop whatever you spawned.
+For Docker, microVMs, or any other runtime, write the runner body directly. Compose a notify channel with `notify.uds(ctx)` (or call `ctx.onMessage` yourself), spread `chan.env` into the room's environment, and close the channel when the room exits. The destructor only needs to stop whatever you spawned. Per-room `ctx.data` is available here, so this is also where you forward room-specific config.
 
 ```ts
 import { spawn } from 'node:child_process';
 import { createRedisDriver } from 'gatho/driver';
-import { runner, start } from 'gatho/server';
+import { notify, runner, start } from 'gatho/server';
 
-// host and container share this dir so GATHO_SOCKET resolves inside the container
+// host and container share this dir so the socket path resolves inside the
+// container. it's a notify.uds option now, not a server-wide one.
 const SOCKET_DIR = '/tmp/gatho-ipc';
 
-const dockerRunner = runner((ctx) => {
+const dockerRunner = runner(async (ctx) => {
     const gameMode = String(ctx.data.gameMode ?? 'classic');
+
+    // establish the notify channel — a uds the room dials back on to report
+    // heartbeats and client presence. chan.env carries GATHO_NOTIFY_SOCKET /
+    // GATHO_NOTIFY_SOCKET; chan.socketDir is this room's own socket dir to bind-mount.
+    const chan = await notify.uds(ctx, { socketDir: SOCKET_DIR });
 
     const child = spawn('docker', [
         'run',
@@ -227,18 +232,22 @@ const dockerRunner = runner((ctx) => {
         '--memory', '512m',
         // limit CPU
         '--cpus', '1',
-        // mount the socket dir so the room can communicate with the server
-        '-v', `${SOCKET_DIR}:${SOCKET_DIR}`,
-        // forward gatho default env vars to the container
-        ...Object.entries(ctx.env).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+        // mount only THIS room's socket dir so the room can reach its own socket
+        // but not sibling rooms' sockets.
+        '-v', `${chan.socketDir}:${chan.socketDir}`,
+        // forward gatho env + the notify channel env to the container
+        ...Object.entries({ ...ctx.env, ...chan.env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
         // set a game mode env var for the container based on ctx.data
         '-e', `GAME_MODE=${gameMode}`,
         // our docker image, runs gatho/room's start() within
         'my-game-image:latest',
     ], { stdio: ['ignore', 'inherit', 'inherit'] });
 
-    // when the child exits, tell the server the room stopped
-    child.on('exit', (code) => ctx.stopped(code));
+    // when the child exits, tear down the channel and tell the server the room stopped
+    child.on('exit', (code) => {
+        chan.close();
+        ctx.stopped(code);
+    });
 
     // destructor that stops the container
     return () => {
@@ -249,7 +258,6 @@ const dockerRunner = runner((ctx) => {
 });
 
 await start({
-    socketDir: SOCKET_DIR,
     rooms: { game: dockerRunner },
     driver: createRedisDriver({ url: 'redis://localhost:6379' }),
     roomEndpoint: ({ port }) => `wss://my-host/${port}`,
@@ -257,13 +265,13 @@ await start({
 });
 ```
 
-### Server ↔ Room IPC
+### The notify channel
 
-Rooms push messages to their parent server over a Unix domain socket (UDS), one per room, created in `socketDir` (default `${os.tmpdir()}/gatho-ipc`). The channel is one-way — rooms send ready signals, heartbeats, process metrics, and client connect/disconnect events; the server doesn't currently push anything back over this channel.
+Rooms report to their parent server over a one-way **notify channel** — they send ready signals, heartbeats, and client connect/disconnect events; the server never pushes back over it (stop is delivered out-of-band via the runner's destructor). The runner owns the channel: built-in runners set one up for you, and custom runners compose a helper.
 
-A UDS is used instead of TCP because it is local-only: no TCP/IP stack, no port allocation, no handshake, no TLS — just a file on disk the kernel routes through. That means low latency and low overhead for the chatter between server and room, faster room startup (no port negotiation on the IPC side), and the IPC channel is never exposed to the network. The only port a room opens is the public WebSocket port clients connect to.
+The default helper, `notify.uds(ctx)`, is a Unix domain socket — one per room, created at `socketDir/<roomId>/sock` (`socketDir` defaults to `${os.tmpdir()}/gatho-ipc`, overridable via the helper's options). A UDS is local-only: no TCP/IP stack, no port allocation, no handshake, no TLS — just a file on disk the kernel routes through. That means low latency and low overhead, faster room startup, and an IPC channel never exposed to the network. The only port a room opens is the public WebSocket port clients connect to.
 
-When running rooms in a sandbox (Docker, microVM, etc.), bind-mount `socketDir` into the container so the path in `GATHO_SOCKET` resolves on both sides — see the custom runner snippet above.
+The helper returns `chan.env` — `GATHO_NOTIFY_SOCKET`, a `uds:<path>` URI — which you spread into the room's environment. When running rooms in a sandbox (Docker, microVM, etc.), bind-mount `chan.socketDir` into the container so the socket path resolves on both sides — see the custom runner snippet above.
 
 ## Rooms
 

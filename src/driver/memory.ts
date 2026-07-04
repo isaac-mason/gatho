@@ -285,7 +285,7 @@ export function createMemoryDriver(): Driver {
 
         // mint jwt signed with the room's secret. tags travel as a separate
         // claim from user data so the room can forward them back over ipc.
-        const token = jwtSign(
+        const token = await jwtSign(
             { clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags },
             r.roomSecret,
         );

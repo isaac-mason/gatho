@@ -1,7 +1,16 @@
 // gatho/room — room-side api
 // rooms are scripts. user initializes state in module scope, calls start()
 // which returns a Room handle. no defineRoom, no hook bags, no RoomContext.
+// the module IS the room: state closes over module scope, and instancing
+// happens by evaluating the module in a fresh process / worker / isolate.
 
+export type {
+    Notifier,
+    NotifyMessage,
+} from '../common/notify-protocol';
+// protocol helpers for non-node runtimes that need to speak the notify wire
+// protocol themselves (e.g. a workerd harness relaying room notifications over tcp)
+export { createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec } from '../common/notify-protocol';
 export type { ServerConfig, StartOptions } from './start';
 export { start } from './start';
 export type { WsTransportConfig } from './transport/index';

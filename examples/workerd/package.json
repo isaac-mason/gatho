@@ -1,0 +1,23 @@
+{
+    "name": "gatho-example-workerd",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "demo": "node --experimental-strip-types demo.ts",
+        "start": "node --experimental-strip-types server.ts",
+        "typecheck": "tsc --noEmit",
+        "test:spa": "node --experimental-strip-types spa-test.ts"
+    },
+    "dependencies": {
+        "gatho": "workspace:*",
+        "packcat": "0.3.0",
+        "ws": "^8.20.0"
+    },
+    "devDependencies": {
+        "@types/node": "^25.6.0",
+        "@types/ws": "^8.18.1",
+        "esbuild": "^0.25.0",
+        "typescript": "^5.9.2",
+        "workerd": "^1.20250712.0"
+    }
+}

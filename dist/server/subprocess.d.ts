@@ -1,33 +1,37 @@
-import type { Destructor, RunnerSpawnContext } from './runner/runner';
-/** options for the `subprocess` helper */
-export type SubprocessOptions = {
-    /** additional env vars to pass to the subprocess, alongside the standard GATHO_ vars from ctx.env */
-    env?: Record<string, string>;
+import { type UdsNotifyOptions } from './runner/notify';
+import { type RunnerSpawnContext } from './runner/runner';
+import type { RoomRunner } from './runner/types';
+/** options for the `subprocess` runner factory */
+export type SubprocessOptions = UdsNotifyOptions & {
+    /** additional env vars to pass to the subprocess, alongside the standard GATHO_ vars.
+     *  pass a function to derive per-room env from the spawn context — this is how
+     *  room-specific config (`ctx.data`, from createRoom options) reaches the process:
+     *  `subprocess(cmd, { env: (ctx) => ({ GAMEMODE: String(ctx.data.gamemode) }) })` */
+    env?: Record<string, string> | ((ctx: RunnerSpawnContext) => Record<string, string>);
     /** how long to wait after SIGTERM before sending SIGKILL (default 5s) */
     killTimeoutMs?: number;
 };
 /**
- * spawn-a-child-process helper for use inside a `runner()` callback.
+ * spawn-a-child-process room runner.
  *
- * the subprocess should call `gatho/room`'s `start()` function (`import { start } from 'gatho/room'`).
+ * the subprocess should call `gatho/room`'s `start()` function
+ * (`import { start } from 'gatho/room'`).
  *
- * the process will be started with at least the standard gatho environment variables from `ctx.env`,
- * which `start()` picks up automatically:
+ * establishes a uds notify channel, then starts the process with at least the standard
+ * gatho environment variables, which `start()` picks up automatically:
  * - `GATHO_ROOM_ID`: the room's unique identifier
- * - `GATHO_SOCKET`: the uds socket path for ipc communication with the server
  * - `GATHO_ROOM_TYPE`: the room type string
  * - `GATHO_SERVER_ID`: the id of the server this room is running on
  * - `GATHO_ROOM_SECRET`: a per-room secret for signing JWTs
+ * - `GATHO_NOTIFY_SOCKET`: where to dial the notify channel
  *
- * the caller is responsible for forwarding `ctx.data` (room-specific config) if the subprocess
- * needs it — typically by spreading it into `options.env` with whatever naming/transform you want.
+ * room-specific config (`ctx.data` in a custom `runner()`) is not forwarded automatically —
+ * use `options.env` (or a custom runner) to pass it with whatever naming/transform you want.
  *
- * wires `child.on('exit', ctx.stopped)` and returns a destructor that sends SIGTERM, escalating
- * to SIGKILL after `killTimeoutMs`.
+ * a spawn failure (e.g. missing binary) is surfaced as a synthesized `error` notify message
+ * so it's visible in gatho's own reporting, not just the host's stderr.
  *
- * @param ctx the runner spawn context, provided by the enclosing `runner()` callback
  * @param command the full argv array for the subprocess, e.g. `['bun', 'run', 'game-room.ts']`
- * @param options additional env vars and kill timeout
- * @returns a Destructor that terminates the subprocess
+ * @param options additional env vars, kill timeout, socket dir
  */
-export declare function subprocess(ctx: RunnerSpawnContext, command: string[], options?: SubprocessOptions): Destructor;
+export declare function subprocess(command: string[], options?: SubprocessOptions): RoomRunner;

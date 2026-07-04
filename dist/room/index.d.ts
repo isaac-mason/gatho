@@ -1,3 +1,5 @@
+export type { Notifier, NotifyMessage, } from '../common/notify-protocol';
+export { createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec } from '../common/notify-protocol';
 export type { ServerConfig, StartOptions } from './start';
 export { start } from './start';
 export type { WsTransportConfig } from './transport/index';

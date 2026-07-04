@@ -1,4 +1,3 @@
-import type { Socket } from 'node:net';
 import * as pack from 'packcat';
 declare const ProcessMetrics: {
     type: "object";
@@ -43,22 +42,25 @@ declare const Heartbeat: {
             type: "float64";
         };
         metrics: {
-            type: "object";
-            fields: {
-                memoryRss: {
-                    type: "float64";
-                };
-                memoryHeapUsed: {
-                    type: "float64";
-                };
-                memoryHeapTotal: {
-                    type: "float64";
-                };
-                cpuUser: {
-                    type: "float64";
-                };
-                cpuSystem: {
-                    type: "float64";
+            type: "optional";
+            of: {
+                type: "object";
+                fields: {
+                    memoryRss: {
+                        type: "float64";
+                    };
+                    memoryHeapUsed: {
+                        type: "float64";
+                    };
+                    memoryHeapTotal: {
+                        type: "float64";
+                    };
+                    cpuUser: {
+                        type: "float64";
+                    };
+                    cpuSystem: {
+                        type: "float64";
+                    };
                 };
             };
         };
@@ -135,7 +137,7 @@ declare const Stopped: {
         };
     };
 };
-declare const RoomMessageSchema: {
+declare const NotifyMessageSchema: {
     type: "union";
     key: "type";
     variants: [{
@@ -160,22 +162,25 @@ declare const RoomMessageSchema: {
                 type: "float64";
             };
             metrics: {
-                type: "object";
-                fields: {
-                    memoryRss: {
-                        type: "float64";
-                    };
-                    memoryHeapUsed: {
-                        type: "float64";
-                    };
-                    memoryHeapTotal: {
-                        type: "float64";
-                    };
-                    cpuUser: {
-                        type: "float64";
-                    };
-                    cpuSystem: {
-                        type: "float64";
+                type: "optional";
+                of: {
+                    type: "object";
+                    fields: {
+                        memoryRss: {
+                            type: "float64";
+                        };
+                        memoryHeapUsed: {
+                            type: "float64";
+                        };
+                        memoryHeapTotal: {
+                            type: "float64";
+                        };
+                        cpuUser: {
+                            type: "float64";
+                        };
+                        cpuSystem: {
+                            type: "float64";
+                        };
                     };
                 };
             };
@@ -249,7 +254,7 @@ declare const RoomMessageSchema: {
         };
     }];
 };
-export declare const ipcCodec: {
+export declare const notifyCodec: {
     pack: (value: {
         type: "ready";
         port: number;
@@ -262,7 +267,7 @@ export declare const ipcCodec: {
             memoryHeapTotal: number;
             cpuUser: number;
             cpuSystem: number;
-        };
+        } | undefined;
         clients: {
             clientId: string;
             tags: Record<string, string>;
@@ -293,7 +298,7 @@ export declare const ipcCodec: {
             memoryHeapTotal: number;
             cpuUser: number;
             cpuSystem: number;
-        };
+        } | undefined;
         clients: {
             clientId: string;
             tags: Record<string, string>;
@@ -324,7 +329,7 @@ export declare const ipcCodec: {
             memoryHeapTotal: number;
             cpuUser: number;
             cpuSystem: number;
-        };
+        } | undefined;
         clients: {
             clientId: string;
             tags: Record<string, string>;
@@ -355,7 +360,7 @@ export declare const ipcCodec: {
             memoryHeapTotal: number;
             cpuUser: number;
             cpuSystem: number;
-        };
+        } | undefined;
         clients: {
             clientId: string;
             tags: Record<string, string>;
@@ -381,7 +386,7 @@ export declare const ipcCodec: {
         packInto: string;
     };
 };
-export type RoomMessage = pack.SchemaType<typeof RoomMessageSchema>;
+export type NotifyMessage = pack.SchemaType<typeof NotifyMessageSchema>;
 export type ReadyMessage = pack.SchemaType<typeof Ready>;
 export type HeartbeatMessage = pack.SchemaType<typeof Heartbeat>;
 export type ProcessMetricsMessage = pack.SchemaType<typeof ProcessMetrics>;
@@ -389,10 +394,23 @@ export type ClientConnectedMessage = pack.SchemaType<typeof ClientConnected>;
 export type ClientDisconnectedMessage = pack.SchemaType<typeof ClientDisconnected>;
 export type ErrorMessage = pack.SchemaType<typeof ErrorMsg>;
 export type StoppedMessage = pack.SchemaType<typeof Stopped>;
-export type UdsConnection = {
-    send: (msg: RoomMessage) => void;
+/** the room's handle for notifying its managing server — connected over
+ *  uds/tcp, or wired straight to the server's message handler when hosted
+ *  in-process (`notify.direct`). */
+export type Notifier = {
+    send: (msg: NotifyMessage) => void;
     close: () => void;
 };
-export declare function sendMessage(socket: Socket, msg: RoomMessage): void;
-export declare function createFrameReader(onMessage: (msg: RoomMessage) => void, onError?: (err: unknown) => void): (data: Buffer | Uint8Array) => void;
+/** wrap raw payload bytes in a length-prefixed frame */
+export declare function encodeRawFrame(payload: Uint8Array): Uint8Array;
+/** encode a notify message as a length-prefixed frame, ready to write to any pipe */
+export declare function encodeNotifyFrame(msg: NotifyMessage): Uint8Array;
+/** streaming frame parser — handles partial reads and buffering across chunks.
+ *  returns a push function that accepts raw chunks and invokes `onFrame` with
+ *  each complete payload (header stripped). */
+export declare function createFrameParser(onFrame: (payload: Uint8Array) => void): (data: Uint8Array) => void;
+/** streaming notify-message reader built on the frame parser.
+ *  malformed frames are dropped via `onError` rather than thrown — callers are
+ *  socket 'data' handlers which must not throw. */
+export declare function createFrameReader(onMessage: (msg: NotifyMessage) => void, onError?: (err: unknown) => void): (data: Uint8Array) => void;
 export {};

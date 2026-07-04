@@ -28,17 +28,25 @@ export type CreateServerOptions = {
     /** full URL for this server's HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
      *  if not set, defaults to "http://{host}:{port}" using the bound address. */
     serverEndpoint?: string;
-    /** directory for the per-room UDS sockets used for server↔room IPC. defaults to
-     *  `${os.tmpdir()}/gatho-ipc`. set an explicit path when running rooms in docker
-     *  (or any other sandbox) so the same path can be bind-mounted into the container
-     *  and appear in `GATHO_SOCKET` unchanged. created if it doesn't exist. */
-    socketDir?: string;
+    /** how long a freshly spawned room may take to send its first notify message
+     *  before startup is considered failed and the room is killed. raise this when
+     *  spawning is slow — e.g. a docker runner whose first spawn pulls the image.
+     *  @default 30000 */
+    roomStartupTimeoutMs?: number;
+    /** how long a started room may go without a heartbeat before it is considered
+     *  stalled and killed (rooms heartbeat every ~3s). @default 10000 */
+    roomStallTimeoutMs?: number;
 };
 export type RoomDetails = {
     roomId: string;
     roomType: string;
     workerRunning: boolean;
     endpoint: string | null;
+    /** the room's lifecycle as the server observes it */
+    status: 'starting' | 'ready' | 'stopped';
+    /** wall-clock ms of the room's last heartbeat (or first notify message),
+     *  null before the room has spoken */
+    lastHeartbeatAt: number | null;
 };
 export type Server = {
     stop(): Promise<void>;
@@ -54,19 +62,4 @@ export declare function reconcileClients(driver: Driver['_internal'], roomId: st
     clientId: string;
     tags: Record<string, string>;
 }[], heartbeatTimestamp: number): Promise<void>;
-/**
- * Build the per-room UDS socket path: `socketDir/<roomId>/sock`.
- *
- * The per-room subdirectory (rather than a flat `socketDir/<roomId>.sock`) is what
- * lets a container runner mount each room only its own socket dir, isolating the
- * IPC channel from sibling rooms. `roomId` becomes a path segment, so reject
- * anything that could escape `socketDir`.
- *
- * The socket filename is kept to `sock` (not e.g. `room.sock`) on purpose: unix
- * socket paths have a hard length limit (~104 bytes on macOS) and the per-room
- * subdir already costs the `roomId` segment. `<roomId>/sock` is the same length as
- * the old flat `<roomId>.sock`, so we don't regress paths that used to fit. Don't
- * lengthen this filename without re-checking that limit on the longest socketDir.
- */
-export declare function roomSocketPath(socketDir: string, roomId: string): string;
 export declare function start(options: CreateServerOptions): Promise<Server>;

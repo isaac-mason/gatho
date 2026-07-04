@@ -4,7 +4,7 @@
 import { createMemoryDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
 import type { Server } from 'gatho/server';
-import { runner, start, subprocess } from 'gatho/server';
+import { start, subprocess } from 'gatho/server';
 import { afterEach, describe, expect, it } from 'vitest';
 import { roomScripts } from './helpers';
 
@@ -23,7 +23,7 @@ describe('/ping endpoint', () => {
 
         server = await start({
             rooms: {
-                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
+                echo: subprocess(['bun', 'run', roomScripts.echo]),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
@@ -45,7 +45,7 @@ describe('/ping endpoint', () => {
 
         server = await start({
             rooms: {
-                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
+                echo: subprocess(['bun', 'run', roomScripts.echo]),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
@@ -68,7 +68,7 @@ describe('/ping endpoint', () => {
 
         server = await start({
             rooms: {
-                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
+                echo: subprocess(['bun', 'run', roomScripts.echo]),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
@@ -95,7 +95,7 @@ describe('/ping endpoint', () => {
 
         server = await start({
             rooms: {
-                echo: runner((ctx) => subprocess(ctx, ['bun', 'run', roomScripts.echo])),
+                echo: subprocess(['bun', 'run', roomScripts.echo]),
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,

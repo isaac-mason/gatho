@@ -1,7 +1,7 @@
 import Bun from 'bun';
 import { createMemoryDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
-import { runner, start, subprocess } from 'gatho/server';
+import { start, subprocess } from 'gatho/server';
 
 // uncommon dev ports to dodge conflicts with the usual 3000/5173/8080 crowd.
 const API_PORT = 7100; // bun join api
@@ -26,7 +26,7 @@ const ROOM_CMD = process.env.ROOM_BIN
 
 const server = await start({
     rooms: {
-        landing: runner((ctx) => subprocess(ctx, ROOM_CMD)),
+        landing: subprocess(ROOM_CMD),
     },
     driver,
     port: SERVER_PORT,

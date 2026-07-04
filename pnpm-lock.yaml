@@ -151,6 +151,65 @@ importers:
         specifier: workspace:*
         version: link:../../..
 
+  examples/workerd:
+    dependencies:
+      gatho:
+        specifier: workspace:*
+        version: link:../..
+      packcat:
+        specifier: 0.3.0
+        version: 0.3.0
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
+    devDependencies:
+      '@types/node':
+        specifier: ^25.6.0
+        version: 25.6.0
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
+      esbuild:
+        specifier: ^0.25.0
+        version: 0.25.9
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.2
+      workerd:
+        specifier: ^1.20250712.0
+        version: 1.20260704.1
+
+  examples/workerd/frontend:
+    dependencies:
+      gatho:
+        specifier: workspace:*
+        version: link:../../..
+      packcat:
+        specifier: 0.3.0
+        version: 0.3.0
+      react:
+        specifier: ^19.1.0
+        version: 19.2.4
+      react-dom:
+        specifier: ^19.1.0
+        version: 19.2.4(react@19.2.4)
+    devDependencies:
+      '@types/react':
+        specifier: ^19.1.0
+        version: 19.2.14
+      '@types/react-dom':
+        specifier: ^19.1.0
+        version: 19.2.3(@types/react@19.2.14)
+      '@vitejs/plugin-react':
+        specifier: ^4.5.2
+        version: 4.7.0(vite@6.4.1)
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.2
+      vite:
+        specifier: ^6.3.5
+        version: 6.4.1(@types/node@25.6.0)
+
   website/backend:
     dependencies:
       gatho:
@@ -462,6 +521,51 @@ packages:
   /@biomejs/cli-win32-x64@2.4.12:
     resolution: {integrity: sha512-yMckRzTyZ83hkk8iDFWswqSdU8tvZxspJKnYNh7JZr/zhZNOlzH13k4ecboU6MurKExCe2HUkH75pGI/O2JwGA==}
     engines: {node: '>=14.21.3'}
+    cpu: [x64]
+    os: [win32]
+    requiresBuild: true
+    dev: true
+    optional: true
+
+  /@cloudflare/workerd-darwin-64@1.20260704.1:
+    resolution: {integrity: sha512-XO+vvdhhTNZSsIWCkZ+JaE/JrFUmQAB0H0y/sVkAf32xa2TYBRvFUMwjSqf6WxtlxcKPQvmbLfpO/UQ0l/q4eQ==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [darwin]
+    requiresBuild: true
+    dev: true
+    optional: true
+
+  /@cloudflare/workerd-darwin-arm64@1.20260704.1:
+    resolution: {integrity: sha512-6iI7nbOOO8PzEQ6UZVBZB/hv95m8jl0yvyjMuWrF5cJbiLb5zPw3KnpqvGi+aeOs2ZmUkc81i1FWKfXwLXzPRA==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [darwin]
+    requiresBuild: true
+    dev: true
+    optional: true
+
+  /@cloudflare/workerd-linux-64@1.20260704.1:
+    resolution: {integrity: sha512-3mT0YHtxT7eLjghu3hKSJDUQoz+AYv8FM43nLPYhM0YiHOxr8OlmvnCb2Lp7v/U3bwd3Gnx7WEqjSppR583mGg==}
+    engines: {node: '>=16'}
+    cpu: [x64]
+    os: [linux]
+    requiresBuild: true
+    dev: true
+    optional: true
+
+  /@cloudflare/workerd-linux-arm64@1.20260704.1:
+    resolution: {integrity: sha512-Opo7cPTPg4x0WwK+eZSDszCyFLKQkOGNCWxF005HRTJ5SJH8h0K9KyrC1k4LBwx3haXSVi+E1eGqo1gZ1Hmhkg==}
+    engines: {node: '>=16'}
+    cpu: [arm64]
+    os: [linux]
+    requiresBuild: true
+    dev: true
+    optional: true
+
+  /@cloudflare/workerd-windows-64@1.20260704.1:
+    resolution: {integrity: sha512-a97Ecnzhy04x3U052VKPCNp863F7Wf00WY7Ga5P0SbtYvaO1PDzylsHrvFMPKeiDFcOwqiredawmJ+v6bhIgeQ==}
+    engines: {node: '>=16'}
     cpu: [x64]
     os: [win32]
     requiresBuild: true
@@ -3888,6 +3992,19 @@ packages:
     engines: {node: '>=8'}
     dependencies:
       string-width: 4.2.3
+    dev: true
+
+  /workerd@1.20260704.1:
+    resolution: {integrity: sha512-GDZ0jzIYDYfN7rCt/oFJv4BG3QJ+4IS2kfRvxEMY9VKIfPhzo63PH69Ir7ug8LfORCgCtmfkiQVXrqbot7pZTQ==}
+    engines: {node: '>=16'}
+    hasBin: true
+    requiresBuild: true
+    optionalDependencies:
+      '@cloudflare/workerd-darwin-64': 1.20260704.1
+      '@cloudflare/workerd-darwin-arm64': 1.20260704.1
+      '@cloudflare/workerd-linux-64': 1.20260704.1
+      '@cloudflare/workerd-linux-arm64': 1.20260704.1
+      '@cloudflare/workerd-windows-64': 1.20260704.1
     dev: true
 
   /wrap-ansi@7.0.0:

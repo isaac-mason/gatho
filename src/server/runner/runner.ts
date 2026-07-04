@@ -2,10 +2,10 @@ import type { RoomRunner, SpawnContext, SpawnResult } from './types';
 
 /** spawn context extended with runner helpers. */
 export type RunnerSpawnContext = SpawnContext & {
-    /** standard gatho environment variables built from this context — ready to spread into a process env or docker -e flags */
+    /** standard gatho environment variables built from this context — ready to spread into a
+     *  process env or docker -e flags. note: the notify channel's own env (GATHO_NOTIFY_SOCKET)
+     *  comes from the channel helper (e.g. `notify.uds(ctx)`), not from here. */
     env: Record<string, string>;
-    /** call when the room has exited, for any reason (crash, natural exit, killed, etc.) */
-    stopped(code: number | null): void;
 };
 
 /** destructor returned by the runner spawn function. called by the server to stop the room. */
@@ -17,31 +17,23 @@ export type RunnerSpawnFn = (ctx: RunnerSpawnContext) => Destructor | Promise<De
 /**
  * ergonomic factory for creating a RoomRunner.
  *
- * the provided function receives a spawn context with a `stopped` callback, sets up the room,
- * and returns a destructor. the destructor is called by the server when it wants the room to stop.
- * `ctx.stopped()` should be called when the room has exited, regardless of the reason.
+ * the provided function receives a spawn context carrying two sinks into the server core —
+ * `ctx.onMessage` (room→server notify messages) and `ctx.stopped` (the room exited) — sets up
+ * the room, and returns a destructor. the destructor is called by the server when it wants the
+ * room to stop. `ctx.stopped()` should be called when the room has exited, for any reason.
+ *
+ * how notify messages get from the room into `ctx.onMessage` is this function's business:
+ * compose a channel helper (`notify.uds(ctx)`, `notify.tcp(ctx)`, `notify.direct(ctx)`) or
+ * send on it directly to synthesize messages on the room's behalf.
  *
  * supports both sync and async spawn/destructor — async is useful for runners that need to make
- * API calls (e.g. ECS RunTask, docker create) during setup or teardown.
- *
- * bridges to the internal RoomRunner/SpawnResult interface — the server doesn't need to know
- * about this API.
+ * API calls (e.g. ECS RunTask, docker create) during setup or teardown. if an async spawn
+ * rejects, the failure is surfaced as a synthesized `{ type: 'error' }` notify message followed
+ * by `stopped(null)`.
  */
 export function runner(fn: RunnerSpawnFn): RoomRunner {
     return {
         spawn(ctx: SpawnContext): SpawnResult {
-            // buffer stopped() calls if they fire before onExit is registered
-            let bufferedCode: { code: number | null } | null = null;
-            let exitHandler: ((code: number | null) => void) | null = null;
-            let delivered = false;
-
-            function deliver(code: number | null): void {
-                if (delivered) return;
-                delivered = true;
-                if (exitHandler) exitHandler(code);
-                else bufferedCode = { code };
-            }
-
             // track destructor — may resolve later if spawn is async
             let destructor: Destructor | null = null;
             let queuedKill = false;
@@ -50,21 +42,26 @@ export function runner(fn: RunnerSpawnFn): RoomRunner {
                 ...ctx,
                 env: {
                     GATHO_ROOM_ID: ctx.roomId,
-                    GATHO_SOCKET: ctx.socket,
                     GATHO_ROOM_TYPE: ctx.roomType,
                     GATHO_SERVER_ID: ctx.serverId,
                     GATHO_ROOM_SECRET: ctx.roomSecret,
                 },
-                stopped: deliver,
             };
 
             const result = fn(runnerCtx);
 
             if (result instanceof Promise) {
-                result.then((d) => {
-                    destructor = d;
-                    if (queuedKill) destructor();
-                });
+                result
+                    .then((d) => {
+                        destructor = d;
+                        if (queuedKill) void d();
+                    })
+                    .catch((err) => {
+                        // async spawn failed — the room never started. surface the
+                        // cause and report the exit so the server can reschedule.
+                        ctx.onMessage({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+                        ctx.stopped(null);
+                    });
             } else {
                 destructor = result;
             }
@@ -72,16 +69,9 @@ export function runner(fn: RunnerSpawnFn): RoomRunner {
             return {
                 kill() {
                     if (destructor) {
-                        destructor();
+                        void destructor();
                     } else {
                         queuedKill = true;
-                    }
-                },
-                onExit(handler) {
-                    if (bufferedCode !== null) {
-                        handler(bufferedCode.code);
-                    } else {
-                        exitHandler = handler;
                     }
                 },
             };

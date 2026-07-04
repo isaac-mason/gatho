@@ -3,22 +3,19 @@
 // rooms run their own websocket servers — clients connect directly.
 // this process is control-plane only: health checks, reconciliation, leader election.
 //
-// the server owns the UDS socket for each room. it creates the socket,
-// starts listening, spawns the room process (which connects back).
-// room config is passed via env vars (GATHO_ROOM_ID, GATHO_ROOM_TYPE, etc.).
-// all ipc flows over that socket — child-to-parent only.
+// the server core does NOT own the notify channel — the runner does. spawn hands
+// the runner its message handler and exit sink (ctx.onMessage, ctx.stopped); how
+// the room's messages reach them (uds frames, tcp, in-memory) is the runner's business.
+// messages flow one direction: room → server.
 
 import { randomBytes, randomUUID } from 'crypto';
 import * as http from 'http';
 import type { Socket } from 'net';
-import { tmpdir } from 'os';
-import { dirname, join } from 'path';
 import { log } from '../common/logger';
+import type { NotifyMessage } from '../common/notify-protocol';
 import { type Punctuator, punctuate } from '../common/punctuate';
-import type { RoomMessage } from '../common/uds';
 import type { Driver, RoomData } from '../driver/types';
 import type { RoomRunner } from './runner/types';
-import { createUdsServer } from './runner/uds';
 
 /* exported types */
 
@@ -48,11 +45,14 @@ export type CreateServerOptions = {
     /** full URL for this server's HTTP endpoint, e.g. "http://localhost:3000" or "https://us-east.mysite.com".
      *  if not set, defaults to "http://{host}:{port}" using the bound address. */
     serverEndpoint?: string;
-    /** directory for the per-room UDS sockets used for server↔room IPC. defaults to
-     *  `${os.tmpdir()}/gatho-ipc`. set an explicit path when running rooms in docker
-     *  (or any other sandbox) so the same path can be bind-mounted into the container
-     *  and appear in `GATHO_SOCKET` unchanged. created if it doesn't exist. */
-    socketDir?: string;
+    /** how long a freshly spawned room may take to send its first notify message
+     *  before startup is considered failed and the room is killed. raise this when
+     *  spawning is slow — e.g. a docker runner whose first spawn pulls the image.
+     *  @default 30000 */
+    roomStartupTimeoutMs?: number;
+    /** how long a started room may go without a heartbeat before it is considered
+     *  stalled and killed (rooms heartbeat every ~3s). @default 10000 */
+    roomStallTimeoutMs?: number;
 };
 
 export type RoomDetails = {
@@ -60,6 +60,11 @@ export type RoomDetails = {
     roomType: string;
     workerRunning: boolean;
     endpoint: string | null;
+    /** the room's lifecycle as the server observes it */
+    status: 'starting' | 'ready' | 'stopped';
+    /** wall-clock ms of the room's last heartbeat (or first notify message),
+     *  null before the room has spoken */
+    lastHeartbeatAt: number | null;
 };
 
 export type Server = {
@@ -77,8 +82,8 @@ type RoomProcess = {
     roomType: string;
     roomSecret: string;
     endpoint: string | null;
+    status(): 'starting' | 'ready' | 'stopped';
     kill(): void;
-    closeIpc(): void;
     exited: Promise<void>;
     markExited(): void;
 };
@@ -92,7 +97,6 @@ type ServerState = {
     host: string;
     serverId: string;
     knownRoomTypes: Set<string>;
-    socketDir: string;
 
     // processes
     processes: Map<string, RoomProcess>;
@@ -137,15 +141,18 @@ const LEADER_LOOP_INTERVAL_MS = 10_000;
 const LEADER_LOOP_TIMEOUT_MS = 5_000;
 const HEARTBEAT_TICK_TIMEOUT_MS = 5_000;
 
-/** how long a room process can go without a heartbeat before we consider it stalled and kill it. */
-const ROOM_STALL_TIMEOUT_MS = 10_000;
+/** default for CreateServerOptions.roomStallTimeoutMs */
+const DEFAULT_ROOM_STALL_TIMEOUT_MS = 10_000;
+
+/** default for CreateServerOptions.roomStartupTimeoutMs */
+const DEFAULT_ROOM_STARTUP_TIMEOUT_MS = 30_000;
 
 /* centralized room cleanup */
 
 // single cleanup path for a room process. idempotent — no-ops if already cleaned up.
-// all teardown paths (ipc close, process exit, self-stop, heartbeat timeout)
-// go through here instead of doing inline cleanup.
-type CleanupReason = 'ipc-closed' | 'process-exited' | 'self-stopped' | 'heartbeat-timeout';
+// all teardown paths (process exit, self-stop, heartbeat timeout) go through here
+// instead of doing inline cleanup.
+type CleanupReason = 'process-exited' | 'self-stopped' | 'heartbeat-timeout';
 
 function cleanupRoom(s: ServerState, roomId: string, reason: CleanupReason): void {
     const proc = s.processes.get(roomId);
@@ -153,7 +160,6 @@ function cleanupRoom(s: ServerState, roomId: string, reason: CleanupReason): voi
 
     s.processes.delete(roomId);
     s.lastHeartbeats.delete(roomId);
-    proc.closeIpc();
     proc.markExited();
 
     log.info('room cleaned up', { roomId, reason });
@@ -171,7 +177,6 @@ function cleanupRoom(s: ServerState, roomId: string, reason: CleanupReason): voi
                 log.error('failed to report room failure', { roomId, err });
             });
             break;
-        case 'ipc-closed':
         case 'process-exited':
             if (s.killedRoomIds.has(roomId)) {
                 // expected — server initiated the kill, reconciler handles
@@ -242,9 +247,9 @@ export async function reconcileClients(
     }
 }
 
-// handle all ipc messages from a room subprocess.
-// single dispatch point — every ChildToParent message type is handled here.
-function handleIpcMessage(s: ServerState, roomId: string, msg: RoomMessage): void {
+// handle all notify messages from a room.
+// single dispatch point — every room→server message type is handled here.
+function handleNotifyMessage(s: ServerState, roomId: string, msg: NotifyMessage): void {
     switch (msg.type) {
         case 'heartbeat': {
             s.lastHeartbeats.set(roomId, Date.now());
@@ -253,10 +258,10 @@ function handleIpcMessage(s: ServerState, roomId: string, msg: RoomMessage): voi
             log.debug('room heartbeat', {
                 roomId,
                 roomType: proc?.roomType,
-                memoryRss: msg.metrics.memoryRss,
-                memoryHeapUsed: msg.metrics.memoryHeapUsed,
-                cpuUser: msg.metrics.cpuUser,
-                cpuSystem: msg.metrics.cpuSystem,
+                memoryRss: msg.metrics?.memoryRss,
+                memoryHeapUsed: msg.metrics?.memoryHeapUsed,
+                cpuUser: msg.metrics?.cpuUser,
+                cpuSystem: msg.metrics?.cpuSystem,
                 clientCount: msg.clients.length,
             });
 
@@ -308,35 +313,15 @@ function handleIpcMessage(s: ServerState, roomId: string, msg: RoomMessage): voi
 
 /* room lifecycle */
 
-/**
- * Build the per-room UDS socket path: `socketDir/<roomId>/sock`.
- *
- * The per-room subdirectory (rather than a flat `socketDir/<roomId>.sock`) is what
- * lets a container runner mount each room only its own socket dir, isolating the
- * IPC channel from sibling rooms. `roomId` becomes a path segment, so reject
- * anything that could escape `socketDir`.
- *
- * The socket filename is kept to `sock` (not e.g. `room.sock`) on purpose: unix
- * socket paths have a hard length limit (~104 bytes on macOS) and the per-room
- * subdir already costs the `roomId` segment. `<roomId>/sock` is the same length as
- * the old flat `<roomId>.sock`, so we don't regress paths that used to fit. Don't
- * lengthen this filename without re-checking that limit on the longest socketDir.
- */
-export function roomSocketPath(socketDir: string, roomId: string): string {
-    if (roomId.includes('/') || roomId.includes('\\') || roomId === '.' || roomId === '..') {
-        throw new Error(`invalid roomId for socket path: ${JSON.stringify(roomId)}`);
-    }
-    return join(socketDir, roomId, 'sock');
-}
-
-// spawn a new room subprocess via the injected runner.
-// 1. creates a UDS socket at socketDir/roomId/sock and starts listening.
-//    the per-room subdirectory (rather than a flat socketDir/roomId.sock) lets
-//    container runners mount each room only its own socket dir, isolating the
-//    IPC channel from sibling rooms — see SpawnContext.socketDir.
-// 2. calls runner.spawn() to start the process (which connects back)
-// 3. ipc messages from the child are handled by handleIpcMessage()
-// 4. when the room sends 'ready' with wsPort, computes endpoint and registers with driver
+// spawn a new room via the injected runner.
+// 1. registers the room process handle, then calls runner.spawn() with two
+//    injected sinks: `notifier` (room→server notify messages, however the runner
+//    chooses to carry them) and `stopped` (the runner's observation that the
+//    room exited).
+// 2. waits for the room's first notify message before resolving — a room that
+//    exits or stays silent past the startup timeout is a spawn failure.
+// 3. when the room sends 'ready' with its ws port, computes the endpoint and
+//    registers with the driver.
 async function createRoom(s: ServerState, roomId: string, roomType: string, data: RoomData): Promise<RoomProcess> {
     const runner = s.runners.get(roomType);
     if (!runner) {
@@ -344,76 +329,98 @@ async function createRoom(s: ServerState, roomId: string, roomType: string, data
     }
 
     const roomSecret = randomBytes(32).toString('base64url');
-    const socketPath = roomSocketPath(s.socketDir, roomId);
 
     let resolveExited: () => void;
     const exited = new Promise<void>((r) => {
         resolveExited = r;
     });
 
+    // startup gate: resolves on the room's first notify message, rejects if the
+    // room exits (or stays silent past the timeout) before ever speaking.
+    let started = false;
+    let stoppedCalled = false;
+    let status: 'starting' | 'ready' | 'stopped' = 'starting';
+
     const roomProcess: RoomProcess = {
         roomId,
         roomType,
         roomSecret,
         endpoint: null,
+        status: () => status,
         kill: () => {},
-        closeIpc: () => {},
         exited,
         markExited: () => resolveExited(),
     };
 
-    function onMessage(msg: RoomMessage): void {
-        handleIpcMessage(s, roomId, msg);
-    }
-
-    // start listening on UDS socket — don't await yet, we need to spawn first.
-    // createUdsServer resolves when the child connects, so we must spawn the
-    // child process before awaiting, otherwise it's a deadlock.
-    const udsPromise = createUdsServer(socketPath, onMessage, {
-        timeoutMs: 30_000,
-        onClose() {
-            cleanupRoom(s, roomId, 'ipc-closed');
-        },
+    // register before spawn — the room's first notify message (often `ready`)
+    // must find the process entry in place. note: lastHeartbeats is NOT seeded
+    // here — the stall sweep must not tick against a room that hasn't spoken
+    // yet, or it would cut the startup budget down to the stall timeout.
+    // the clock starts on the first notify message.
+    s.processes.set(roomId, roomProcess);
+    let settleStarted!: { resolve: () => void; reject: (err: Error) => void };
+    const startedPromise = new Promise<void>((resolve, reject) => {
+        settleStarted = { resolve, reject };
     });
 
-    // spawn the room process — it will connect back to our socket
+    const onMessage = (msg: NotifyMessage): void => {
+        // drop messages once the room has exited or been cleaned up — a late
+        // heartbeat must not resurrect bookkeeping for a dead room.
+        if (stoppedCalled || !s.processes.has(roomId)) return;
+        if (!started) {
+            started = true;
+            s.lastHeartbeats.set(roomId, Date.now());
+            settleStarted.resolve();
+        }
+        if (msg.type === 'ready' && status === 'starting') status = 'ready';
+        if (msg.type === 'stopped') status = 'stopped';
+        handleNotifyMessage(s, roomId, msg);
+    };
+
+    function stopped(code: number | null): void {
+        if (stoppedCalled) return;
+        stoppedCalled = true;
+        status = 'stopped';
+        if (!started) {
+            settleStarted.reject(new Error(`room process exited during startup (code ${code})`));
+        } else {
+            cleanupRoom(s, roomId, 'process-exited');
+        }
+    }
+
     const spawnResult = runner.spawn({
         roomId,
         roomType,
         serverId: s.serverId,
         roomSecret,
         data,
-        socket: socketPath,
-        socketDir: dirname(socketPath),
+        onMessage,
+        stopped,
+        status: () => status,
     });
 
-    // race UDS connection against child exit — if the child crashes before
-    // connecting (bad path, syntax error, etc.), we reject immediately instead
-    // of blocking for the full 30s UDS timeout.
-    //
-    // we also wire the post-startup exit handler here (guarded by `started`) so
-    // there's no window between the race resolving and the handler being attached
-    // where a fast crash could go undetected.
-    let started = false;
-    const childExited = new Promise<never>((_, reject) => {
-        spawnResult.onExit((code) => {
-            if (!started) {
-                reject(new Error(`room process exited during startup (code ${code})`));
-            } else {
-                cleanupRoom(s, roomId, 'process-exited');
-            }
-        });
-    });
-
-    const uds = await Promise.race([udsPromise, childExited]);
-    started = true;
-
-    // wire up the room process handle
     roomProcess.kill = () => spawnResult.kill();
-    roomProcess.closeIpc = () => uds.close();
 
-    s.processes.set(roomId, roomProcess);
-    s.lastHeartbeats.set(roomId, Date.now());
+    const startupTimeoutMs = s.options.roomStartupTimeoutMs ?? DEFAULT_ROOM_STARTUP_TIMEOUT_MS;
+    const startupTimeout = setTimeout(() => {
+        settleStarted.reject(new Error(`room sent no notify message within ${startupTimeoutMs}ms`));
+    }, startupTimeoutMs);
+    startupTimeout.unref();
+
+    try {
+        await startedPromise;
+    } catch (err) {
+        // startup failed — unregister and make sure nothing lingers. on the
+        // timeout path the room may still be running; kill() is a no-op for a
+        // room that already exited.
+        s.processes.delete(roomId);
+        s.lastHeartbeats.delete(roomId);
+        spawnResult.kill();
+        roomProcess.markExited();
+        throw err;
+    } finally {
+        clearTimeout(startupTimeout);
+    }
 
     return roomProcess;
 }
@@ -441,8 +448,9 @@ function shutdownAllWorkers(s: ServerState): void {
 // kills stalled processes and reports failure to the driver.
 function checkHeartbeats(s: ServerState): void {
     const now = Date.now();
+    const stallTimeoutMs = s.options.roomStallTimeoutMs ?? DEFAULT_ROOM_STALL_TIMEOUT_MS;
     for (const [roomId, lastBeat] of s.lastHeartbeats) {
-        if (now - lastBeat > ROOM_STALL_TIMEOUT_MS) {
+        if (now - lastBeat > stallTimeoutMs) {
             const roomProcess = s.processes.get(roomId);
             if (roomProcess) {
                 log.warn('process stalled, killing', { roomId, stalledMs: now - lastBeat });
@@ -750,6 +758,8 @@ function getRoomDetails(s: ServerState, roomId: string): RoomDetails | null {
         roomType: roomProcess.roomType,
         workerRunning: true,
         endpoint: roomProcess.endpoint,
+        status: roomProcess.status(),
+        lastHeartbeatAt: s.lastHeartbeats.get(roomId) ?? null,
     };
 }
 
@@ -761,6 +771,8 @@ function getAllRoomDetails(s: ServerState): RoomDetails[] {
             roomType: roomProcess.roomType,
             workerRunning: true,
             endpoint: roomProcess.endpoint,
+            status: roomProcess.status(),
+            lastHeartbeatAt: s.lastHeartbeats.get(roomProcess.roomId) ?? null,
         });
     }
     return details;
@@ -771,7 +783,6 @@ function getAllRoomDetails(s: ServerState): RoomDetails[] {
 export async function start(options: CreateServerOptions): Promise<Server> {
     const { _internal: driver } = options.driver;
     const runners = new Map(Object.entries(options.rooms));
-    const socketDir = options.socketDir ?? join(tmpdir(), 'gatho-ipc');
 
     const s: ServerState = {
         options,
@@ -781,7 +792,6 @@ export async function start(options: CreateServerOptions): Promise<Server> {
         host: options.host ?? '0.0.0.0',
         serverId: randomUUID(),
         knownRoomTypes: new Set(Object.keys(options.rooms)),
-        socketDir,
 
         processes: new Map(),
         lastHeartbeats: new Map(),

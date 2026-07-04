@@ -4,8 +4,7 @@
 // pub/sub is implemented manually since ws doesn't have built-in
 // topic-based broadcast like uWebSockets.js.
 
-import { createServer } from 'http';
-import { type WebSocket, WebSocketServer } from 'ws';
+import type { WebSocket } from 'ws';
 import type { ClientSocket, Transport, TransportHandlers, TransportListenConfig, TransportServer } from './types';
 
 // ws-specific configuration — pass through to the ws library directly.
@@ -26,7 +25,14 @@ type ConnectionState = {
 
 export function wsTransport(config?: WsTransportConfig): Transport {
     return {
-        listen(handlers: TransportHandlers, listenConfig?: TransportListenConfig): Promise<TransportServer> {
+        async listen(handlers: TransportHandlers, listenConfig?: TransportListenConfig): Promise<TransportServer> {
+            // `ws` and `http` load lazily, inside listen() — same pattern as
+            // node:net in room/ipc.ts. a bundle for a runtime that supplies its
+            // own transport (e.g. a workerd isolate) carries these as inert
+            // dynamic imports and never executes them, so no shims are needed.
+            const { createServer } = await import('http');
+            const { WebSocketServer } = await import('ws');
+
             return new Promise((resolve, reject) => {
                 const httpServer = createServer((_req, res) => {
                     // reject plain http requests — this server is ws-only
@@ -49,17 +55,36 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                 // topic subscriptions: topic -> set of ws instances
                 const topics = new Map<string, Set<WebSocket>>();
 
-                // handle http upgrade — this is where auth happens
+                // handle http upgrade — this is where auth happens.
+                // upgrade() may be async (webcrypto jwt verify); the raw socket just
+                // buffers until handleUpgrade consumes it.
                 httpServer.on('upgrade', (req, socket, head) => {
                     const query = req.url?.split('?')[1] ?? '';
 
-                    const result = handlers.upgrade(query);
-                    if (!result) {
-                        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-                        socket.destroy();
-                        return;
-                    }
+                    Promise.resolve(handlers.upgrade(query))
+                        .then((result) => {
+                            if (socket.destroyed) return;
+                            if (!result) {
+                                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                                socket.destroy();
+                                return;
+                            }
+                            completeUpgrade(req, socket, head, result);
+                        })
+                        .catch(() => {
+                            socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+                            socket.destroy();
+                        });
+                });
 
+                type UpgradeResultResolved = NonNullable<Awaited<ReturnType<TransportHandlers['upgrade']>>>;
+
+                function completeUpgrade(
+                    req: import('http').IncomingMessage,
+                    socket: import('stream').Duplex,
+                    head: Buffer,
+                    result: UpgradeResultResolved,
+                ): void {
                     const { clientId, reconnecting } = result;
                     const joinData = result.joinData ?? {};
                     const tags = result.tags ?? {};
@@ -158,7 +183,7 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                             handlers.close(clientId, code);
                         });
                     });
-                });
+                }
 
                 // listen on configured port, or 0 for os-assigned
                 httpServer.listen(listenConfig?.port ?? 0, () => {

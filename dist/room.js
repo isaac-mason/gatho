@@ -1,90 +1,3 @@
-import { createHmac, randomUUID, randomBytes } from 'node:crypto';
-import { createConnection } from 'node:net';
-import { createServer } from 'http';
-import { WebSocketServer } from 'ws';
-
-// minimal hmac-sha256 jwt — no external deps.
-// single source of truth for sign + verify across drivers and room workers.
-// static header — always the same, computed once
-Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-/** verify a compact jwt string, returns the payload or null if invalid/expired */
-function jwtVerify(token, secret) {
-    const parts = token.split('.');
-    if (parts.length !== 3)
-        return null;
-    const [header, body, signature] = parts;
-    const expected = createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url');
-    if (signature !== expected)
-        return null;
-    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
-    if (typeof payload.exp === 'number' && Date.now() > payload.exp)
-        return null;
-    return payload;
-}
-
-// structured json line logger
-// emits ndjson to stdout/stderr, supports child loggers for scoped context
-const LEVEL_VALUES = {
-    debug: 0,
-    info: 1,
-    warn: 2,
-    error: 3,
-};
-function resolveLevel() {
-    const env = (typeof process !== 'undefined' && process.env?.GATHO_LOG_LEVEL) || '';
-    const lower = env.toLowerCase();
-    if (lower in LEVEL_VALUES)
-        return lower;
-    return 'info';
-}
-// serialize a value, handling Error instances that JSON.stringify turns into {}
-function serializeValue(value) {
-    if (value instanceof Error) {
-        return { message: value.message, stack: value.stack };
-    }
-    return value;
-}
-function buildLine(level, msg, context, fields) {
-    const entry = { ts: Date.now(), level, msg };
-    for (const key in context) {
-        entry[key] = serializeValue(context[key]);
-    }
-    if (fields) {
-        for (const key in fields) {
-            entry[key] = serializeValue(fields[key]);
-        }
-    }
-    return JSON.stringify(entry);
-}
-function createLoggerInternal(minLevel, context) {
-    function log(level, msg, fields) {
-        if (LEVEL_VALUES[level] < minLevel)
-            return;
-        const line = buildLine(level, msg, context, fields);
-        if (level === 'error') {
-            process.stderr.write(`${line}\n`);
-        }
-        else {
-            process.stdout.write(`${line}\n`);
-        }
-    }
-    return {
-        debug: (msg, fields) => log('debug', msg, fields),
-        info: (msg, fields) => log('info', msg, fields),
-        warn: (msg, fields) => log('warn', msg, fields),
-        error: (msg, fields) => log('error', msg, fields),
-        child(fields) {
-            return createLoggerInternal(minLevel, { ...context, ...fields });
-        },
-    };
-}
-function createLogger(options) {
-    const level = resolveLevel();
-    return createLoggerInternal(LEVEL_VALUES[level], {});
-}
-// module-scope singleton — reads GATHO_LOG_LEVEL at import time
-createLogger();
-
 /* lightweight helpers that just return objects */
 /**
  * Boolean schema - stores true/false values using 1 byte.
@@ -129,7 +42,7 @@ const uint16 = () => ({ type: 'uint16' });
  */
 const float64 = () => ({ type: 'float64' });
 function list(of, length) {
-    return (length === undefined ? { type: 'list', of } : { type: 'list', of, length });
+    return ({ type: 'list', of } );
 }
 /**
  * Object schema - fixed set of named fields.
@@ -184,6 +97,21 @@ const record = (field) => ({
 const literal = (value) => {
     return { type: 'literal', value };
 };
+/**
+ * Optional schema - value that can be undefined.
+ *
+ * Uses 1 byte to indicate presence (0=undefined, 1=present), followed by the value if defined.
+ *
+ * @param of - Schema for the defined value
+ * @returns An optional schema definition
+ *
+ * @example
+ * optional(uint32()) // number | undefined
+ *
+ * @example
+ * optional(string()) // string | undefined
+ */
+const optional = (of) => ({ type: 'optional', of });
 /**
  * Union schema - discriminated union of object variants.
  *
@@ -1892,6 +1820,240 @@ function writeString(ctx, value, offset = 'o') {
     return code;
 }
 
+// notify protocol — the room→server notification schema and framing.
+//
+// messages flow one direction: room → server. the server never speaks back on
+// this channel (stop is delivered out-of-band by the runner's destructor).
+//
+// this module is runtime-neutral on purpose: no Buffer, no node imports. the
+// uds and tcp channels both carry these frames; the direct (in-memory) channel
+// skips framing and passes messages by reference; non-node runtimes (workerd,
+// deno, bun) can use the codec + frame helpers to speak the same protocol.
+//
+// frame format: length(4 bytes, uint32 BE) + payload(length bytes).
+// notify frames carry a packcat-encoded NotifyMessage payload. the tcp channel
+// additionally sends one raw frame first: the utf-8 auth token.
+// --- message schema ---
+const ProcessMetrics = object({
+    memoryRss: float64(),
+    memoryHeapUsed: float64(),
+    memoryHeapTotal: float64(),
+    cpuUser: float64(),
+    cpuSystem: float64(),
+});
+const Ready = object({
+    type: literal('ready'),
+    port: uint16(),
+});
+const HeartbeatClient = object({
+    clientId: string(),
+    tags: record(string()),
+});
+const Heartbeat = object({
+    type: literal('heartbeat'),
+    timestamp: float64(),
+    // optional: not every room runtime can report process metrics (e.g. a
+    // workerd isolate has no process.memoryUsage)
+    metrics: optional(ProcessMetrics),
+    clients: list(HeartbeatClient),
+});
+const ClientConnected = object({
+    type: literal('client-connected'),
+    clientId: string(),
+    roomId: string(),
+    tags: record(string()),
+});
+const ClientDisconnected = object({
+    type: literal('client-disconnected'),
+    clientId: string(),
+});
+const ErrorMsg = object({
+    type: literal('error'),
+    message: string(),
+});
+const Stopped = object({
+    type: literal('stopped'),
+});
+const NotifyMessageSchema = union('type', [Ready, Heartbeat, ClientConnected, ClientDisconnected, ErrorMsg, Stopped]);
+const notifyCodec = build(NotifyMessageSchema);
+// --- framing ---
+// header: 4 bytes uint32 BE length
+const HEADER_SIZE = 4;
+/** wrap raw payload bytes in a length-prefixed frame */
+function encodeRawFrame(payload) {
+    const frame = new Uint8Array(HEADER_SIZE + payload.byteLength);
+    new DataView(frame.buffer).setUint32(0, payload.byteLength, false);
+    frame.set(payload, HEADER_SIZE);
+    return frame;
+}
+/** encode a notify message as a length-prefixed frame, ready to write to any pipe */
+function encodeNotifyFrame(msg) {
+    return encodeRawFrame(notifyCodec.pack(msg));
+}
+/** streaming frame parser — handles partial reads and buffering across chunks.
+ *  returns a push function that accepts raw chunks and invokes `onFrame` with
+ *  each complete payload (header stripped). */
+function createFrameParser(onFrame) {
+    let buffer = new Uint8Array(0);
+    return (data) => {
+        if (buffer.byteLength === 0) {
+            buffer = data;
+        }
+        else {
+            const merged = new Uint8Array(buffer.byteLength + data.byteLength);
+            merged.set(buffer, 0);
+            merged.set(data, buffer.byteLength);
+            buffer = merged;
+        }
+        while (buffer.byteLength >= HEADER_SIZE) {
+            const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+            const payloadLength = view.getUint32(0, false);
+            const totalFrameSize = HEADER_SIZE + payloadLength;
+            if (buffer.byteLength < totalFrameSize)
+                break;
+            const payload = buffer.subarray(HEADER_SIZE, totalFrameSize);
+            buffer = buffer.subarray(totalFrameSize);
+            onFrame(payload);
+        }
+    };
+}
+
+// minimal hmac-sha256 jwt — no external deps.
+// single source of truth for sign + verify across drivers and rooms.
+//
+// built on WebCrypto (async) rather than node:crypto so the verify side runs
+// in any runtime a room might be hosted in (node, workerd, deno, bun).
+const encoder = new TextEncoder();
+function toBase64Url(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++)
+        bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+function fromBase64Url(s) {
+    const b64 = s.replaceAll('-', '+').replaceAll('_', '/');
+    const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), '=');
+    const bin = atob(padded);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++)
+        bytes[i] = bin.charCodeAt(i);
+    return bytes;
+}
+// CryptoKey cache — importKey is an async round-trip and sign/verify sit on hot
+// paths (every reservation, every ws upgrade). keyed by usage+secret; capped so
+// a long-lived process signing for many rooms doesn't grow unboundedly (Map
+// iteration order = insertion order, so evicting the first entry is FIFO).
+const KEY_CACHE_MAX = 256;
+const keyCache = new Map();
+function hmacKey(secret, usage) {
+    const cacheKey = `${usage}:${secret}`;
+    const cached = keyCache.get(cacheKey);
+    if (cached)
+        return cached;
+    const key = crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [usage]);
+    if (keyCache.size >= KEY_CACHE_MAX) {
+        const oldest = keyCache.keys().next().value;
+        if (oldest !== undefined)
+            keyCache.delete(oldest);
+    }
+    keyCache.set(cacheKey, key);
+    key.catch(() => keyCache.delete(cacheKey));
+    return key;
+}
+// static header — always the same, computed once
+toBase64Url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+/** verify a compact jwt string, returns the payload or null if invalid/expired */
+async function jwtVerify(token, secret) {
+    const parts = token.split('.');
+    if (parts.length !== 3)
+        return null;
+    const [header, body, signature] = parts;
+    let valid;
+    try {
+        const key = await hmacKey(secret, 'verify');
+        // subtle.verify rather than a string compare — constant-time on the mac check
+        valid = await crypto.subtle.verify('HMAC', key, fromBase64Url(signature), encoder.encode(`${header}.${body}`));
+    }
+    catch {
+        return null; // malformed base64url etc.
+    }
+    if (!valid)
+        return null;
+    let payload;
+    try {
+        payload = JSON.parse(new TextDecoder().decode(fromBase64Url(body)));
+    }
+    catch {
+        return null;
+    }
+    if (typeof payload.exp === 'number' && Date.now() > payload.exp)
+        return null;
+    return payload;
+}
+
+// structured json line logger
+// emits ndjson to stdout/stderr, supports child loggers for scoped context
+const LEVEL_VALUES = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3,
+};
+function resolveLevel() {
+    const env = (typeof process !== 'undefined' && process.env?.GATHO_LOG_LEVEL) || '';
+    const lower = env.toLowerCase();
+    if (lower in LEVEL_VALUES)
+        return lower;
+    return 'info';
+}
+// serialize a value, handling Error instances that JSON.stringify turns into {}
+function serializeValue(value) {
+    if (value instanceof Error) {
+        return { message: value.message, stack: value.stack };
+    }
+    return value;
+}
+function buildLine(level, msg, context, fields) {
+    const entry = { ts: Date.now(), level, msg };
+    for (const key in context) {
+        entry[key] = serializeValue(context[key]);
+    }
+    if (fields) {
+        for (const key in fields) {
+            entry[key] = serializeValue(fields[key]);
+        }
+    }
+    return JSON.stringify(entry);
+}
+function createLoggerInternal(minLevel, context) {
+    function log(level, msg, fields) {
+        if (LEVEL_VALUES[level] < minLevel)
+            return;
+        const line = buildLine(level, msg, context, fields);
+        if (level === 'error') {
+            process.stderr.write(`${line}\n`);
+        }
+        else {
+            process.stdout.write(`${line}\n`);
+        }
+    }
+    return {
+        debug: (msg, fields) => log('debug', msg, fields),
+        info: (msg, fields) => log('info', msg, fields),
+        warn: (msg, fields) => log('warn', msg, fields),
+        error: (msg, fields) => log('error', msg, fields),
+        child(fields) {
+            return createLoggerInternal(minLevel, { ...context, ...fields });
+        },
+    };
+}
+function createLogger(options) {
+    const level = resolveLevel();
+    return createLoggerInternal(LEVEL_VALUES[level], {});
+}
+// module-scope singleton — reads GATHO_LOG_LEVEL at import time
+createLogger();
+
 // wire framing for gatho websocket connections.
 //
 // every websocket message is a binary frame. byte 0 is the frame type:
@@ -1983,80 +2145,65 @@ function frameUserMessage(message) {
     return packUserBinary(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
 }
 
-// uds ipc protocol — packcat-encoded, length-prefixed framing.
+// room-side notify link (node runtimes): dial the parent server's notify
+// channel over uds or tcp. rooms only ever send to the server — they never
+// receive. so no frame reading is needed; we just wire up the send side.
 //
-// frame format: length(4 bytes, uint32 BE) + payload(length bytes, packcat-encoded RoomMessage)
-//
-// messages flow one direction: room → server.
-// --- message schema ---
-const ProcessMetrics = object({
-    memoryRss: float64(),
-    memoryHeapUsed: float64(),
-    memoryHeapTotal: float64(),
-    cpuUser: float64(),
-    cpuSystem: float64(),
-});
-const Ready = object({
-    type: literal('ready'),
-    port: uint16(),
-});
-const HeartbeatClient = object({
-    clientId: string(),
-    tags: record(string()),
-});
-const Heartbeat = object({
-    type: literal('heartbeat'),
-    timestamp: float64(),
-    metrics: ProcessMetrics,
-    clients: list(HeartbeatClient),
-});
-const ClientConnected = object({
-    type: literal('client-connected'),
-    clientId: string(),
-    roomId: string(),
-    tags: record(string()),
-});
-const ClientDisconnected = object({
-    type: literal('client-disconnected'),
-    clientId: string(),
-});
-const ErrorMsg = object({
-    type: literal('error'),
-    message: string(),
-});
-const Stopped = object({
-    type: literal('stopped'),
-});
-const RoomMessageSchema = union('type', [Ready, Heartbeat, ClientConnected, ClientDisconnected, ErrorMsg, Stopped]);
-const ipcCodec = build(RoomMessageSchema);
-// --- framing ---
-// header: 4 bytes uint32 BE length
-const HEADER_SIZE = 4;
-// encode and write a length-prefixed packcat frame
-function sendMessage(socket, msg) {
-    const payload = ipcCodec.pack(msg);
-    const frame = Buffer.alloc(HEADER_SIZE + payload.byteLength);
-    frame.writeUInt32BE(payload.byteLength, 0);
-    frame.set(payload, HEADER_SIZE);
-    socket.write(frame);
+// non-node runtimes don't use this module — they construct a Notifier from
+// whatever pipe their host provides (e.g. a workerd service binding) or use
+// the frame helpers in common/notify-protocol directly.
+/** parse a notify target: `uds:<path>`, `tcp://host:port?token=...`, or a bare
+ *  filesystem path (treated as a uds socket path). */
+function parseNotifyTarget(uri) {
+    if (uri.startsWith('uds:')) {
+        return { kind: 'uds', path: uri.slice('uds:'.length) };
+    }
+    if (uri.startsWith('tcp://')) {
+        const url = new URL(uri);
+        const port = Number(url.port);
+        if (!Number.isInteger(port) || port <= 0) {
+            throw new Error(`notify: invalid tcp port in ${JSON.stringify(uri)}`);
+        }
+        return {
+            kind: 'tcp',
+            host: url.hostname,
+            port,
+            token: url.searchParams.get('token') ?? '',
+        };
+    }
+    if (uri.includes('://')) {
+        throw new Error(`notify: unsupported uri scheme in ${JSON.stringify(uri)} (expected uds: or tcp://)`);
+    }
+    // schemeless — a plain socket path
+    return { kind: 'uds', path: uri };
 }
-
-// room-side ipc: connect to the parent server's uds socket.
-// rooms only ever send to the server — they never receive.
-// so no frame reading is needed; we just wire up the send side.
-function connectToSocket(socketPath, options) {
+/** dial a parsed notify target */
+async function connectNotify(target, options) {
+    const { createConnection } = await import('node:net');
+    if (target.kind === 'uds') {
+        return dial(() => createConnection({ path: target.path }), `uds ${target.path}`, null);
+    }
+    return dial(() => createConnection({ host: target.host, port: target.port }), `tcp ${target.host}:${target.port}`, target.token);
+}
+// shared dial-with-retry. for tcp, the auth token is written as the first
+// frame immediately on connect — the server drops the connection if it's
+// missing or wrong.
+function dial(connect, label, token, options) {
     const maxRetries = 50;
     const retryDelay = 20;
     return new Promise((resolve, reject) => {
         let attempt = 0;
         const tryConnect = () => {
-            const socket = createConnection({ path: socketPath });
+            const socket = connect();
             let connected = false;
             socket.on('connect', () => {
                 connected = true;
+                if (token !== null) {
+                    socket.write(encodeRawFrame(new TextEncoder().encode(token)));
+                }
                 resolve({
                     send(msg) {
-                        sendMessage(socket, msg);
+                        socket.write(encodeNotifyFrame(msg));
                     },
                     close() {
                         socket.destroy();
@@ -2069,7 +2216,7 @@ function connectToSocket(socketPath, options) {
                 socket.destroy();
                 attempt++;
                 if (attempt >= maxRetries) {
-                    reject(new Error(`uds: failed to connect to ${socketPath} after ${maxRetries} attempts: ${error.message}`));
+                    reject(new Error(`notify: failed to connect to ${label} after ${maxRetries} attempts: ${error.message}`));
                     return;
                 }
                 setTimeout(tryConnect, retryDelay);
@@ -2086,7 +2233,13 @@ function connectToSocket(socketPath, options) {
 // topic-based broadcast like uWebSockets.js.
 function wsTransport(config) {
     return {
-        listen(handlers, listenConfig) {
+        async listen(handlers, listenConfig) {
+            // `ws` and `http` load lazily, inside listen() — same pattern as
+            // node:net in room/ipc.ts. a bundle for a runtime that supplies its
+            // own transport (e.g. a workerd isolate) carries these as inert
+            // dynamic imports and never executes them, so no shims are needed.
+            const { createServer } = await import('http');
+            const { WebSocketServer } = await import('ws');
             return new Promise((resolve, reject) => {
                 const httpServer = createServer((_req, res) => {
                     // reject plain http requests — this server is ws-only
@@ -2104,15 +2257,28 @@ function wsTransport(config) {
                 const clientSockets = new Map();
                 // topic subscriptions: topic -> set of ws instances
                 const topics = new Map();
-                // handle http upgrade — this is where auth happens
+                // handle http upgrade — this is where auth happens.
+                // upgrade() may be async (webcrypto jwt verify); the raw socket just
+                // buffers until handleUpgrade consumes it.
                 httpServer.on('upgrade', (req, socket, head) => {
                     const query = req.url?.split('?')[1] ?? '';
-                    const result = handlers.upgrade(query);
-                    if (!result) {
-                        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                    Promise.resolve(handlers.upgrade(query))
+                        .then((result) => {
+                        if (socket.destroyed)
+                            return;
+                        if (!result) {
+                            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                            socket.destroy();
+                            return;
+                        }
+                        completeUpgrade(req, socket, head, result);
+                    })
+                        .catch(() => {
+                        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
                         socket.destroy();
-                        return;
-                    }
+                    });
+                });
+                function completeUpgrade(req, socket, head, result) {
                     const { clientId, reconnecting } = result;
                     const joinData = result.joinData ?? {};
                     const tags = result.tags ?? {};
@@ -2206,7 +2372,7 @@ function wsTransport(config) {
                             handlers.close(clientId, code);
                         });
                     });
-                });
+                }
                 // listen on configured port, or 0 for os-assigned
                 httpServer.listen(listenConfig?.port ?? 0, () => {
                     const addr = httpServer.address();
@@ -2244,6 +2410,21 @@ function wsTransport(config) {
 }
 
 const HEARTBEAT_INTERVAL_MS = 3000;
+// --- runtime-neutral helpers ---
+// the room engine runs in node, bun, deno, and workerd isolates. node-only
+// surfaces (process env/metrics/signals, node:net) are feature-detected or
+// lazily imported; entropy comes from webcrypto.
+function readEnv(key) {
+    return typeof process !== 'undefined' ? process.env?.[key] : undefined;
+}
+function randomHex(byteLength) {
+    const buf = new Uint8Array(byteLength);
+    crypto.getRandomValues(buf);
+    let hex = '';
+    for (const b of buf)
+        hex += b.toString(16).padStart(2, '0');
+    return hex;
+}
 function safeCall(log, label, fn) {
     Promise.resolve()
         .then(fn)
@@ -2411,18 +2592,24 @@ function startHeartbeat(state) {
                 clients.push({ clientId: id, tags: tracked.tags });
             }
         }
-        const mem = process.memoryUsage();
-        const cpu = process.cpuUsage();
-        ipc.send({
-            type: 'heartbeat',
-            timestamp: Date.now(),
-            metrics: {
+        // process metrics are node/bun-only — omitted where the runtime can't
+        // report them (e.g. workerd isolates). the wire schema marks them optional.
+        let metrics;
+        if (typeof process !== 'undefined' && typeof process.memoryUsage === 'function' && typeof process.cpuUsage === 'function') {
+            const mem = process.memoryUsage();
+            const cpu = process.cpuUsage();
+            metrics = {
                 memoryRss: mem.rss,
                 memoryHeapUsed: mem.heapUsed,
                 memoryHeapTotal: mem.heapTotal,
                 cpuUser: cpu.user,
                 cpuSystem: cpu.system,
-            },
+            };
+        }
+        ipc.send({
+            type: 'heartbeat',
+            timestamp: Date.now(),
+            metrics,
             clients,
         });
     }, HEARTBEAT_INTERVAL_MS);
@@ -2436,7 +2623,7 @@ function startRoom(state, transport, options) {
         onShutdown: options.onShutdown,
     });
     const handlers = {
-        upgrade(query) {
+        async upgrade(query) {
             const params = new URLSearchParams(query);
             // check for session token — reconnection attempt
             const sessionParam = params.get('session');
@@ -2463,7 +2650,7 @@ function startRoom(state, transport, options) {
                 const token = params.get('token');
                 if (!token)
                     return null;
-                const payload = jwtVerify(token, state.roomSecret);
+                const payload = await jwtVerify(token, state.roomSecret);
                 if (!payload)
                     return null;
                 const clientId = payload.clientId;
@@ -2476,7 +2663,7 @@ function startRoom(state, transport, options) {
                 return { clientId, joinData, tags };
             }
             // dev mode — no jwt verification, generate identity
-            return { clientId: randomUUID(), joinData: {}, tags: {} };
+            return { clientId: crypto.randomUUID(), joinData: {}, tags: {} };
         },
         open(clientId, socket, joinData, tags) {
             socket.subscribe(BROADCAST_TOPIC);
@@ -2498,7 +2685,7 @@ function startRoom(state, transport, options) {
                     return;
                 }
                 // generate session token
-                const sessionToken = randomBytes(16).toString('hex');
+                const sessionToken = randomHex(16);
                 state.sessionTokens.set(sessionToken, clientId);
                 // track client
                 const tracked = {
@@ -2566,7 +2753,7 @@ function startRoom(state, transport, options) {
             socket.subscribe(BROADCAST_TOPIC);
             // invalidate old session token, generate new one
             state.sessionTokens.delete(tracked.sessionToken);
-            const newToken = randomBytes(16).toString('hex');
+            const newToken = randomHex(16);
             tracked.sessionToken = newToken;
             state.sessionTokens.set(newToken, clientId);
             // flush reliable buffer to client (FIFO)
@@ -2670,15 +2857,21 @@ async function stopRoom(state, selfInitiated, room, onShutdown, onLeave) {
     state.ipc?.close();
 }
 // env vars that indicate a managed server context
-const MANAGED_ENV_KEYS = ['GATHO_SOCKET', 'GATHO_ROOM_ID', 'GATHO_ROOM_TYPE', 'GATHO_ROOM_SECRET', 'GATHO_SERVER_ID'];
+const MANAGED_ENV_KEYS = [
+    'GATHO_NOTIFY_SOCKET',
+    'GATHO_ROOM_ID',
+    'GATHO_ROOM_TYPE',
+    'GATHO_ROOM_SECRET',
+    'GATHO_SERVER_ID',
+];
 async function start(options) {
     // --- resolve managed context ---
-    const presentEnvKeys = MANAGED_ENV_KEYS.filter((k) => process.env[k] !== undefined);
+    const presentEnvKeys = MANAGED_ENV_KEYS.filter((k) => readEnv(k) !== undefined);
     const hasServerOption = options.server !== undefined;
     let server;
     let roomId;
     let roomType;
-    let socketPath;
+    let notifySource;
     let roomSecret;
     let serverId;
     if (options.standalone === true) {
@@ -2693,40 +2886,40 @@ async function start(options) {
             createLogger().warn(`gatho/room: standalone: true is set, ignoring managed context from ${bits}`);
         }
         server = undefined;
-        roomId = randomUUID();
+        roomId = crypto.randomUUID();
         roomType = 'room';
-        socketPath = undefined;
+        notifySource = undefined;
         roomSecret = null;
         serverId = undefined;
     }
     else {
         server = options.server;
-        roomId = server?.roomId ?? process.env.GATHO_ROOM_ID ?? randomUUID();
-        roomType = server?.roomType ?? process.env.GATHO_ROOM_TYPE ?? 'room';
-        socketPath = server?.socket ?? process.env.GATHO_SOCKET;
-        roomSecret = server?.roomSecret ?? process.env.GATHO_ROOM_SECRET ?? null;
-        serverId = server?.serverId ?? process.env.GATHO_SERVER_ID;
+        roomId = server?.roomId ?? readEnv('GATHO_ROOM_ID') ?? crypto.randomUUID();
+        roomType = server?.roomType ?? readEnv('GATHO_ROOM_TYPE') ?? 'room';
+        roomSecret = server?.roomSecret ?? readEnv('GATHO_ROOM_SECRET') ?? null;
+        serverId = server?.serverId ?? readEnv('GATHO_SERVER_ID');
+        // notify channel resolution: explicit option → GATHO_NOTIFY_SOCKET
+        // (a `uds:`/`tcp://` uri, or a bare uds socket path)
+        notifySource = server?.notify ?? readEnv('GATHO_NOTIFY_SOCKET');
         // fail closed: require managed context OR explicit standalone opt-in.
         // this prevents accidentally running a room with no auth in production.
-        if (!socketPath && !roomSecret) {
+        if (!notifySource && !roomSecret) {
             throw new Error('gatho/room start(): no managed server context detected ' +
-                '(no GATHO_SOCKET / GATHO_ROOM_SECRET, and no options.server.socket / roomSecret). ' +
+                '(no GATHO_NOTIFY_SOCKET / GATHO_ROOM_SECRET env vars, and no options.server.notify / roomSecret). ' +
                 'If running this room directly for local dev or tests, pass `standalone: true`. ' +
                 'Otherwise ensure the gatho server spawned this process so GATHO_* env vars are set.');
         }
     }
-    // set up ipc if socket path is present (managed mode)
+    // set up the notify link (managed mode). a Notifier object is used as-is
+    // (in-process hosting); a uri string is dialed over uds/tcp — node:net is
+    // loaded lazily inside the dialer, so non-node bundles that always pass a
+    // Notifier object never execute a node import.
     let ipc = null;
-    if (socketPath) {
-        const conn = await connectToSocket(socketPath);
-        ipc = {
-            send(msg) {
-                conn.send(msg);
-            },
-            close() {
-                conn.close();
-            },
-        };
+    if (typeof notifySource === 'string') {
+        ipc = await connectNotify(parseNotifyTarget(notifySource));
+    }
+    else if (notifySource) {
+        ipc = notifySource;
     }
     const log = createLogger().child({ roomId, roomType });
     const state = {
@@ -2759,19 +2952,27 @@ async function start(options) {
         startHeartbeat(state);
         ipc.send({ type: 'ready', port });
     }
-    const sigtermHandler = () => {
-        stopRoom(state, false, room, options.onShutdown, options.onLeave).catch((err) => {
-            state.log.error('error during shutdown', { err });
-        });
-    };
-    state.sigtermHandler = sigtermHandler;
-    process.on('SIGTERM', sigtermHandler);
+    // signal handling belongs to whoever owns the process — install only where
+    // there is one (node/bun/deno; workerd isolates have no signals).
+    if (typeof process !== 'undefined' && typeof process.on === 'function') {
+        const sigtermHandler = () => {
+            stopRoom(state, false, room, options.onShutdown, options.onLeave).catch((err) => {
+                state.log.error('error during shutdown', { err });
+            });
+        };
+        state.sigtermHandler = sigtermHandler;
+        process.on('SIGTERM', sigtermHandler);
+    }
     return room;
 }
 
 // gatho/room — room-side api
 // rooms are scripts. user initializes state in module scope, calls start()
 // which returns a Room handle. no defineRoom, no hook bags, no RoomContext.
+// the module IS the room: state closes over module scope, and instancing
+// happens by evaluating the module in a fresh process / worker / isolate.
+// protocol helpers for non-node runtimes that need to speak the notify wire
+// protocol themselves (e.g. a workerd harness relaying room notifications over tcp)
 // --- close codes ---
 // websocket close codes that gatho uses to distinguish disconnect reasons.
 // 4000 (CONSENTED) = the client explicitly called close() — sent __leave first.
@@ -2793,5 +2994,5 @@ const auth = {
     },
 };
 
-export { CloseCode, auth, start, wsTransport };
+export { CloseCode, auth, createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec, start, wsTransport };
 //# sourceMappingURL=room.js.map

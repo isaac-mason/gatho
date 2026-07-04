@@ -1,13 +1,18 @@
+import type { Notifier } from '../common/notify-protocol';
 import type { AuthResult, Client, Room } from './index';
 import type { Transport } from './transport/types';
 /** server-managed config passed to `start()`. all fields fall back to `GATHO_*` env vars.
  *  when the server spawns a room process, it sets these env vars automatically.
  *  you can also pass them explicitly for custom setups. */
 export type ServerConfig = {
-    /** uds socket path — falls back to `GATHO_SOCKET`.
-     *  presence of this (from option or env) triggers ipc connection,
-     *  heartbeats, and ready signal to the parent server. */
-    socket?: string;
+    /** notify channel back to the managing server — either a `Notifier` object
+     *  (when the room is hosted in the same process as something that can hand
+     *  it one) or a string: `uds:<path>`, `tcp://host:port?token=…`, or a bare
+     *  filesystem path (treated as a uds socket path). falls back to
+     *  `GATHO_NOTIFY_SOCKET`. presence of either (option or env) triggers
+     *  managed mode: heartbeats, ready signal, and client tracking to the
+     *  parent server. */
+    notify?: Notifier | string;
     /** room identity — falls back to `GATHO_ROOM_ID`. */
     roomId?: string;
     /** room type — falls back to `GATHO_ROOM_TYPE`. */
@@ -41,12 +46,13 @@ export type ServerConfig = {
  *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in. */
 export type StartOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
     /** server-managed config. when provided, fields override `GATHO_*` env vars.
-     *  when omitted, env vars are checked instead — if `GATHO_SOCKET` is set,
-     *  the room connects ipc automatically. mutually exclusive with `standalone`. */
+     *  when omitted, env vars are checked instead — if `GATHO_NOTIFY_SOCKET` is
+     *  set, the room connects its notify channel automatically. mutually
+     *  exclusive with `standalone`. */
     server?: ServerConfig;
     /** explicit opt-in to run without a managed server context. required when
-     *  neither `GATHO_SOCKET`/`GATHO_ROOM_SECRET` env vars are set nor
-     *  `options.server.socket`/`options.server.roomSecret` are provided —
+     *  neither `GATHO_NOTIFY_SOCKET`/`GATHO_ROOM_SECRET` env vars are set nor
+     *  `options.server.notify`/`options.server.roomSecret` are provided —
      *  otherwise `start()` throws. when `true`, all managed config (env vars and
      *  `options.server`) is ignored; a warning is logged if any was present. */
     standalone?: boolean;

@@ -10,7 +10,7 @@ export type UpgradeResult = {
     tags?: Record<string, string>;
 };
 export type TransportHandlers = {
-    upgrade(query: string): UpgradeResult | null;
+    upgrade(query: string): UpgradeResult | null | Promise<UpgradeResult | null>;
     open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>): void;
     reconnect(clientId: string, socket: ClientSocket): void;
     message(clientId: string, data: ArrayBuffer, isBinary: boolean): void;

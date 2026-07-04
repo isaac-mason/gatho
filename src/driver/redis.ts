@@ -405,7 +405,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         // tags travel as a separate claim from user data: rooms are untrusted and
         // must forward tags back over ipc so connectClient can reconstitute the
         // hash if redis evicted it during the reserve→connect window.
-        const token = jwtSign(
+        const token = await jwtSign(
             { clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags },
             roomData.roomSecret,
         );

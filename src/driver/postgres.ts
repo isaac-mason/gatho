@@ -281,7 +281,7 @@ export async function createPostgresDriver(options: PostgresDriverOptions = {}):
 
         // tags travel as a separate jwt claim from user data so the room can
         // forward them back over ipc to connectClient (mirrors redis driver).
-        const token = jwtSign(
+        const token = await jwtSign(
             { clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags },
             room.room_secret,
         );

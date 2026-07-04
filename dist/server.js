@@ -1,87 +1,11 @@
-import { randomUUID, randomBytes } from 'crypto';
-import * as http from 'http';
-import { tmpdir } from 'os';
-import { join, dirname as dirname$1 } from 'path';
-import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, unlinkSync, rmdirSync } from 'node:fs';
 import { createServer } from 'node:net';
-import { dirname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { randomUUID, randomBytes as randomBytes$1 } from 'crypto';
+import * as http from 'http';
 import { spawn } from 'node:child_process';
-
-/**
- * ergonomic factory for creating a RoomRunner.
- *
- * the provided function receives a spawn context with a `stopped` callback, sets up the room,
- * and returns a destructor. the destructor is called by the server when it wants the room to stop.
- * `ctx.stopped()` should be called when the room has exited, regardless of the reason.
- *
- * supports both sync and async spawn/destructor — async is useful for runners that need to make
- * API calls (e.g. ECS RunTask, docker create) during setup or teardown.
- *
- * bridges to the internal RoomRunner/SpawnResult interface — the server doesn't need to know
- * about this API.
- */
-function runner(fn) {
-    return {
-        spawn(ctx) {
-            // buffer stopped() calls if they fire before onExit is registered
-            let bufferedCode = null;
-            let exitHandler = null;
-            let delivered = false;
-            function deliver(code) {
-                if (delivered)
-                    return;
-                delivered = true;
-                if (exitHandler)
-                    exitHandler(code);
-                else
-                    bufferedCode = { code };
-            }
-            // track destructor — may resolve later if spawn is async
-            let destructor = null;
-            let queuedKill = false;
-            const runnerCtx = {
-                ...ctx,
-                env: {
-                    GATHO_ROOM_ID: ctx.roomId,
-                    GATHO_SOCKET: ctx.socket,
-                    GATHO_ROOM_TYPE: ctx.roomType,
-                    GATHO_SERVER_ID: ctx.serverId,
-                    GATHO_ROOM_SECRET: ctx.roomSecret,
-                },
-                stopped: deliver,
-            };
-            const result = fn(runnerCtx);
-            if (result instanceof Promise) {
-                result.then((d) => {
-                    destructor = d;
-                    if (queuedKill)
-                        destructor();
-                });
-            }
-            else {
-                destructor = result;
-            }
-            return {
-                kill() {
-                    if (destructor) {
-                        destructor();
-                    }
-                    else {
-                        queuedKill = true;
-                    }
-                },
-                onExit(handler) {
-                    if (bufferedCode !== null) {
-                        handler(bufferedCode.code);
-                    }
-                    else {
-                        exitHandler = handler;
-                    }
-                },
-            };
-        },
-    };
-}
 
 // structured json line logger
 // emits ndjson to stdout/stderr, supports child loggers for scoped context
@@ -145,64 +69,6 @@ function createLogger(options) {
 }
 // module-scope singleton — reads GATHO_LOG_LEVEL at import time
 const log = createLogger();
-
-/** race a promise against a timeout. rejects with `${label} timeout` if it doesn't settle in time. */
-async function withTimeout(p, ms, label) {
-    let timer;
-    try {
-        return await Promise.race([
-            p,
-            new Promise((_, reject) => {
-                timer = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
-            }),
-        ]);
-    }
-    finally {
-        if (timer)
-            clearTimeout(timer);
-    }
-}
-/**
- * schedule async work on a self-pacing cadence.
- *
- * the first tick runs eagerly and is awaited before this function returns; the
- * caller can rely on `run` having executed once (success or caught error) by
- * the time the resulting Punctuator handle is in hand. each subsequent tick is
- * scheduled `intervalMs` after the previous one's start (or immediately if the
- * previous run exceeded the interval). avoids both pending-promise pile-up
- * (no overlap by construction) and the "skip a full interval" gap that
- * setInterval + skip-on-overlap produces when a run runs long.
- */
-async function punctuate(label, run, opts) {
-    const log$1 = opts.logger ?? log;
-    let stopped = false;
-    let timer;
-    function stop() {
-        stopped = true;
-        if (timer) {
-            clearTimeout(timer);
-            timer = undefined;
-        }
-    }
-    async function tick() {
-        if (stopped)
-            return;
-        const startedAt = Date.now();
-        try {
-            await withTimeout(run(), opts.timeoutMs, label);
-        }
-        catch (err) {
-            log$1.error(`${label} error`, { err });
-        }
-        if (stopped)
-            return;
-        const elapsed = Date.now() - startedAt;
-        const delay = Math.max(0, opts.intervalMs - elapsed);
-        timer = setTimeout(tick, delay);
-    }
-    await tick();
-    return { stop };
-}
 
 /* lightweight helpers that just return objects */
 /**
@@ -303,6 +169,21 @@ const record = (field) => ({
 const literal = (value) => {
     return { type: 'literal', value };
 };
+/**
+ * Optional schema - value that can be undefined.
+ *
+ * Uses 1 byte to indicate presence (0=undefined, 1=present), followed by the value if defined.
+ *
+ * @param of - Schema for the defined value
+ * @returns An optional schema definition
+ *
+ * @example
+ * optional(uint32()) // number | undefined
+ *
+ * @example
+ * optional(string()) // string | undefined
+ */
+const optional = (of) => ({ type: 'optional', of });
 /**
  * Union schema - discriminated union of object variants.
  *
@@ -2011,11 +1892,19 @@ function writeString(ctx, value, offset = 'o') {
     return code;
 }
 
-// uds ipc protocol — packcat-encoded, length-prefixed framing.
+// notify protocol — the room→server notification schema and framing.
 //
-// frame format: length(4 bytes, uint32 BE) + payload(length bytes, packcat-encoded RoomMessage)
+// messages flow one direction: room → server. the server never speaks back on
+// this channel (stop is delivered out-of-band by the runner's destructor).
 //
-// messages flow one direction: room → server.
+// this module is runtime-neutral on purpose: no Buffer, no node imports. the
+// uds and tcp channels both carry these frames; the direct (in-memory) channel
+// skips framing and passes messages by reference; non-node runtimes (workerd,
+// deno, bun) can use the codec + frame helpers to speak the same protocol.
+//
+// frame format: length(4 bytes, uint32 BE) + payload(length bytes).
+// notify frames carry a packcat-encoded NotifyMessage payload. the tcp channel
+// additionally sends one raw frame first: the utf-8 auth token.
 // --- message schema ---
 const ProcessMetrics = object({
     memoryRss: float64(),
@@ -2035,7 +1924,9 @@ const HeartbeatClient = object({
 const Heartbeat = object({
     type: literal('heartbeat'),
     timestamp: float64(),
-    metrics: ProcessMetrics,
+    // optional: not every room runtime can report process metrics (e.g. a
+    // workerd isolate has no process.memoryUsage)
+    metrics: optional(ProcessMetrics),
     clients: list(HeartbeatClient),
 });
 const ClientConnected = object({
@@ -2055,47 +1946,135 @@ const ErrorMsg = object({
 const Stopped = object({
     type: literal('stopped'),
 });
-const RoomMessageSchema = union('type', [Ready, Heartbeat, ClientConnected, ClientDisconnected, ErrorMsg, Stopped]);
-const ipcCodec = build(RoomMessageSchema);
+const NotifyMessageSchema = union('type', [Ready, Heartbeat, ClientConnected, ClientDisconnected, ErrorMsg, Stopped]);
+const notifyCodec = build(NotifyMessageSchema);
 // --- framing ---
 // header: 4 bytes uint32 BE length
 const HEADER_SIZE = 4;
-// streaming frame reader — handles partial reads and buffering across data events.
-// returns a push function that accepts raw chunks from the socket.
-// malformed frames are dropped with a log rather than thrown — callers are socket
-// 'data' handlers which must not throw.
-function createFrameReader(onMessage, onError) {
-    let buffer = Buffer.alloc(0);
+/** streaming frame parser — handles partial reads and buffering across chunks.
+ *  returns a push function that accepts raw chunks and invokes `onFrame` with
+ *  each complete payload (header stripped). */
+function createFrameParser(onFrame) {
+    let buffer = new Uint8Array(0);
     return (data) => {
-        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        buffer = buffer.byteLength === 0 ? buf : Buffer.concat([buffer, buf]);
+        if (buffer.byteLength === 0) {
+            buffer = data;
+        }
+        else {
+            const merged = new Uint8Array(buffer.byteLength + data.byteLength);
+            merged.set(buffer, 0);
+            merged.set(data, buffer.byteLength);
+            buffer = merged;
+        }
         while (buffer.byteLength >= HEADER_SIZE) {
-            const payloadLength = buffer.readUInt32BE(0);
+            const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+            const payloadLength = view.getUint32(0, false);
             const totalFrameSize = HEADER_SIZE + payloadLength;
             if (buffer.byteLength < totalFrameSize)
                 break;
             const payload = buffer.subarray(HEADER_SIZE, totalFrameSize);
             buffer = buffer.subarray(totalFrameSize);
-            try {
-                onMessage(ipcCodec.unpack(payload));
-            }
-            catch (err) {
-                // malformed frame — drop it and keep reading. never let a decode
-                // error propagate out of a socket 'data' handler.
-                onError?.(err);
-            }
+            onFrame(payload);
         }
     };
 }
+/** streaming notify-message reader built on the frame parser.
+ *  malformed frames are dropped via `onError` rather than thrown — callers are
+ *  socket 'data' handlers which must not throw. */
+function createFrameReader(onMessage, onError) {
+    return createFrameParser((payload) => {
+        try {
+            onMessage(notifyCodec.unpack(payload));
+        }
+        catch (err) {
+            onError?.(err);
+        }
+    });
+}
 
-function listenOnSocket(socketPath, onMessage, options) {
+// notify channel helpers — for use inside `runner()` spawn functions.
+//
+// a channel helper connects a room's Notifier to the server's message handler
+// (`ctx.onMessage`) across a process boundary: it listens on some pipe, decodes
+// the room's frames, and feeds them to `ctx.onMessage`. helpers resolve once
+// they are LISTENING (not once the room connects) so the runner can grab
+// `chan.env` before launching the room.
+/**
+ * Build the per-room UDS socket path: `socketDir/<roomId>/sock`.
+ *
+ * The per-room subdirectory (rather than a flat `socketDir/<roomId>.sock`) is what
+ * lets a container runner mount each room only its own socket dir, isolating the
+ * notify channel from sibling rooms. `roomId` becomes a path segment, so reject
+ * anything that could escape `socketDir`.
+ *
+ * The socket filename is kept to `sock` (not e.g. `room.sock`) on purpose: unix
+ * socket paths have a hard length limit (~104 bytes on macOS) and the per-room
+ * subdir already costs the `roomId` segment. `<roomId>/sock` is the same length as
+ * the old flat `<roomId>.sock`, so we don't regress paths that used to fit. Don't
+ * lengthen this filename without re-checking that limit on the longest socketDir.
+ */
+function roomSocketPath(socketDir, roomId) {
+    if (roomId.includes('/') || roomId.includes('\\') || roomId === '.' || roomId === '..') {
+        throw new Error(`invalid roomId for socket path: ${JSON.stringify(roomId)}`);
+    }
+    return join(socketDir, roomId, 'sock');
+}
+const DEFAULT_SOCKET_DIR = () => join(tmpdir(), 'gatho-ipc');
+function channelListener(label, roomId, handleSocket) {
+    let active = null;
+    let closed = false;
+    const server = createServer((socket) => {
+        if (closed) {
+            socket.destroy();
+            return;
+        }
+        // absorb socket errors — a broken pipe or reset must not become an
+        // uncaught EventEmitter error.
+        socket.on('error', (err) => {
+            log.error(`${label}: socket error`, { roomId, err });
+        });
+        socket.on('close', () => {
+            if (active === socket)
+                active = null;
+        });
+        handleSocket(socket, (s) => {
+            if (active !== null || closed)
+                return false;
+            active = s;
+            return true;
+        });
+    });
+    return {
+        server,
+        close() {
+            if (closed)
+                return;
+            closed = true;
+            active?.destroy();
+            server.close();
+        },
+    };
+}
+/**
+ * uds notify channel: creates a unix domain socket at `socketDir/<roomId>/sock`,
+ * listens for the room to dial back, and feeds decoded frames to `ctx.onMessage`.
+ *
+ * resolves once listening — spawn the room after this so `GATHO_NOTIFY_SOCKET`
+ * (in `chan.env`) points at a live socket.
+ *
+ * socket close needs no handling here — a room that hangs up either already sent
+ * `stopped` (self-stop) or is about to exit (crash), both of which reach the
+ * server through other paths (`stopped` message / runner `ctx.stopped`), with
+ * the heartbeat stall sweep as the backstop. a room may redial after a drop.
+ */
+function uds(ctx, options) {
+    const socketDir = options?.socketDir ?? DEFAULT_SOCKET_DIR();
+    const socketPath = roomSocketPath(socketDir, ctx.roomId);
     return new Promise((resolve, reject) => {
         const dir = dirname(socketPath);
         if (!existsSync(dir)) {
             mkdirSync(dir, { recursive: true });
         }
-        let settled = false;
-        let timeoutHandle = null;
         // clean up stale socket file if present
         try {
             unlinkSync(socketPath);
@@ -2103,81 +2082,266 @@ function listenOnSocket(socketPath, onMessage, options) {
         catch {
             // not there, fine
         }
-        const server = createServer((socket) => {
-            if (settled) {
+        const core = channelListener('uds notify', ctx.roomId, (socket, adopt) => {
+            if (!adopt(socket)) {
                 socket.destroy();
                 return;
             }
-            settled = true;
-            if (timeoutHandle) {
-                clearTimeout(timeoutHandle);
-                timeoutHandle = null;
-            }
-            server.close();
-            const push = createFrameReader(onMessage, (err) => {
-                log.error('uds: malformed frame dropped', { socketPath, err });
-            });
-            const onClose = options?.onClose;
-            // absorb socket errors — a broken pipe or reset should not become an
-            // uncaught EventEmitter error. the 'close' event fires after 'error',
-            // so cleanupRoom is still triggered via the onClose callback.
-            socket.on('error', (err) => {
-                log.error('uds: socket error', { socketPath, err });
+            const push = createFrameReader((msg) => ctx.onMessage(msg), (err) => {
+                log.error('uds notify: malformed frame dropped', { socketPath, err });
             });
             socket.on('data', (chunk) => push(chunk));
-            socket.on('close', () => onClose?.());
+        });
+        function close() {
+            core.close();
+            try {
+                unlinkSync(socketPath);
+            }
+            catch {
+                // already gone
+            }
+            try {
+                rmdirSync(dirname(socketPath));
+            }
+            catch {
+                // non-empty or already gone — fine
+            }
+        }
+        core.server.on('error', (error) => {
+            if (!core.server.listening) {
+                reject(error);
+                return;
+            }
+            log.error('uds notify: server error', { socketPath, err: error });
+        });
+        core.server.listen(socketPath, () => {
             resolve({
-                send() {
-                    // server never sends to room — this is a no-op placeholder
-                    // to satisfy UdsConnection interface
-                    throw new Error('server-side uds does not send messages');
+                socketPath,
+                socketDir: dirname(socketPath),
+                env: {
+                    GATHO_NOTIFY_SOCKET: `uds:${socketPath}`,
                 },
-                close() {
-                    socket.destroy();
-                    try {
-                        unlinkSync(socketPath);
-                    }
-                    catch {
-                        // already gone
-                    }
-                },
+                close,
             });
         });
-        server.on('error', (error) => {
-            if (!settled) {
-                settled = true;
-                if (timeoutHandle) {
-                    clearTimeout(timeoutHandle);
-                    timeoutHandle = null;
-                }
-                reject(error);
-            }
-        });
-        server.listen(socketPath);
-        if (options?.timeoutMs !== undefined) {
-            timeoutHandle = setTimeout(() => {
-                if (!settled) {
-                    settled = true;
-                    server.close();
-                    try {
-                        unlinkSync(socketPath);
-                    }
-                    catch (e) {
-                        console.warn(`uds: failed to clean up socket file at ${socketPath} after timeout`, e);
-                    }
-                    reject(new Error(`uds: no connection within ${options.timeoutMs}ms on ${socketPath}`));
-                }
-            }, options.timeoutMs);
-        }
     });
 }
-async function createUdsServer(socketPath, onMessage, options) {
-    const conn = await listenOnSocket(socketPath, onMessage, options);
+/**
+ * tcp notify channel: loopback listener carrying the same length-prefixed
+ * packcat frames as uds. where uds gets isolation from filesystem permissions,
+ * tcp gets it from a per-room bearer token: the room must send the token as its
+ * first frame or the connection is dropped.
+ *
+ * for rooms that can't reach a unix socket — containers without a mount,
+ * remote-ish sandboxes, workerd isolates (via `connect()`).
+ *
+ * resolves once listening — spawn the room after this so the uri in `chan.env`
+ * points at a live listener.
+ */
+function tcp(ctx, options) {
+    const bindHost = options?.host ?? '127.0.0.1';
+    const advertisedHost = options?.advertisedHost ?? bindHost;
+    const token = randomBytes(16).toString('hex');
+    return new Promise((resolve, reject) => {
+        const core = channelListener('tcp notify', ctx.roomId, (socket, adopt) => {
+            // token gate: first frame must be the utf-8 token. only a socket that
+            // presents it (and wins the active slot) is kept.
+            let authed = false;
+            const parser = createFrameParser((payload) => {
+                if (!authed) {
+                    const presented = new TextDecoder().decode(payload);
+                    if (presented !== token || !adopt(socket)) {
+                        log.warn('tcp notify: rejected connection (bad token or already connected)', {
+                            roomId: ctx.roomId,
+                        });
+                        socket.destroy();
+                        return;
+                    }
+                    authed = true;
+                    return;
+                }
+                try {
+                    ctx.onMessage(notifyCodec.unpack(payload));
+                }
+                catch (err) {
+                    log.error('tcp notify: malformed frame dropped', { roomId: ctx.roomId, err });
+                }
+            });
+            socket.on('data', (chunk) => parser(chunk));
+        });
+        core.server.on('error', (error) => {
+            if (!core.server.listening) {
+                reject(error);
+                return;
+            }
+            log.error('tcp notify: server error', { roomId: ctx.roomId, err: error });
+        });
+        core.server.listen(0, bindHost, () => {
+            const addr = core.server.address();
+            if (!addr || typeof addr === 'string') {
+                reject(new Error('tcp notify: failed to get listener address'));
+                return;
+            }
+            resolve({
+                port: addr.port,
+                token,
+                env: {
+                    GATHO_NOTIFY_SOCKET: `tcp://${advertisedHost}:${addr.port}?token=${token}`,
+                },
+                close: core.close,
+            });
+        });
+    });
+}
+/**
+ * direct notify channel: no wire at all. for rooms hosted in the same process
+ * as the server — the room is handed (a thin gate over) the server core's own
+ * notifier. synchronous, unlike the wire channels: there is nothing to bind.
+ */
+function direct(ctx) {
+    let closed = false;
     return {
+        notifier: {
+            send(msg) {
+                if (!closed)
+                    ctx.onMessage(msg);
+            },
+            close() {
+                closed = true;
+            },
+        },
         close() {
-            conn.close();
+            closed = true;
         },
     };
+}
+/** notify channel helpers, composed inside `runner()` spawn functions. */
+const notify = {
+    uds,
+    tcp,
+    direct,
+};
+
+/**
+ * ergonomic factory for creating a RoomRunner.
+ *
+ * the provided function receives a spawn context carrying two sinks into the server core —
+ * `ctx.onMessage` (room→server notify messages) and `ctx.stopped` (the room exited) — sets up
+ * the room, and returns a destructor. the destructor is called by the server when it wants the
+ * room to stop. `ctx.stopped()` should be called when the room has exited, for any reason.
+ *
+ * how notify messages get from the room into `ctx.onMessage` is this function's business:
+ * compose a channel helper (`notify.uds(ctx)`, `notify.tcp(ctx)`, `notify.direct(ctx)`) or
+ * send on it directly to synthesize messages on the room's behalf.
+ *
+ * supports both sync and async spawn/destructor — async is useful for runners that need to make
+ * API calls (e.g. ECS RunTask, docker create) during setup or teardown. if an async spawn
+ * rejects, the failure is surfaced as a synthesized `{ type: 'error' }` notify message followed
+ * by `stopped(null)`.
+ */
+function runner(fn) {
+    return {
+        spawn(ctx) {
+            // track destructor — may resolve later if spawn is async
+            let destructor = null;
+            let queuedKill = false;
+            const runnerCtx = {
+                ...ctx,
+                env: {
+                    GATHO_ROOM_ID: ctx.roomId,
+                    GATHO_ROOM_TYPE: ctx.roomType,
+                    GATHO_SERVER_ID: ctx.serverId,
+                    GATHO_ROOM_SECRET: ctx.roomSecret,
+                },
+            };
+            const result = fn(runnerCtx);
+            if (result instanceof Promise) {
+                result
+                    .then((d) => {
+                    destructor = d;
+                    if (queuedKill)
+                        void d();
+                })
+                    .catch((err) => {
+                    // async spawn failed — the room never started. surface the
+                    // cause and report the exit so the server can reschedule.
+                    ctx.onMessage({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+                    ctx.stopped(null);
+                });
+            }
+            else {
+                destructor = result;
+            }
+            return {
+                kill() {
+                    if (destructor) {
+                        void destructor();
+                    }
+                    else {
+                        queuedKill = true;
+                    }
+                },
+            };
+        },
+    };
+}
+
+/** race a promise against a timeout. rejects with `${label} timeout` if it doesn't settle in time. */
+async function withTimeout(p, ms, label) {
+    let timer;
+    try {
+        return await Promise.race([
+            p,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
+            }),
+        ]);
+    }
+    finally {
+        if (timer)
+            clearTimeout(timer);
+    }
+}
+/**
+ * schedule async work on a self-pacing cadence.
+ *
+ * the first tick runs eagerly and is awaited before this function returns; the
+ * caller can rely on `run` having executed once (success or caught error) by
+ * the time the resulting Punctuator handle is in hand. each subsequent tick is
+ * scheduled `intervalMs` after the previous one's start (or immediately if the
+ * previous run exceeded the interval). avoids both pending-promise pile-up
+ * (no overlap by construction) and the "skip a full interval" gap that
+ * setInterval + skip-on-overlap produces when a run runs long.
+ */
+async function punctuate(label, run, opts) {
+    const log$1 = opts.logger ?? log;
+    let stopped = false;
+    let timer;
+    function stop() {
+        stopped = true;
+        if (timer) {
+            clearTimeout(timer);
+            timer = undefined;
+        }
+    }
+    async function tick() {
+        if (stopped)
+            return;
+        const startedAt = Date.now();
+        try {
+            await withTimeout(run(), opts.timeoutMs, label);
+        }
+        catch (err) {
+            log$1.error(`${label} error`, { err });
+        }
+        if (stopped)
+            return;
+        const elapsed = Date.now() - startedAt;
+        const delay = Math.max(0, opts.intervalMs - elapsed);
+        timer = setTimeout(tick, delay);
+    }
+    await tick();
+    return { stop };
 }
 
 // start - main entry point for gatho server
@@ -2185,24 +2349,25 @@ async function createUdsServer(socketPath, onMessage, options) {
 // rooms run their own websocket servers — clients connect directly.
 // this process is control-plane only: health checks, reconciliation, leader election.
 //
-// the server owns the UDS socket for each room. it creates the socket,
-// starts listening, spawns the room process (which connects back).
-// room config is passed via env vars (GATHO_ROOM_ID, GATHO_ROOM_TYPE, etc.).
-// all ipc flows over that socket — child-to-parent only.
+// the server core does NOT own the notify channel — the runner does. spawn hands
+// the runner its message handler and exit sink (ctx.onMessage, ctx.stopped); how
+// the room's messages reach them (uds frames, tcp, in-memory) is the runner's business.
+// messages flow one direction: room → server.
 /* constants */
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 const LEADER_LOOP_INTERVAL_MS = 10_000;
 const LEADER_LOOP_TIMEOUT_MS = 5_000;
 const HEARTBEAT_TICK_TIMEOUT_MS = 5_000;
-/** how long a room process can go without a heartbeat before we consider it stalled and kill it. */
-const ROOM_STALL_TIMEOUT_MS = 10_000;
+/** default for CreateServerOptions.roomStallTimeoutMs */
+const DEFAULT_ROOM_STALL_TIMEOUT_MS = 10_000;
+/** default for CreateServerOptions.roomStartupTimeoutMs */
+const DEFAULT_ROOM_STARTUP_TIMEOUT_MS = 30_000;
 function cleanupRoom(s, roomId, reason) {
     const proc = s.processes.get(roomId);
     if (!proc)
         return;
     s.processes.delete(roomId);
     s.lastHeartbeats.delete(roomId);
-    proc.closeIpc();
     proc.markExited();
     log.info('room cleaned up', { roomId, reason });
     switch (reason) {
@@ -2218,7 +2383,6 @@ function cleanupRoom(s, roomId, reason) {
                 log.error('failed to report room failure', { roomId, err });
             });
             break;
-        case 'ipc-closed':
         case 'process-exited':
             if (s.killedRoomIds.has(roomId)) {
                 // expected — server initiated the kill, reconciler handles
@@ -2278,9 +2442,9 @@ async function reconcileClients(driver, roomId, roomClients, heartbeatTimestamp)
         }
     }
 }
-// handle all ipc messages from a room subprocess.
-// single dispatch point — every ChildToParent message type is handled here.
-function handleIpcMessage(s, roomId, msg) {
+// handle all notify messages from a room.
+// single dispatch point — every room→server message type is handled here.
+function handleNotifyMessage(s, roomId, msg) {
     switch (msg.type) {
         case 'heartbeat': {
             s.lastHeartbeats.set(roomId, Date.now());
@@ -2288,10 +2452,10 @@ function handleIpcMessage(s, roomId, msg) {
             log.debug('room heartbeat', {
                 roomId,
                 roomType: proc?.roomType,
-                memoryRss: msg.metrics.memoryRss,
-                memoryHeapUsed: msg.metrics.memoryHeapUsed,
-                cpuUser: msg.metrics.cpuUser,
-                cpuSystem: msg.metrics.cpuSystem,
+                memoryRss: msg.metrics?.memoryRss,
+                memoryHeapUsed: msg.metrics?.memoryHeapUsed,
+                cpuUser: msg.metrics?.cpuUser,
+                cpuSystem: msg.metrics?.cpuSystem,
                 clientCount: msg.clients.length,
             });
             // reconcile client state in the background — don't block the heartbeat path
@@ -2337,102 +2501,110 @@ function handleIpcMessage(s, roomId, msg) {
     }
 }
 /* room lifecycle */
-/**
- * Build the per-room UDS socket path: `socketDir/<roomId>/sock`.
- *
- * The per-room subdirectory (rather than a flat `socketDir/<roomId>.sock`) is what
- * lets a container runner mount each room only its own socket dir, isolating the
- * IPC channel from sibling rooms. `roomId` becomes a path segment, so reject
- * anything that could escape `socketDir`.
- *
- * The socket filename is kept to `sock` (not e.g. `room.sock`) on purpose: unix
- * socket paths have a hard length limit (~104 bytes on macOS) and the per-room
- * subdir already costs the `roomId` segment. `<roomId>/sock` is the same length as
- * the old flat `<roomId>.sock`, so we don't regress paths that used to fit. Don't
- * lengthen this filename without re-checking that limit on the longest socketDir.
- */
-function roomSocketPath(socketDir, roomId) {
-    if (roomId.includes('/') || roomId.includes('\\') || roomId === '.' || roomId === '..') {
-        throw new Error(`invalid roomId for socket path: ${JSON.stringify(roomId)}`);
-    }
-    return join(socketDir, roomId, 'sock');
-}
-// spawn a new room subprocess via the injected runner.
-// 1. creates a UDS socket at socketDir/roomId/sock and starts listening.
-//    the per-room subdirectory (rather than a flat socketDir/roomId.sock) lets
-//    container runners mount each room only its own socket dir, isolating the
-//    IPC channel from sibling rooms — see SpawnContext.socketDir.
-// 2. calls runner.spawn() to start the process (which connects back)
-// 3. ipc messages from the child are handled by handleIpcMessage()
-// 4. when the room sends 'ready' with wsPort, computes endpoint and registers with driver
+// spawn a new room via the injected runner.
+// 1. registers the room process handle, then calls runner.spawn() with two
+//    injected sinks: `notifier` (room→server notify messages, however the runner
+//    chooses to carry them) and `stopped` (the runner's observation that the
+//    room exited).
+// 2. waits for the room's first notify message before resolving — a room that
+//    exits or stays silent past the startup timeout is a spawn failure.
+// 3. when the room sends 'ready' with its ws port, computes the endpoint and
+//    registers with the driver.
 async function createRoom(s, roomId, roomType, data) {
     const runner = s.runners.get(roomType);
     if (!runner) {
         throw new Error(`no runner for room type "${roomType}"`);
     }
-    const roomSecret = randomBytes(32).toString('base64url');
-    const socketPath = roomSocketPath(s.socketDir, roomId);
+    const roomSecret = randomBytes$1(32).toString('base64url');
     let resolveExited;
     const exited = new Promise((r) => {
         resolveExited = r;
     });
+    // startup gate: resolves on the room's first notify message, rejects if the
+    // room exits (or stays silent past the timeout) before ever speaking.
+    let started = false;
+    let stoppedCalled = false;
+    let status = 'starting';
     const roomProcess = {
         roomId,
         roomType,
         roomSecret,
         endpoint: null,
+        status: () => status,
         kill: () => { },
-        closeIpc: () => { },
         exited,
         markExited: () => resolveExited(),
     };
-    function onMessage(msg) {
-        handleIpcMessage(s, roomId, msg);
-    }
-    // start listening on UDS socket — don't await yet, we need to spawn first.
-    // createUdsServer resolves when the child connects, so we must spawn the
-    // child process before awaiting, otherwise it's a deadlock.
-    const udsPromise = createUdsServer(socketPath, onMessage, {
-        timeoutMs: 30_000,
-        onClose() {
-            cleanupRoom(s, roomId, 'ipc-closed');
-        },
+    // register before spawn — the room's first notify message (often `ready`)
+    // must find the process entry in place. note: lastHeartbeats is NOT seeded
+    // here — the stall sweep must not tick against a room that hasn't spoken
+    // yet, or it would cut the startup budget down to the stall timeout.
+    // the clock starts on the first notify message.
+    s.processes.set(roomId, roomProcess);
+    let settleStarted;
+    const startedPromise = new Promise((resolve, reject) => {
+        settleStarted = { resolve, reject };
     });
-    // spawn the room process — it will connect back to our socket
+    const onMessage = (msg) => {
+        // drop messages once the room has exited or been cleaned up — a late
+        // heartbeat must not resurrect bookkeeping for a dead room.
+        if (stoppedCalled || !s.processes.has(roomId))
+            return;
+        if (!started) {
+            started = true;
+            s.lastHeartbeats.set(roomId, Date.now());
+            settleStarted.resolve();
+        }
+        if (msg.type === 'ready' && status === 'starting')
+            status = 'ready';
+        if (msg.type === 'stopped')
+            status = 'stopped';
+        handleNotifyMessage(s, roomId, msg);
+    };
+    function stopped(code) {
+        if (stoppedCalled)
+            return;
+        stoppedCalled = true;
+        status = 'stopped';
+        if (!started) {
+            settleStarted.reject(new Error(`room process exited during startup (code ${code})`));
+        }
+        else {
+            cleanupRoom(s, roomId, 'process-exited');
+        }
+    }
     const spawnResult = runner.spawn({
         roomId,
         roomType,
         serverId: s.serverId,
         roomSecret,
         data,
-        socket: socketPath,
-        socketDir: dirname$1(socketPath),
+        onMessage,
+        stopped,
+        status: () => status,
     });
-    // race UDS connection against child exit — if the child crashes before
-    // connecting (bad path, syntax error, etc.), we reject immediately instead
-    // of blocking for the full 30s UDS timeout.
-    //
-    // we also wire the post-startup exit handler here (guarded by `started`) so
-    // there's no window between the race resolving and the handler being attached
-    // where a fast crash could go undetected.
-    let started = false;
-    const childExited = new Promise((_, reject) => {
-        spawnResult.onExit((code) => {
-            if (!started) {
-                reject(new Error(`room process exited during startup (code ${code})`));
-            }
-            else {
-                cleanupRoom(s, roomId, 'process-exited');
-            }
-        });
-    });
-    const uds = await Promise.race([udsPromise, childExited]);
-    started = true;
-    // wire up the room process handle
     roomProcess.kill = () => spawnResult.kill();
-    roomProcess.closeIpc = () => uds.close();
-    s.processes.set(roomId, roomProcess);
-    s.lastHeartbeats.set(roomId, Date.now());
+    const startupTimeoutMs = s.options.roomStartupTimeoutMs ?? DEFAULT_ROOM_STARTUP_TIMEOUT_MS;
+    const startupTimeout = setTimeout(() => {
+        settleStarted.reject(new Error(`room sent no notify message within ${startupTimeoutMs}ms`));
+    }, startupTimeoutMs);
+    startupTimeout.unref();
+    try {
+        await startedPromise;
+    }
+    catch (err) {
+        // startup failed — unregister and make sure nothing lingers. on the
+        // timeout path the room may still be running; kill() is a no-op for a
+        // room that already exited.
+        s.processes.delete(roomId);
+        s.lastHeartbeats.delete(roomId);
+        spawnResult.kill();
+        roomProcess.markExited();
+        throw err;
+    }
+    finally {
+        clearTimeout(startupTimeout);
+    }
     return roomProcess;
 }
 // kill a room process. the runner's kill() handles signal escalation
@@ -2455,8 +2627,9 @@ function shutdownAllWorkers(s) {
 // kills stalled processes and reports failure to the driver.
 function checkHeartbeats(s) {
     const now = Date.now();
+    const stallTimeoutMs = s.options.roomStallTimeoutMs ?? DEFAULT_ROOM_STALL_TIMEOUT_MS;
     for (const [roomId, lastBeat] of s.lastHeartbeats) {
-        if (now - lastBeat > ROOM_STALL_TIMEOUT_MS) {
+        if (now - lastBeat > stallTimeoutMs) {
             const roomProcess = s.processes.get(roomId);
             if (roomProcess) {
                 log.warn('process stalled, killing', { roomId, stalledMs: now - lastBeat });
@@ -2718,6 +2891,8 @@ function getRoomDetails(s, roomId) {
         roomType: roomProcess.roomType,
         workerRunning: true,
         endpoint: roomProcess.endpoint,
+        status: roomProcess.status(),
+        lastHeartbeatAt: s.lastHeartbeats.get(roomId) ?? null,
     };
 }
 function getAllRoomDetails(s) {
@@ -2728,6 +2903,8 @@ function getAllRoomDetails(s) {
             roomType: roomProcess.roomType,
             workerRunning: true,
             endpoint: roomProcess.endpoint,
+            status: roomProcess.status(),
+            lastHeartbeatAt: s.lastHeartbeats.get(roomProcess.roomId) ?? null,
         });
     }
     return details;
@@ -2736,7 +2913,6 @@ function getAllRoomDetails(s) {
 async function start(options) {
     const { _internal: driver } = options.driver;
     const runners = new Map(Object.entries(options.rooms));
-    const socketDir = options.socketDir ?? join(tmpdir(), 'gatho-ipc');
     const s = {
         options,
         driver,
@@ -2745,7 +2921,6 @@ async function start(options) {
         host: options.host ?? '0.0.0.0',
         serverId: randomUUID(),
         knownRoomTypes: new Set(Object.keys(options.rooms)),
-        socketDir,
         processes: new Map(),
         lastHeartbeats: new Map(),
         killedRoomIds: new Set(),
@@ -2774,53 +2949,71 @@ async function start(options) {
 
 const SIGKILL_DELAY_MS = 5_000;
 /**
- * spawn-a-child-process helper for use inside a `runner()` callback.
+ * spawn-a-child-process room runner.
  *
- * the subprocess should call `gatho/room`'s `start()` function (`import { start } from 'gatho/room'`).
+ * the subprocess should call `gatho/room`'s `start()` function
+ * (`import { start } from 'gatho/room'`).
  *
- * the process will be started with at least the standard gatho environment variables from `ctx.env`,
- * which `start()` picks up automatically:
+ * establishes a uds notify channel, then starts the process with at least the standard
+ * gatho environment variables, which `start()` picks up automatically:
  * - `GATHO_ROOM_ID`: the room's unique identifier
- * - `GATHO_SOCKET`: the uds socket path for ipc communication with the server
  * - `GATHO_ROOM_TYPE`: the room type string
  * - `GATHO_SERVER_ID`: the id of the server this room is running on
  * - `GATHO_ROOM_SECRET`: a per-room secret for signing JWTs
+ * - `GATHO_NOTIFY_SOCKET`: where to dial the notify channel
  *
- * the caller is responsible for forwarding `ctx.data` (room-specific config) if the subprocess
- * needs it — typically by spreading it into `options.env` with whatever naming/transform you want.
+ * room-specific config (`ctx.data` in a custom `runner()`) is not forwarded automatically —
+ * use `options.env` (or a custom runner) to pass it with whatever naming/transform you want.
  *
- * wires `child.on('exit', ctx.stopped)` and returns a destructor that sends SIGTERM, escalating
- * to SIGKILL after `killTimeoutMs`.
+ * a spawn failure (e.g. missing binary) is surfaced as a synthesized `error` notify message
+ * so it's visible in gatho's own reporting, not just the host's stderr.
  *
- * @param ctx the runner spawn context, provided by the enclosing `runner()` callback
  * @param command the full argv array for the subprocess, e.g. `['bun', 'run', 'game-room.ts']`
- * @param options additional env vars and kill timeout
- * @returns a Destructor that terminates the subprocess
+ * @param options additional env vars, kill timeout, socket dir
  */
-function subprocess(ctx, command, options) {
+function subprocess(command, options) {
     const killTimeout = options?.killTimeoutMs ?? SIGKILL_DELAY_MS;
-    const env = {
-        ...process.env,
-        ...options?.env,
-        ...ctx.env,
-    };
-    const child = spawn(command[0], command.slice(1), {
-        env: env,
-        stdio: ['ignore', 'inherit', 'inherit'],
+    return runner(async (ctx) => {
+        const chan = await notify.uds(ctx, { socketDir: options?.socketDir });
+        const userEnv = typeof options?.env === 'function' ? options.env(ctx) : options?.env;
+        const env = {
+            ...process.env,
+            ...userEnv,
+            ...ctx.env,
+            ...chan.env,
+        };
+        const child = spawn(command[0], command.slice(1), {
+            env: env,
+            stdio: ['ignore', 'inherit', 'inherit'],
+        });
+        // single exit path — 'error' (spawn failure) and 'exit' can both fire;
+        // report once, then tear the channel down.
+        let reported = false;
+        function report(code) {
+            if (reported)
+                return;
+            reported = true;
+            chan.close();
+            ctx.stopped(code);
+        }
+        child.on('exit', (code) => report(code));
+        child.on('error', (err) => {
+            ctx.onMessage({ type: 'error', message: `subprocess spawn failed: ${err.message}` });
+            report(-1);
+        });
+        let killed = false;
+        return () => {
+            if (killed)
+                return;
+            killed = true;
+            child.kill('SIGTERM');
+            const timer = setTimeout(() => {
+                child.kill('SIGKILL');
+            }, killTimeout);
+            timer.unref();
+        };
     });
-    child.on('exit', (code) => ctx.stopped(code));
-    let killed = false;
-    return () => {
-        if (killed)
-            return;
-        killed = true;
-        child.kill('SIGTERM');
-        const timer = setTimeout(() => {
-            child.kill('SIGKILL');
-        }, killTimeout);
-        timer.unref();
-    };
 }
 
-export { runner, start, subprocess };
+export { notify, roomSocketPath, runner, start, subprocess };
 //# sourceMappingURL=server.js.map

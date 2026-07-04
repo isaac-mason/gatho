@@ -1,14 +1,30 @@
-import { randomBytes, randomUUID } from 'node:crypto';
 import { jwtVerify } from '../common/jwt';
 import { createLogger, type Logger } from '../common/logger';
+import type { Notifier, ProcessMetricsMessage } from '../common/notify-protocol';
 import { frameUserMessage, packProtocol, unpackFrame } from '../common/protocol';
-import type { RoomMessage } from '../common/uds';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
-import { connectToSocket } from './ipc';
+import { connectNotify, parseNotifyTarget } from './ipc';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
 import { wsTransport } from './transport/ws';
 
 const HEARTBEAT_INTERVAL_MS = 3000;
+
+// --- runtime-neutral helpers ---
+// the room engine runs in node, bun, deno, and workerd isolates. node-only
+// surfaces (process env/metrics/signals, node:net) are feature-detected or
+// lazily imported; entropy comes from webcrypto.
+
+function readEnv(key: string): string | undefined {
+    return typeof process !== 'undefined' ? process.env?.[key] : undefined;
+}
+
+function randomHex(byteLength: number): string {
+    const buf = new Uint8Array(byteLength);
+    crypto.getRandomValues(buf);
+    let hex = '';
+    for (const b of buf) hex += b.toString(16).padStart(2, '0');
+    return hex;
+}
 
 function safeCall(log: Logger, label: string, fn: () => void | Promise<void>): void {
     Promise.resolve()
@@ -17,11 +33,6 @@ function safeCall(log: Logger, label: string, fn: () => void | Promise<void>): v
             log.error(`${label} threw unexpectedly`, { err });
         });
 }
-
-type IpcConnection = {
-    send(msg: RoomMessage): void;
-    close(): void;
-};
 
 type TrackedClient = {
     id: string;
@@ -50,7 +61,7 @@ type RoomState = {
     roomSecret: string | null;
     clients: Map<string, TrackedClient>;
     sessionTokens: Map<string, string>; // token -> clientId
-    ipc: IpcConnection | null;
+    ipc: Notifier | null;
     heartbeatInterval: ReturnType<typeof setInterval> | null;
     alive: boolean;
     server: TransportServer | null;
@@ -67,10 +78,14 @@ const BROADCAST_TOPIC = 'room';
  *  when the server spawns a room process, it sets these env vars automatically.
  *  you can also pass them explicitly for custom setups. */
 export type ServerConfig = {
-    /** uds socket path — falls back to `GATHO_SOCKET`.
-     *  presence of this (from option or env) triggers ipc connection,
-     *  heartbeats, and ready signal to the parent server. */
-    socket?: string;
+    /** notify channel back to the managing server — either a `Notifier` object
+     *  (when the room is hosted in the same process as something that can hand
+     *  it one) or a string: `uds:<path>`, `tcp://host:port?token=…`, or a bare
+     *  filesystem path (treated as a uds socket path). falls back to
+     *  `GATHO_NOTIFY_SOCKET`. presence of either (option or env) triggers
+     *  managed mode: heartbeats, ready signal, and client tracking to the
+     *  parent server. */
+    notify?: Notifier | string;
 
     /** room identity — falls back to `GATHO_ROOM_ID`. */
     roomId?: string;
@@ -109,13 +124,14 @@ export type ServerConfig = {
  *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in. */
 export type StartOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
     /** server-managed config. when provided, fields override `GATHO_*` env vars.
-     *  when omitted, env vars are checked instead — if `GATHO_SOCKET` is set,
-     *  the room connects ipc automatically. mutually exclusive with `standalone`. */
+     *  when omitted, env vars are checked instead — if `GATHO_NOTIFY_SOCKET` is
+     *  set, the room connects its notify channel automatically. mutually
+     *  exclusive with `standalone`. */
     server?: ServerConfig;
 
     /** explicit opt-in to run without a managed server context. required when
-     *  neither `GATHO_SOCKET`/`GATHO_ROOM_SECRET` env vars are set nor
-     *  `options.server.socket`/`options.server.roomSecret` are provided —
+     *  neither `GATHO_NOTIFY_SOCKET`/`GATHO_ROOM_SECRET` env vars are set nor
+     *  `options.server.notify`/`options.server.roomSecret` are provided —
      *  otherwise `start()` throws. when `true`, all managed config (env vars and
      *  `options.server`) is ignored; a warning is logged if any was present. */
     standalone?: boolean;
@@ -362,18 +378,25 @@ function startHeartbeat(state: RoomState): void {
             }
         }
 
-        const mem = process.memoryUsage();
-        const cpu = process.cpuUsage();
-        ipc.send({
-            type: 'heartbeat',
-            timestamp: Date.now(),
-            metrics: {
+        // process metrics are node/bun-only — omitted where the runtime can't
+        // report them (e.g. workerd isolates). the wire schema marks them optional.
+        let metrics: ProcessMetricsMessage | undefined;
+        if (typeof process !== 'undefined' && typeof process.memoryUsage === 'function' && typeof process.cpuUsage === 'function') {
+            const mem = process.memoryUsage();
+            const cpu = process.cpuUsage();
+            metrics = {
                 memoryRss: mem.rss,
                 memoryHeapUsed: mem.heapUsed,
                 memoryHeapTotal: mem.heapTotal,
                 cpuUser: cpu.user,
                 cpuSystem: cpu.system,
-            },
+            };
+        }
+
+        ipc.send({
+            type: 'heartbeat',
+            timestamp: Date.now(),
+            metrics,
             clients,
         });
     }, HEARTBEAT_INTERVAL_MS);
@@ -404,7 +427,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
     });
 
     const handlers: TransportHandlers = {
-        upgrade(query: string) {
+        async upgrade(query: string) {
             const params = new URLSearchParams(query);
 
             // check for session token — reconnection attempt
@@ -433,7 +456,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 const token = params.get('token');
                 if (!token) return null;
 
-                const payload = jwtVerify(token, state.roomSecret);
+                const payload = await jwtVerify(token, state.roomSecret);
                 if (!payload) return null;
 
                 const clientId = payload.clientId as string;
@@ -448,7 +471,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             }
 
             // dev mode — no jwt verification, generate identity
-            return { clientId: randomUUID(), joinData: {}, tags: {} };
+            return { clientId: crypto.randomUUID(), joinData: {}, tags: {} };
         },
 
         open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>) {
@@ -475,7 +498,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 }
 
                 // generate session token
-                const sessionToken = randomBytes(16).toString('hex');
+                const sessionToken = randomHex(16);
                 state.sessionTokens.set(sessionToken, clientId);
 
                 // track client
@@ -558,7 +581,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
 
             // invalidate old session token, generate new one
             state.sessionTokens.delete(tracked.sessionToken);
-            const newToken = randomBytes(16).toString('hex');
+            const newToken = randomHex(16);
             tracked.sessionToken = newToken;
             state.sessionTokens.set(newToken, clientId);
 
@@ -691,20 +714,26 @@ async function stopRoom<ClientData>(
 }
 
 // env vars that indicate a managed server context
-const MANAGED_ENV_KEYS = ['GATHO_SOCKET', 'GATHO_ROOM_ID', 'GATHO_ROOM_TYPE', 'GATHO_ROOM_SECRET', 'GATHO_SERVER_ID'] as const;
+const MANAGED_ENV_KEYS = [
+    'GATHO_NOTIFY_SOCKET',
+    'GATHO_ROOM_ID',
+    'GATHO_ROOM_TYPE',
+    'GATHO_ROOM_SECRET',
+    'GATHO_SERVER_ID',
+] as const;
 
 export async function start<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(
     options: StartOptions<ClientData, JoinData>,
 ): Promise<Room<ClientData>> {
     // --- resolve managed context ---
 
-    const presentEnvKeys = MANAGED_ENV_KEYS.filter((k) => process.env[k] !== undefined);
+    const presentEnvKeys = MANAGED_ENV_KEYS.filter((k) => readEnv(k) !== undefined);
     const hasServerOption = options.server !== undefined;
 
     let server: ServerConfig | undefined;
     let roomId: string;
     let roomType: string;
-    let socketPath: string | undefined;
+    let notifySource: Notifier | string | undefined;
     let roomSecret: string | null;
     let serverId: string | undefined;
 
@@ -720,45 +749,44 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
             createLogger().warn(`gatho/room: standalone: true is set, ignoring managed context from ${bits}`);
         }
         server = undefined;
-        roomId = randomUUID();
+        roomId = crypto.randomUUID();
         roomType = 'room';
-        socketPath = undefined;
+        notifySource = undefined;
         roomSecret = null;
         serverId = undefined;
     } else {
         server = options.server;
-        roomId = server?.roomId ?? process.env.GATHO_ROOM_ID ?? randomUUID();
-        roomType = server?.roomType ?? process.env.GATHO_ROOM_TYPE ?? 'room';
-        socketPath = server?.socket ?? process.env.GATHO_SOCKET;
-        roomSecret = server?.roomSecret ?? process.env.GATHO_ROOM_SECRET ?? null;
-        serverId = server?.serverId ?? process.env.GATHO_SERVER_ID;
+        roomId = server?.roomId ?? readEnv('GATHO_ROOM_ID') ?? crypto.randomUUID();
+        roomType = server?.roomType ?? readEnv('GATHO_ROOM_TYPE') ?? 'room';
+        roomSecret = server?.roomSecret ?? readEnv('GATHO_ROOM_SECRET') ?? null;
+        serverId = server?.serverId ?? readEnv('GATHO_SERVER_ID');
+
+        // notify channel resolution: explicit option → GATHO_NOTIFY_SOCKET
+        // (a `uds:`/`tcp://` uri, or a bare uds socket path)
+        notifySource = server?.notify ?? readEnv('GATHO_NOTIFY_SOCKET');
 
         // fail closed: require managed context OR explicit standalone opt-in.
         // this prevents accidentally running a room with no auth in production.
-        if (!socketPath && !roomSecret) {
+        if (!notifySource && !roomSecret) {
             throw new Error(
                 'gatho/room start(): no managed server context detected ' +
-                    '(no GATHO_SOCKET / GATHO_ROOM_SECRET, and no options.server.socket / roomSecret). ' +
+                    '(no GATHO_NOTIFY_SOCKET / GATHO_ROOM_SECRET env vars, and no options.server.notify / roomSecret). ' +
                     'If running this room directly for local dev or tests, pass `standalone: true`. ' +
                     'Otherwise ensure the gatho server spawned this process so GATHO_* env vars are set.',
             );
         }
     }
 
-    // set up ipc if socket path is present (managed mode)
-    let ipc: IpcConnection | null = null;
+    // set up the notify link (managed mode). a Notifier object is used as-is
+    // (in-process hosting); a uri string is dialed over uds/tcp — node:net is
+    // loaded lazily inside the dialer, so non-node bundles that always pass a
+    // Notifier object never execute a node import.
+    let ipc: Notifier | null = null;
 
-    if (socketPath) {
-        const conn = await connectToSocket(socketPath);
-
-        ipc = {
-            send(msg: RoomMessage) {
-                conn.send(msg);
-            },
-            close() {
-                conn.close();
-            },
-        };
+    if (typeof notifySource === 'string') {
+        ipc = await connectNotify(parseNotifyTarget(notifySource));
+    } else if (notifySource) {
+        ipc = notifySource;
     }
 
     const log = createLogger().child({ roomId, roomType });
@@ -797,13 +825,17 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
         ipc.send({ type: 'ready', port });
     }
 
-    const sigtermHandler = () => {
-        stopRoom(state, false, room, options.onShutdown, options.onLeave).catch((err) => {
-            state.log.error('error during shutdown', { err });
-        });
-    };
-    state.sigtermHandler = sigtermHandler;
-    process.on('SIGTERM', sigtermHandler);
+    // signal handling belongs to whoever owns the process — install only where
+    // there is one (node/bun/deno; workerd isolates have no signals).
+    if (typeof process !== 'undefined' && typeof process.on === 'function') {
+        const sigtermHandler = () => {
+            stopRoom(state, false, room, options.onShutdown, options.onLeave).catch((err) => {
+                state.log.error('error during shutdown', { err });
+            });
+        };
+        state.sigtermHandler = sigtermHandler;
+        process.on('SIGTERM', sigtermHandler);
+    }
 
     return room;
 }

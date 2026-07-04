@@ -1,4 +1,5 @@
+export { type DirectNotifyChannel, notify, roomSocketPath, type TcpNotifyChannel, type TcpNotifyOptions, type UdsNotifyChannel, type UdsNotifyOptions, } from './runner/notify';
+export { type Destructor, type RunnerSpawnContext, type RunnerSpawnFn, runner } from './runner/runner';
 export type { RoomRunner, SpawnContext, SpawnResult } from './runner/types';
-export { type RunnerSpawnContext, type Destructor, type RunnerSpawnFn, runner } from './runner/runner';
-export { type CreateServerOptions, start, type RoomDetails, type RoomEndpointFn as EndpointFn, type Server, } from './server';
+export { type CreateServerOptions, type RoomDetails, type RoomEndpointFn as EndpointFn, type Server, start, } from './server';
 export { type SubprocessOptions, subprocess } from './subprocess';

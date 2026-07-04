@@ -1,17 +1,48 @@
 import { EventEmitter } from 'node:events';
-import { createHmac } from 'node:crypto';
 import postgres from 'postgres';
 import Redis from 'ioredis';
 
 // minimal hmac-sha256 jwt — no external deps.
-// single source of truth for sign + verify across drivers and room workers.
+// single source of truth for sign + verify across drivers and rooms.
+//
+// built on WebCrypto (async) rather than node:crypto so the verify side runs
+// in any runtime a room might be hosted in (node, workerd, deno, bun).
+const encoder = new TextEncoder();
+function toBase64Url(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++)
+        bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+// CryptoKey cache — importKey is an async round-trip and sign/verify sit on hot
+// paths (every reservation, every ws upgrade). keyed by usage+secret; capped so
+// a long-lived process signing for many rooms doesn't grow unboundedly (Map
+// iteration order = insertion order, so evicting the first entry is FIFO).
+const KEY_CACHE_MAX = 256;
+const keyCache = new Map();
+function hmacKey(secret, usage) {
+    const cacheKey = `${usage}:${secret}`;
+    const cached = keyCache.get(cacheKey);
+    if (cached)
+        return cached;
+    const key = crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [usage]);
+    if (keyCache.size >= KEY_CACHE_MAX) {
+        const oldest = keyCache.keys().next().value;
+        if (oldest !== undefined)
+            keyCache.delete(oldest);
+    }
+    keyCache.set(cacheKey, key);
+    key.catch(() => keyCache.delete(cacheKey));
+    return key;
+}
 // static header — always the same, computed once
-const JWT_HEADER = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+const JWT_HEADER = toBase64Url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
 /** sign a payload with hs256, returns a compact jwt string */
-function jwtSign(payload, secret) {
-    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
-    const signature = createHmac('sha256', secret).update(`${JWT_HEADER}.${body}`).digest('base64url');
-    return `${JWT_HEADER}.${body}.${signature}`;
+async function jwtSign(payload, secret) {
+    const body = toBase64Url(encoder.encode(JSON.stringify(payload)));
+    const key = await hmacKey(secret, 'sign');
+    const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(`${JWT_HEADER}.${body}`)));
+    return `${JWT_HEADER}.${body}.${toBase64Url(signature)}`;
 }
 
 // typed domain errors for gatho
@@ -353,7 +384,7 @@ function createMemoryDriver() {
         const expiresAt = Date.now() + ttl;
         // mint jwt signed with the room's secret. tags travel as a separate
         // claim from user data so the room can forward them back over ipc.
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, r.roomSecret);
+        const token = await jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, r.roomSecret);
         clients.set(clientId, {
             clientId,
             roomId,
@@ -815,7 +846,7 @@ async function createPostgresDriver(options = {}) {
         const expiresAt = Date.now() + ttl;
         // tags travel as a separate jwt claim from user data so the room can
         // forward them back over ipc to connectClient (mirrors redis driver).
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, room.room_secret);
+        const token = await jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, room.room_secret);
         await db `
             insert into ${db.unsafe(t.clients)} (client_id, room_id, status, expires_at, tags, connected_at)
             values (${clientId}, ${roomId}, 'reserved', ${expiresAt}, ${db.json(clientTags)}, 0)
@@ -1524,7 +1555,7 @@ function createRedisDriver(options = {}) {
         // tags travel as a separate claim from user data: rooms are untrusted and
         // must forward tags back over ipc so connectClient can reconstitute the
         // hash if redis evicted it during the reserve→connect window.
-        const token = jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, roomData.roomSecret);
+        const token = await jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, roomData.roomSecret);
         // store client record
         await client.hset(keys.client(clientId), {
             clientId,

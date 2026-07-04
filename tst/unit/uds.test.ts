@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { ipcCodec, createFrameReader, type RoomMessage } from '../../src/common/uds';
+import { notifyCodec, createFrameReader, type NotifyMessage } from '../../src/common/notify-protocol';
 
-describe('uds ipc codec', () => {
+describe('notify codec', () => {
     // round-trip every message variant through pack/unpack
-    const variants: RoomMessage[] = [
+    const variants: NotifyMessage[] = [
         { type: 'ready', port: 8080 },
         { type: 'ready', port: 0 },
         { type: 'ready', port: 65535 },
@@ -34,6 +34,14 @@ describe('uds ipc codec', () => {
             },
             clients: [],
         },
+        // metrics omitted — a room runtime without process metrics (e.g. a
+        // workerd isolate) reports a heartbeat with no `metrics` value.
+        {
+            type: 'heartbeat',
+            timestamp: 1713300000000,
+            metrics: undefined,
+            clients: [{ clientId: 'no-metrics', tags: {} }],
+        },
         { type: 'client-connected', clientId: 'user-abc', roomId: 'room-1', tags: { team: 'red' } },
         { type: 'client-connected', clientId: 'user-def', roomId: 'room-2', tags: {} },
         { type: 'client-disconnected', clientId: 'user-abc' },
@@ -43,21 +51,33 @@ describe('uds ipc codec', () => {
 
     for (const msg of variants) {
         it(`round-trips ${msg.type}`, () => {
-            const packed = ipcCodec.pack(msg);
+            const packed = notifyCodec.pack(msg);
             expect(packed).toBeInstanceOf(Uint8Array);
             expect(packed.byteLength).toBeGreaterThan(0);
 
-            const unpacked = ipcCodec.unpack(packed);
+            const unpacked = notifyCodec.unpack(packed);
             expect(unpacked).toEqual(msg);
         });
     }
+
+    it('heartbeat round-trips with metrics omitted (undefined)', () => {
+        const msg: NotifyMessage = {
+            type: 'heartbeat',
+            timestamp: 1713300000000,
+            metrics: undefined,
+            clients: [{ clientId: 'abc', tags: {} }],
+        };
+        const unpacked = notifyCodec.unpack(notifyCodec.pack(msg)) as { metrics?: unknown };
+        expect(unpacked).toEqual(msg);
+        expect(unpacked.metrics).toBeUndefined();
+    });
 
     it('heartbeat with many clients', () => {
         const clients = Array.from({ length: 200 }, (_, i) => ({
             clientId: `client-${i}`,
             tags: { idx: String(i) },
         }));
-        const msg: RoomMessage = {
+        const msg: NotifyMessage = {
             type: 'heartbeat',
             timestamp: 1713300000000,
             metrics: {
@@ -69,34 +89,34 @@ describe('uds ipc codec', () => {
             },
             clients,
         };
-        const unpacked = ipcCodec.unpack(ipcCodec.pack(msg));
+        const unpacked = notifyCodec.unpack(notifyCodec.pack(msg));
         expect(unpacked).toEqual(msg);
         expect((unpacked as { clients: unknown[] }).clients).toHaveLength(200);
     });
 
     it('port uses uint16 — max value 65535', () => {
-        const msg: RoomMessage = { type: 'ready', port: 65535 };
-        const unpacked = ipcCodec.unpack(ipcCodec.pack(msg));
+        const msg: NotifyMessage = { type: 'ready', port: 65535 };
+        const unpacked = notifyCodec.unpack(notifyCodec.pack(msg));
         expect((unpacked as { port: number }).port).toBe(65535);
     });
 
     it('timestamp preserves millisecond precision via float64', () => {
         const ts = 1713300000123.456;
-        const msg: RoomMessage = {
+        const msg: NotifyMessage = {
             type: 'heartbeat',
             timestamp: ts,
             metrics: { memoryRss: 0, memoryHeapUsed: 0, memoryHeapTotal: 0, cpuUser: 0, cpuSystem: 0 },
             clients: [],
         };
-        const unpacked = ipcCodec.unpack(ipcCodec.pack(msg));
+        const unpacked = notifyCodec.unpack(notifyCodec.pack(msg));
         expect((unpacked as { timestamp: number }).timestamp).toBe(ts);
     });
 });
 
 describe('createFrameReader', () => {
-    // helper: build a raw length-prefixed frame from a RoomMessage
-    function buildFrame(msg: RoomMessage): Buffer {
-        const payload = ipcCodec.pack(msg);
+    // helper: build a raw length-prefixed frame from a NotifyMessage
+    function buildFrame(msg: NotifyMessage): Buffer {
+        const payload = notifyCodec.pack(msg);
         const frame = Buffer.alloc(4 + payload.byteLength);
         frame.writeUInt32BE(payload.byteLength, 0);
         frame.set(payload, 4);
@@ -104,10 +124,10 @@ describe('createFrameReader', () => {
     }
 
     it('delivers a single complete frame', () => {
-        const received: RoomMessage[] = [];
+        const received: NotifyMessage[] = [];
         const push = createFrameReader((msg) => received.push(msg));
 
-        const msg: RoomMessage = { type: 'ready', port: 3000 };
+        const msg: NotifyMessage = { type: 'ready', port: 3000 };
         push(buildFrame(msg));
 
         expect(received).toHaveLength(1);
@@ -115,10 +135,10 @@ describe('createFrameReader', () => {
     });
 
     it('delivers multiple frames from a single chunk', () => {
-        const received: RoomMessage[] = [];
+        const received: NotifyMessage[] = [];
         const push = createFrameReader((msg) => received.push(msg));
 
-        const msgs: RoomMessage[] = [
+        const msgs: NotifyMessage[] = [
             { type: 'ready', port: 3000 },
             { type: 'client-connected', clientId: 'a', roomId: 'room-1', tags: {} },
             { type: 'stopped' },
@@ -134,10 +154,10 @@ describe('createFrameReader', () => {
     });
 
     it('handles partial frames across multiple pushes', () => {
-        const received: RoomMessage[] = [];
+        const received: NotifyMessage[] = [];
         const push = createFrameReader((msg) => received.push(msg));
 
-        const msg: RoomMessage = { type: 'client-connected', clientId: 'test-user-123', roomId: 'room-1', tags: {} };
+        const msg: NotifyMessage = { type: 'client-connected', clientId: 'test-user-123', roomId: 'room-1', tags: {} };
         const frame = buildFrame(msg);
 
         // split at an arbitrary point in the middle
@@ -151,10 +171,10 @@ describe('createFrameReader', () => {
     });
 
     it('handles byte-at-a-time delivery', () => {
-        const received: RoomMessage[] = [];
+        const received: NotifyMessage[] = [];
         const push = createFrameReader((msg) => received.push(msg));
 
-        const msg: RoomMessage = { type: 'stopped' };
+        const msg: NotifyMessage = { type: 'stopped' };
         const frame = buildFrame(msg);
 
         for (let i = 0; i < frame.byteLength; i++) {
@@ -166,10 +186,10 @@ describe('createFrameReader', () => {
     });
 
     it('handles split across header boundary', () => {
-        const received: RoomMessage[] = [];
+        const received: NotifyMessage[] = [];
         const push = createFrameReader((msg) => received.push(msg));
 
-        const msg: RoomMessage = { type: 'error', message: 'uh oh' };
+        const msg: NotifyMessage = { type: 'error', message: 'uh oh' };
         const frame = buildFrame(msg);
 
         // push only 2 of 4 header bytes first
@@ -182,11 +202,11 @@ describe('createFrameReader', () => {
     });
 
     it('interleaves partial and complete frames', () => {
-        const received: RoomMessage[] = [];
+        const received: NotifyMessage[] = [];
         const push = createFrameReader((msg) => received.push(msg));
 
-        const msg1: RoomMessage = { type: 'ready', port: 9000 };
-        const msg2: RoomMessage = { type: 'client-disconnected', clientId: 'x' };
+        const msg1: NotifyMessage = { type: 'ready', port: 9000 };
+        const msg2: NotifyMessage = { type: 'client-disconnected', clientId: 'x' };
         const frame1 = buildFrame(msg1);
         const frame2 = buildFrame(msg2);
 
