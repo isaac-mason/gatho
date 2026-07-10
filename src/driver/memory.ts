@@ -50,15 +50,33 @@ type ServerRecord = {
     lastHeartbeat: number;
 };
 
-const STALE_MS = 30_000;
+const DEFAULT_STALE_SERVER_MS = 30_000;
 const PRUNE_INTERVAL_MS = 10_000;
+
+/** options for creating an in-memory driver */
+export type MemoryDriverOptions = {
+    /**
+     * how long (ms) a server may go without a heartbeat before it is treated as
+     * dead — dropped from listServers and pruned (with its rooms) by the
+     * background prune loop. defaults to 30_000.
+     *
+     * tradeoff: a lower value fails a dead server over faster, but is less
+     * tolerant of transient blips; a higher value tolerates blips at the cost
+     * of slower failover. must comfortably exceed the server's
+     * heartbeatIntervalMs (default 5_000). rarely worth tuning for the memory
+     * driver — it is single-process, so the only staleness source is a server
+     * that genuinely stopped heartbeating.
+     */
+    staleServerMs?: number;
+};
 
 /**
  * An in-memory driver.
  * good for local development, tests, and situationally onebox dev environments.
  * note that you must pass the same driver object to both the server and sdk in order for them to see each other's state.
  */
-export function createMemoryDriver(): Driver {
+export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
+    const staleServerMs = options.staleServerMs ?? DEFAULT_STALE_SERVER_MS;
     const rooms = new Map<string, RoomRecord>();
     const clients = new Map<string, ClientRecord>();
     const servers = new Map<string, ServerRecord>();
@@ -87,7 +105,7 @@ export function createMemoryDriver(): Driver {
             status: r.status,
             endpoint: r.endpoint,
             clients: getClientsForRoom(r.roomId),
-            data: r.data,
+            data: { ...r.data },
             tags: { ...r.tags },
             createdAt: r.createdAt,
         };
@@ -123,7 +141,7 @@ export function createMemoryDriver(): Driver {
     // prune stale servers (and their rooms/clients) + expired client reservations
     function prune(): void {
         const now = Date.now();
-        const staleCutoff = now - STALE_MS;
+        const staleCutoff = now - staleServerMs;
 
         // collect stale server ids
         const staleServerIds: string[] = [];
@@ -415,7 +433,7 @@ export function createMemoryDriver(): Driver {
     }
 
     async function listServers(filter?: ListServersFilter): Promise<ServerInfo[]> {
-        const cutoff = Date.now() - STALE_MS;
+        const cutoff = Date.now() - staleServerMs;
         let result = Array.from(servers.values()).filter((s) => s.lastHeartbeat >= cutoff);
 
         if (filter?.roomTypes) {
@@ -437,7 +455,7 @@ export function createMemoryDriver(): Driver {
     }
 
     async function listStaleServers(): Promise<ServerInfo[]> {
-        const cutoff = Date.now() - STALE_MS;
+        const cutoff = Date.now() - staleServerMs;
         const result: ServerInfo[] = [];
         for (const s of servers.values()) {
             if (s.lastHeartbeat < cutoff) result.push(serverToInfo(s));
