@@ -101,3 +101,91 @@
   spawn pulls the image).
 - **server:** `getRoomDetails` / `getAllRoomDetails` now include `status`
   (`'starting' | 'ready' | 'stopped'`) and `lastHeartbeatAt`.
+
+### review-fixes series (robustness + api reshape)
+
+A pass over robustness, ergonomics, and the public API surface. Pre-1.0, so the
+breaking changes below ship without compat shims.
+
+- **protocol:** a `PROTOCOL_VERSION` handshake now gates every connection. The client
+  stamps its version onto the connect URL; a room with a different version rejects the
+  connection with a readable `auth_error` (`protocol version mismatch (client <x>, server <y>)`)
+  and closes 4000, instead of a cryptic transport failure. Versions must match exactly —
+  no negotiation. **Breaking:** clients and rooms must be redeployed together.
+- **client:** two-phase and single-handler reshape of `gatho/client`.
+  - `connect(url, handlers)` now takes a **single-handler bag** — one optional callback per
+    event (`onOpen`, `onMessage`, `onDrop`, `onReconnect`, `onAuthError`, `onClose`, `onError`).
+    **Breaking:** `on`/`off` are removed; the socket is not an app-wide event bus, so app code
+    fans out from the single handlers itself.
+  - `conn.clientId` — the room-assigned id, delivered on the `session` message and exposed as
+    `readonly clientId: string | null` (null until the first session arrives).
+  - `open` (and `onOpen`) now fires on **receipt of the `session` message**, not on raw ws open,
+    so "open" means authenticated and joined — symmetric with the room's `onJoin`. The minUptime
+    timer starts at session receipt.
+  - Reliable sends issued while `connecting` are buffered (reusing the reconnect buffer + overflow
+    policy) and flushed in order on open. Unreliable sends still drop while not open.
+  - Reconnection gives up after a **10-attempt cap** (reset on success) and enters a terminal
+    close with cause `reconnect-failed`.
+  - `onClose(info)` carries a structured `info.cause`: `consented | auth | session |
+    reconnect-failed | buffer-overflow | initial-connect-failed | server`. **Breaking:** the old
+    `(code, reason)` close signature is gone; `CloseCause` and `CloseInfo` are exported.
+- **room:** two-phase API + per-client verbs + single stable client handles.
+  - `create(options)` (from `gatho/room`) builds a room synchronously and returns the handle;
+    `await room.start()` brings it online. **Breaking:** replaces the old one-shot `start(options)`.
+    Lifecycle callbacks are declared on `create()` and **no longer receive a `room` argument** —
+    close over the returned handle.
+  - Per-client verbs move onto the client handle: `client.send()`, `client.allowReconnection()`,
+    `client.disconnect()`. **Breaking:** `room.send` / `room.allowReconnection` / `room.disconnect`
+    are removed. The room keeps `broadcast`, `clients`, `stop`, and identity.
+  - Client handles are now **stable for a client's whole lifetime** — one cached object per tracked
+    client, so `Map<Client, T>` keys and `===` identity checks work. Verbs on a dead handle
+    (post-`onLeave`) are silent no-ops.
+  - `client.bufferedAmount` — a readonly getter over the socket's outbound buffer depth (0 when
+    disconnected/unobservable), the pacing signal for large-payload streaming.
+  - `broadcast(message, { except })` skips specific clients (a `Client` or `Client[]`); excluded
+    clients receive nothing, not even a buffered copy on reconnect. The pub/sub fast path is kept
+    when `except` is unset.
+  - `room.clients` is now **iterable** (`for (const c of room.clients)`), without allocating an
+    array per step.
+  - `broadcast`/`client.*` before `start()` throw (programming error); post-`stop()` they stay
+    silent no-ops. A created-but-unstarted room warns once after ~5s (dev insurance).
+- **room (auth/transport hardening):** clients subscribe to the broadcast topic only **after**
+  `onAuth` resolves ok (no broadcast leakage during the auth window); a duplicate connection for a
+  clientId that already holds a live socket is rejected (`seat already in use`); the ws transport's
+  `message`/`close` handlers no-op for a socket that is no longer the current one for its clientId;
+  and a client that reconnects while `onDrop` is still awaiting is no longer evicted.
+- **sdk / control plane:**
+  - `createRoom` now **rejects fast with the real cause**. Drivers publish a room-failure signal
+    (redis pub/sub / memory event) that `waitForRoom` subscribes to alongside ready; on failure the
+    SDK rejects with a typed **`RoomFailedError`** (extends `GathoError`) instead of burning the
+    full `timeoutMs`. The timeout remains a backstop.
+  - `CreateRoomOptions.data` and `.tags` are now **optional** (default `{}`), and `JoinOptions.ttl`
+    defaults to `30000` (ms).
+  - `join({ data })` is capped at 2048 bytes and `join({ tags })` at 512 bytes (serialized);
+    exceeding either throws a typed `PayloadTooLargeError`.
+- **server:** `start()` **fails fast** when a networked (non-local) driver is used, `serverEndpoint`
+  is unset, and the effective bind host is a wildcard (`0.0.0.0`, `::`, unset) — an unroutable
+  endpoint would make servers evict each other. Set `serverEndpoint` to a reachable URL. Memory-driver
+  oneboxes keep working with defaults.
+- **server:** a timed-out `punctuate` heartbeat tick can no longer act on stale conclusions — the run
+  callback receives a currency token and no-ops its destructive actions (e.g. `destroyWorker`) if it
+  outlived its tick.
+- **server:** when a server's driver record is reaped while it is still alive, its still-`ready` local
+  rooms are **re-asserted** (re-registered + `roomReady`) instead of being killed by the empty desired
+  set. (Room tags from the original `createRoom` are lost on restore — a warn notes this.)
+- **drivers:**
+  - `ioredis` moved from a dependency to an **optional peer dependency**. The redis driver now lives
+    at its own subpath **`gatho/driver/redis`** (`createRedisDriver`); `gatho/driver` (memory driver,
+    types, errors) no longer statically pulls in ioredis, so memory-only installs import cleanly
+    without it. **Breaking:** import `createRedisDriver` from `gatho/driver/redis`, and
+    `npm install ioredis` when you use it.
+  - The redis read paths are **pipelined** (`getClientsForRoom`, `listRooms`, `getRoomsForServer`,
+    `listServers`) — one round trip per batch instead of N.
+  - `staleServerMs` (default `30000`) is now configurable on both drivers — the threshold past which a
+    silent server is treated as dead and pruned.
+  - Memory driver `roomToInfo` now copies `data` by value (like it already did for tags).
+- **messaging (contract):** the `{ reliable: false }` send option is now documented as a
+  **transport-agnostic** contract — best-effort, may drop, may reorder, never buffered or
+  retransmitted, keep payloads small (~1KB), no ordering guarantee between the reliable and
+  unreliable channels. WebSocket's happens-to-be-ordered behaviour is explicitly not promised, and
+  WebTransport datagrams will map onto this contract later.
