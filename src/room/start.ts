@@ -1,7 +1,7 @@
 import { jwtVerify } from '../common/jwt';
 import { createLogger, type Logger } from '../common/logger';
 import type { Notifier, ProcessMetricsMessage } from '../common/notify-protocol';
-import { frameUserMessage, packProtocol, PROTOCOL_VERSION, unpackFrame } from '../common/protocol';
+import { frameUserMessage, PROTOCOL_VERSION, packProtocol, unpackFrame } from '../common/protocol';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
 import { connectNotify, parseNotifyTarget } from './ipc';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
@@ -381,7 +381,11 @@ function startHeartbeat(state: RoomState): void {
         // process metrics are node/bun-only — omitted where the runtime can't
         // report them (e.g. workerd isolates). the wire schema marks them optional.
         let metrics: ProcessMetricsMessage | undefined;
-        if (typeof process !== 'undefined' && typeof process.memoryUsage === 'function' && typeof process.cpuUsage === 'function') {
+        if (
+            typeof process !== 'undefined' &&
+            typeof process.memoryUsage === 'function' &&
+            typeof process.cpuUsage === 'function'
+        ) {
             const mem = process.memoryUsage();
             const cpu = process.cpuUsage();
             metrics = {
@@ -491,7 +495,13 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             return { clientId: crypto.randomUUID(), joinData: {}, tags: {} };
         },
 
-        open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>, versionMismatch?: string) {
+        open(
+            clientId: string,
+            socket: ClientSocket,
+            joinData: Record<string, unknown>,
+            tags: Record<string, string>,
+            versionMismatch?: string,
+        ) {
             // reject a protocol-version-mismatched client with a readable error
             // before doing any auth or state work.
             if (versionMismatch) {
@@ -499,8 +509,6 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 socket.close(4000, 'protocol version mismatch');
                 return;
             }
-
-            socket.subscribe(BROADCAST_TOPIC);
 
             (async () => {
                 let result: AuthResult<ClientData>;
@@ -538,6 +546,11 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                     tags,
                 };
                 state.clients.set(clientId, tracked);
+
+                // subscribe to broadcasts only now that auth has passed — a
+                // rejected client must never be subscribed, and broadcasts sent
+                // during a slow async onAuth must not reach an unauthenticated socket.
+                socket.subscribe(BROADCAST_TOPIC);
 
                 // send session token to client
                 socket.send(packProtocol({ type: 'session', token: sessionToken, clientId }), true);

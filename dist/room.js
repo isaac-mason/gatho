@@ -2342,6 +2342,12 @@ function wsTransport(config) {
                             handlers.open(clientId, wsSocket, joinData, tags, versionMismatch);
                         }
                         ws.on('message', (data, isBinary) => {
+                            // generation guard: ignore frames from a socket that is no
+                            // longer the current one for this clientId (a newer socket
+                            // replaced it, e.g. a reconnect). without this a lingering
+                            // stale socket could drive room logic against a live client.
+                            if (clientSockets.get(clientId) !== ws)
+                                return;
                             // normalize to arraybuffer — consistent with transport interface.
                             // we copy into a fresh ArrayBuffer to avoid SharedArrayBuffer issues
                             // with Buffer.buffer on some runtimes.
@@ -2364,7 +2370,13 @@ function wsTransport(config) {
                             handlers.message(clientId, ab, isBinary);
                         });
                         ws.on('close', (code) => {
-                            // clean up topic subscriptions
+                            // generation guard: is this socket still the current one
+                            // for its clientId? a stale socket (replaced by a reconnect
+                            // via completeUpgrade, which already dropped it from
+                            // clientSockets) must self-clean but MUST NOT touch the new
+                            // socket's mapping or drive room-side close logic.
+                            const isCurrent = clientSockets.get(clientId) === ws;
+                            // clean up this socket's own topic subscriptions
                             for (const topic of state.topics) {
                                 const subs = topics.get(topic);
                                 if (subs) {
@@ -2375,6 +2387,10 @@ function wsTransport(config) {
                                 }
                             }
                             connections.delete(ws);
+                            if (!isCurrent)
+                                return;
+                            // only the current socket owns the reverse mapping and the
+                            // room-side close — the normal single-socket close path.
                             clientSockets.delete(clientId);
                             handlers.close(clientId, code);
                         });
@@ -2602,7 +2618,9 @@ function startHeartbeat(state) {
         // process metrics are node/bun-only — omitted where the runtime can't
         // report them (e.g. workerd isolates). the wire schema marks them optional.
         let metrics;
-        if (typeof process !== 'undefined' && typeof process.memoryUsage === 'function' && typeof process.cpuUsage === 'function') {
+        if (typeof process !== 'undefined' &&
+            typeof process.memoryUsage === 'function' &&
+            typeof process.cpuUsage === 'function') {
             const mem = process.memoryUsage();
             const cpu = process.cpuUsage();
             metrics = {
@@ -2696,7 +2714,6 @@ function startRoom(state, transport, options) {
                 socket.close(4000, 'protocol version mismatch');
                 return;
             }
-            socket.subscribe(BROADCAST_TOPIC);
             (async () => {
                 let result;
                 try {
@@ -2729,6 +2746,10 @@ function startRoom(state, transport, options) {
                     tags,
                 };
                 state.clients.set(clientId, tracked);
+                // subscribe to broadcasts only now that auth has passed — a
+                // rejected client must never be subscribed, and broadcasts sent
+                // during a slow async onAuth must not reach an unauthenticated socket.
+                socket.subscribe(BROADCAST_TOPIC);
                 // send session token to client
                 socket.send(packProtocol({ type: 'session', token: sessionToken, clientId }), true);
                 // notify server for driver bookkeeping (managed mode only).
