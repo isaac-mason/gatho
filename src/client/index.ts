@@ -242,25 +242,11 @@ export function connect(url: string): RoomConnection {
                 socket.close();
                 return;
             }
-
-            if (!isReconnect) {
-                // initial connection — the ws is connected. transition to OPEN
-                // and flush anything the app queued while connecting, in order,
-                // before emitting open.
-                state = 'open';
-                openedAt = Date.now();
-
-                // start minUptime timer — if we stay open this long, reset retry count
-                uptimeTimer = setTimeout(() => {
-                    retryCount = 0;
-                }, MIN_UPTIME);
-
-                // flush the connecting buffer before notifying user code.
-                flushReliableBuffer(socket);
-
-                emit('open');
-            }
-            // for reconnection, we wait for __session to confirm
+            // both the initial connect and reconnect defer the open/reconnect
+            // transition to the `session` protocol message. a raw ws open means
+            // the socket is connected but not yet authenticated or joined, so we
+            // do nothing here and wait for `session`. this makes open mean
+            // "authenticated and joined" and symmetrizes with the reconnect path.
         };
 
         socket.onmessage = (event: MessageEvent) => {
@@ -292,6 +278,27 @@ export function connect(url: string): RoomConnection {
                         flushReliableBuffer(socket);
 
                         emit('reconnect');
+                        return;
+                    }
+
+                    if (!isReconnect && state === 'connecting') {
+                        // initial connection confirmed — the client is now
+                        // authenticated and joined. minUptime timer starts here,
+                        // at session receipt, not at raw ws open.
+                        state = 'open';
+                        openedAt = Date.now();
+
+                        // start minUptime timer
+                        uptimeTimer = setTimeout(() => {
+                            retryCount = 0;
+                        }, MIN_UPTIME);
+
+                        // flush anything buffered while connecting, in order,
+                        // BEFORE emitting open (mirrors the reconnect path).
+                        flushReliableBuffer(socket);
+
+                        emit('open');
+                        return;
                     }
                     return;
                 }
