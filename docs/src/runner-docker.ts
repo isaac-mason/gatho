@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { notify, runner, start } from 'gatho/server';
 
 // host and container share this dir so the socket path resolves inside the

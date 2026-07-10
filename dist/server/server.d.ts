@@ -1,4 +1,4 @@
-import type { Driver } from '../driver/types';
+import type { Driver, RoomData } from '../driver/types';
 import type { RoomRunner } from './runner/types';
 export type RoomEndpointFn = (info: {
     roomId: string;
@@ -63,3 +63,20 @@ export declare function reconcileClients(driver: Driver['_internal'], roomId: st
     tags: Record<string, string>;
 }[], heartbeatTimestamp: number): Promise<void>;
 export declare function start(options: CreateServerOptions): Promise<Server>;
+export type TestRoom = {
+    roomId: string;
+    roomType: string;
+    roomSecret: string;
+    data: RoomData;
+    endpoint: string | null;
+    status: 'starting' | 'ready' | 'stopped';
+};
+export declare function __heartbeatTickForTest(args: {
+    driver: Driver['_internal'];
+    serverId: string;
+    endpoint: string;
+    rooms: TestRoom[];
+    previouslyRegistered: boolean;
+}): Promise<{
+    killed: string[];
+}>;

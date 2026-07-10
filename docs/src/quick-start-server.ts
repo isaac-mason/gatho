@@ -1,5 +1,5 @@
 // server.ts
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { start, subprocess } from 'gatho/server';
 
 const driver = createRedisDriver({ url: 'redis://localhost:6379' });

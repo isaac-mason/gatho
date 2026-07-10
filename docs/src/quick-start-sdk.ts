@@ -1,5 +1,5 @@
 // my-backend.ts
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { createGathoSDK } from 'gatho/sdk';
 
 const gatho = createGathoSDK({ driver: createRedisDriver() });

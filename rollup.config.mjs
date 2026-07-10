@@ -38,5 +38,11 @@ export default [
     bundle('./src/client/index.ts', 'dist/client.js'),
     bundle('./src/room/index.ts', 'dist/room.js', ['ws']),
     bundle('./src/sdk/index.ts', 'dist/sdk.js', ['gatho/driver']),
-    bundle('./src/driver/index.ts', 'dist/driver.js', ['postgres', 'ioredis']),
+    // memory driver + types + errors — no ioredis import in this graph, so
+    // memory-only / bundled installs pull `gatho/driver` without ioredis present.
+    bundle('./src/driver/index.ts', 'dist/driver.js'),
+    // redis driver lives on its own subpath (`gatho/driver/redis`). ioredis is an
+    // optional peer dep (external); the error classes come from `gatho/driver`
+    // (external) so they keep one identity across the split.
+    bundle('./src/driver/redis.ts', 'dist/driver-redis.js', ['ioredis', 'gatho/driver']),
 ];

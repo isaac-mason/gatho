@@ -10,7 +10,7 @@
 //   GATHO_HOST        — hostname for room endpoints (default localhost)
 //   GATHO_PORT        — health check port for this server instance (required)
 
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { start, subprocess } from 'gatho/server';
 
 const caddyPort = process.env.GATHO_CADDY_PORT;

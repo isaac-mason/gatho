@@ -1,7 +1,8 @@
 // driver setup definitions for e2e tests
 import Redis from 'ioredis';
-import { createMemoryDriver, createRedisDriver } from 'gatho/driver';
+import { createMemoryDriver } from 'gatho/driver';
 import type { Driver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 
 export type DriverSetup = {
     name: string;

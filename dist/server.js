@@ -2562,6 +2562,7 @@ async function createRoom(s, roomId, roomType, data) {
         roomId,
         roomType,
         roomSecret,
+        data,
         endpoint: null,
         status: () => status,
         kill: () => { },
@@ -2726,18 +2727,66 @@ async function heartbeatTick(s, adminEndpoint, isCurrent) {
         log.warn('discarding stale heartbeat tick result', { serverId: s.serverId });
         return;
     }
+    s.serverTags = result.tags;
+    s.lastDriverHeartbeatAt = Date.now();
+    checkHeartbeats(s);
+    const desiredIds = new Set(result.desiredRooms.map((r) => r.roomId));
+    // reap-recovery: our server record was reaped (e.g. a driver blip stalled our
+    // heartbeats past the staleness threshold) while we were still alive and
+    // running rooms. this heartbeat re-created the record (registered: true) but
+    // it comes back with an EMPTY desired-set — reaping the server also deleted
+    // its room records. without intervention the destroy sweep below would kill
+    // every healthy, client-occupied room. instead, re-assert our still-running
+    // local rooms into the driver BEFORE the sweep so they survive.
+    const reasserted = new Set();
     if (result.registered && s.previouslyRegistered) {
+        const restoredRoomIds = [];
+        for (const proc of s.processes.values()) {
+            // only re-assert rooms that are actually ready and NOT already in the
+            // driver's desired set. a room still present in desiredRooms doesn't
+            // need re-asserting (its record survived). checking desiredRooms also
+            // guards against fighting a deliberate destroy: if an sdk destroyed a
+            // room during the outage, registerRoom would recreate it — but a
+            // destroyed room won't be in our processes-with-ready-status set for
+            // long, and more importantly we accept the tradeoff that a deliberate
+            // sdk destroy landing DURING the outage gets re-asserted here and then
+            // re-destroyed on the next reconcile after the sdk retries. that window
+            // is bounded by one heartbeat interval and never resurrects a room the
+            // sdk has finished tearing down before the reap.
+            if (proc.status() !== 'ready')
+                continue;
+            if (desiredIds.has(proc.roomId))
+                continue;
+            if (!proc.endpoint)
+                continue;
+            // note: room tags from the original sdk.createRoom are NOT persisted
+            // on the RoomProcess, so they cannot be restored here — re-register
+            // with empty tags. building tag persistence is out of scope; we warn.
+            try {
+                await s.driver.registerRoom(proc.roomId, proc.roomType, s.serverId, proc.data, {});
+                await s.driver.roomReady(proc.roomId, proc.endpoint, proc.roomSecret);
+                reasserted.add(proc.roomId);
+                restoredRoomIds.push(proc.roomId);
+            }
+            catch (err) {
+                log.error('failed to re-assert room after server reap', { roomId: proc.roomId, err });
+            }
+        }
         log.warn('restored missing server entry — record was reaped while alive', {
             serverId: s.serverId,
             tags: s.serverTags,
+            restoredRoomIds,
+            note: 'room tags from the original createRoom were NOT restored (not persisted on the server)',
         });
     }
-    s.serverTags = result.tags;
-    s.lastDriverHeartbeatAt = Date.now();
     s.previouslyRegistered = true;
-    checkHeartbeats(s);
-    const desiredIds = new Set(result.desiredRooms.map((r) => r.roomId));
+    // destroy sweep: kill any local room no longer wanted by the driver. skip the
+    // rooms we just re-asserted this tick — the heartbeat's desired-set predates
+    // our re-registration and would otherwise cause us to destroy exactly the
+    // rooms we just restored.
     for (const roomId of s.processes.keys()) {
+        if (reasserted.has(roomId))
+            continue;
         if (!desiredIds.has(roomId)) {
             destroyWorker(s, roomId);
         }

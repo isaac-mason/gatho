@@ -24,4 +24,17 @@ export type RedisDriverOptions = {
      * e.g. "myapp:{myapp}:".
      */
     prefix?: string;
+    /**
+     * how long (ms) a server may go without a heartbeat before it is treated as
+     * dead — dropped from listServers and reaped (with its rooms) by the leader.
+     * defaults to 30_000.
+     *
+     * tradeoff: a lower value fails a dead server over faster, but is less
+     * tolerant of transient driver blips (a brief redis hiccup that delays a
+     * heartbeat can trip a too-low threshold and reap a healthy server, killing
+     * its rooms). a higher value tolerates blips at the cost of slower failover.
+     * this must comfortably exceed the server's heartbeatIntervalMs (default
+     * 5_000) — allow room for several missed beats plus round-trip jitter.
+     */
+    staleServerMs?: number;
 };

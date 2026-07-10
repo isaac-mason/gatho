@@ -89,7 +89,7 @@ Start a gatho server with a driver and tell it how to run your rooms:
 
 ```ts
 // server.ts
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { start, subprocess } from 'gatho/server';
 
 const driver = createRedisDriver({ url: 'redis://localhost:6379' });
@@ -107,7 +107,7 @@ Then you can start rooms using the `gatho/sdk`:
 
 ```ts
 // my-backend.ts
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { createGathoSDK } from 'gatho/sdk';
 
 const gatho = createGathoSDK({ driver: createRedisDriver() });
@@ -203,7 +203,7 @@ For Docker, microVMs, or any other runtime, write the runner body directly. Comp
 
 ```ts
 import { spawn } from 'node:child_process';
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { notify, runner, start } from 'gatho/server';
 
 // host and container share this dir so the socket path resolves inside the
@@ -440,5 +440,5 @@ await start({
 
 Drivers provide the shared state backend used by the server and SDK.
 
-- `createMemoryDriver()`: useful for local dev, tests, and onebox deployments
-- `createRedisDriver({ url })`: requires Redis
+- `createMemoryDriver()` (from `gatho/driver`): useful for local dev, tests, and onebox deployments
+- `createRedisDriver({ url })` (from `gatho/driver/redis`): requires Redis. `ioredis` is an optional peer dependency — install it (`npm i ioredis`) only when you use this driver; `gatho/driver` (memory driver, types, errors) never pulls it in.

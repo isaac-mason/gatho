@@ -150,5 +150,5 @@ On the server side, opt in to reconnection by calling `room.allowReconnection(cl
 
 Drivers provide the shared state backend used by the server and SDK.
 
-- `createMemoryDriver()`: useful for local dev, tests, and onebox deployments
-- `createRedisDriver({ url })`: requires Redis
+- `createMemoryDriver()` (from `gatho/driver`): useful for local dev, tests, and onebox deployments
+- `createRedisDriver({ url })` (from `gatho/driver/redis`): requires Redis. `ioredis` is an optional peer dependency — install it (`npm i ioredis`) only when you use this driver; `gatho/driver` (memory driver, types, errors) never pulls it in.

@@ -9,7 +9,7 @@
 //   POST /api/rooms/:id/dispose  dispose a room if empty
 
 import Bun from 'bun';
-import { createRedisDriver } from 'gatho/driver';
+import { createRedisDriver } from 'gatho/driver/redis';
 import { createGathoSDK } from 'gatho/sdk';
 
 const API_PORT = parseInt(process.env.API_PORT ?? '4000', 10);
