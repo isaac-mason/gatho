@@ -161,6 +161,8 @@ room.send(JSON.stringify({ type: 'increment' }));
 
 `gatho/server` is the host process for your rooms. When starting a server you tell it how to run different types of rooms, and it takes care of placement, spawning, health tracking, and shutdown. Run multiple instances against the same driver (e.g. Redis) for horizontal scale.
 
+With a networked driver, each server publishes its own `serverEndpoint` to its peers and to the SDK. Set it to a URL the rest of your fleet can reach (e.g. `http://10.0.0.5:3000`) — the default derived from a wildcard bind (`0.0.0.0`) is unroutable and would make servers evict each other, so `start()` fails fast in that case. A single-process onebox on the in-memory driver needs no `serverEndpoint`.
+
 ### Runners
 
 A runner knows how to start and stop a single room. The server calls it once per room assignment. The callback you pass to `runner()` does four things:

@@ -780,16 +780,36 @@ function getAllRoomDetails(s: ServerState): RoomDetails[] {
 
 /* start */
 
+// wildcard hosts don't identify a reachable address. with a networked driver the
+// bind host becomes the published serverEndpoint, so a wildcard means every server
+// registers the same unroutable endpoint and they evict each other's rooms forever.
+const WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '']);
+
 export async function start(options: CreateServerOptions): Promise<Server> {
     const { _internal: driver } = options.driver;
     const runners = new Map(Object.entries(options.rooms));
+
+    const host = options.host ?? '0.0.0.0';
+
+    // fail fast: a networked driver publishes this server's endpoint to peers and
+    // sdks. if the operator left serverEndpoint unset and the bind host is a
+    // wildcard, the derived endpoint (http://0.0.0.0:port) is unroutable and every
+    // server registers the same one — they mutually evict each other's rooms. a
+    // local (in-process) driver shares state directly, so the endpoint is moot.
+    if (!driver.local && !options.serverEndpoint && WILDCARD_HOSTS.has(host)) {
+        throw new Error(
+            'gatho: serverEndpoint is required with a networked driver when binding a wildcard host ' +
+                `(${host || 'unset'}). the endpoint is published to other servers and sdks, so it must be a ` +
+                'url they can reach — set serverEndpoint to e.g. "http://10.0.0.5:3000".',
+        );
+    }
 
     const s: ServerState = {
         options,
         driver,
         runners,
         port: options.port ?? 3000,
-        host: options.host ?? '0.0.0.0',
+        host,
         serverId: randomUUID(),
         knownRoomTypes: new Set(Object.keys(options.rooms)),
 

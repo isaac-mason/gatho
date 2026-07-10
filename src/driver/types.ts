@@ -170,6 +170,12 @@ export type Driver = {
     destroy?: () => void;
 
     _internal: {
+        /** true if this driver keeps all state in-process (memory driver): server
+         *  and sdk share one object, so a wildcard/unset serverEndpoint is harmless.
+         *  false for networked drivers (redis) where the endpoint is published to
+         *  peers and sdks — start() fails fast on a wildcard endpoint in that case. */
+        local: boolean;
+
         /** register a new room */
         registerRoom(
             roomId: string,

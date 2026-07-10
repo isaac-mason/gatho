@@ -36,6 +36,9 @@ const server = await start({
     // room on ephemeral port -> client connects through caddy at /{room_port}
     roomEndpoint: ({ port }) => `ws://${host}:${caddyPort}/${port}`,
     port: Number(port),
+    // networked driver publishes this endpoint to peers/sdks — must be reachable,
+    // not the default wildcard bind (see R2). use the health-check host:port.
+    serverEndpoint: `http://${host}:${port}`,
 });
 
 console.log('');

@@ -36,6 +36,9 @@ export function buildContext(driver: Driver): TestContext {
             },
             driver,
             roomEndpoint: (info) => `ws://127.0.0.1:${info.port}`,
+            // bind loopback (concrete host) so the networked-driver endpoint
+            // fail-fast (R2) doesn't trip on a wildcard bind in tests.
+            host: '127.0.0.1',
             port: 0,
             tags: opts?.tags,
         });
