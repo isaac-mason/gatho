@@ -1,9 +1,5 @@
 ![cover](./docs/cover.png)
 
-[![Version](https://img.shields.io/npm/v/gatho?style=for-the-badge)](https://www.npmjs.com/package/gatho)
-![GitHub Workflow Status (with event)](https://img.shields.io/github/actions/workflow/status/isaac-mason/gatho/build-and-deploy.yml?style=for-the-badge)
-[![Downloads](https://img.shields.io/npm/dt/gatho.svg?style=for-the-badge)](https://www.npmjs.com/package/gatho)
-
 ```bash
 > npm install github:isaac-mason/gatho
 # (npm coming soon!)
