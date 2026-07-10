@@ -70,6 +70,11 @@ const MAX_DELAY = 10000;
 const BACKOFF_FACTOR = 1.5;
 const MIN_UPTIME = 5000;
 
+// reconnection attempt cap. after this many consecutive failed reconnect
+// attempts, give up and enter a terminal close — the signal a game needs to
+// re-matchmake. resets to zero on a successful reconnect (session receipt).
+const MAX_RECONNECT_ATTEMPTS = 10;
+
 // outbound reliable message buffer cap — 1mb
 const MAX_BUFFER_BYTES = 1_048_576;
 
@@ -265,8 +270,11 @@ export function connect(url: string): RoomConnection {
                     clientId = msg.clientId;
 
                     if (isReconnect && state === 'reconnecting') {
-                        // reconnection confirmed — server accepted our session
+                        // reconnection confirmed — server accepted our session.
+                        // reset the attempt counter now that we are authenticated
+                        // and joined again.
                         state = 'open';
+                        retryCount = 0;
                         openedAt = Date.now();
 
                         // start minUptime timer
@@ -390,6 +398,13 @@ export function connect(url: string): RoomConnection {
 
     function startReconnect(): void {
         if (state !== 'reconnecting') return;
+
+        if (retryCount >= MAX_RECONNECT_ATTEMPTS) {
+            // gave up — enter a terminal close the app can react to (e.g. by
+            // re-matchmaking). 1006 is the abnormal-closure code.
+            enterClosed(1006, 'reconnection attempts exhausted');
+            return;
+        }
 
         retryCount++;
         const delay = computeDelay(retryCount);
