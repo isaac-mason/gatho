@@ -8,10 +8,10 @@ export type ClientSocket = {
     close(code: number, reason: string): void;
     subscribe(topic: string): void;
     // bytes queued to send but not yet flushed to the os (the kernel/userland
-    // outbound buffer). the room watches this to detect stalled consumers and
-    // evict them before the buffer grows unbounded — see maxOutboundBufferBytes.
-    // transports that cannot observe this portably return 0; the room-side policy
-    // tolerates that (a socket that always reports 0 is never evicted for pressure).
+    // outbound buffer). this is the backpressure signal — gatho exposes it but
+    // ships no automatic eviction policy; the app decides how to pace large sends
+    // and whether to drop stalled consumers. transports that cannot observe this
+    // portably return 0.
     bufferedAmount(): number;
 };
 
