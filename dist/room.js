@@ -2860,12 +2860,15 @@ function startRoom(state, transport, options) {
             (async () => {
                 // fire onDrop — room code may call allowReconnection inside
                 await Promise.resolve(onDrop(room, createClient(tracked), code));
-                // if allowReconnection was NOT called (no timer set), evict immediately
-                if (!tracked.disconnectTimer) {
-                    // check the client is still in the map (not already evicted by something else)
-                    if (state.clients.has(tracked.id)) {
-                        evictClient(state, tracked, room, options.onLeave);
-                    }
+                // if allowReconnection was NOT called (no timer set), evict immediately.
+                // guard against a client that reconnected while onDrop awaited: require
+                //  - still in the map (not already evicted by something else), and
+                //  - socket still null (a reconnect swaps in a live socket — evicting
+                //    then would kill a freshly reconnected client). allowReconnection
+                //    already no-ops post-reconnect, so this branch is the guaranteed
+                //    outcome of the race without the socket check.
+                if (!tracked.disconnectTimer && tracked.socket === null && state.clients.has(tracked.id)) {
+                    evictClient(state, tracked, room, options.onLeave);
                 }
             })().catch((err) => {
                 state.log.error('onDrop threw unexpectedly', { clientId, err });

@@ -243,4 +243,73 @@ describe('room auth + socket identity', () => {
         room.broadcast('after-fail');
         expect(rec.userTexts).toEqual([]);
     });
+
+    it('does not evict a client that reconnects while onDrop awaits', async () => {
+        let releaseDrop: (() => void) | null = null;
+        let leaveCount = 0;
+        const room = await start({
+            standalone: true,
+            transport: stubTransport(sink),
+            onAuth: () => auth.ok({}),
+            onDrop: () =>
+                new Promise((resolve) => {
+                    releaseDrop = () => resolve();
+                }),
+            onLeave: () => {
+                leaveCount++;
+            },
+        });
+
+        // to reconnect we need a valid session token — capture it from the session msg.
+        const a = recordingSocket(subscribers());
+        handlers().open('c1', a.socket, {}, {});
+        await settle();
+
+        // drop non-consented — onDrop starts awaiting (does not call allowReconnection).
+        handlers().close('c1', 1006);
+        await settle();
+        expect(room.clients.has('c1')).toBe(true);
+
+        // while onDrop awaits, the client reconnects via the reconnect handler (swaps
+        // in a live socket).
+        const b = recordingSocket(subscribers());
+        handlers().reconnect('c1', b.socket);
+        await settle();
+
+        // now onDrop resolves WITHOUT allowReconnection. the client must NOT be evicted
+        // because it reconnected (socket !== null).
+        releaseDrop!();
+        await settle();
+        expect(room.clients.has('c1')).toBe(true);
+        expect(leaveCount).toBe(0);
+    });
+
+    it('a client evicted after onDrop (no reconnect) fires onLeave exactly once', async () => {
+        let releaseDrop: (() => void) | null = null;
+        let leaveCount = 0;
+        const room = await start({
+            standalone: true,
+            transport: stubTransport(sink),
+            onAuth: () => auth.ok({}),
+            onDrop: () =>
+                new Promise((resolve) => {
+                    releaseDrop = () => resolve();
+                }),
+            onLeave: () => {
+                leaveCount++;
+            },
+        });
+
+        const a = recordingSocket(subscribers());
+        handlers().open('c1', a.socket, {}, {});
+        await settle();
+        handlers().close('c1', 1006);
+        await settle();
+
+        // no reconnect — onDrop resolves without allowReconnection -> evict.
+        releaseDrop!();
+        await settle();
+        expect(room.clients.has('c1')).toBe(false);
+        expect(leaveCount).toBe(1);
+    });
 });
