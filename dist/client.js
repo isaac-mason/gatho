@@ -1861,6 +1861,10 @@ const MIN_DELAY = 1000;
 const MAX_DELAY = 10000;
 const BACKOFF_FACTOR = 1.5;
 const MIN_UPTIME = 5000;
+// reconnection attempt cap. after this many consecutive failed reconnect
+// attempts, give up and enter a terminal close — the signal a game needs to
+// re-matchmake. resets to zero on a successful reconnect (session receipt).
+const MAX_RECONNECT_ATTEMPTS = 10;
 // outbound reliable message buffer cap — 1mb
 const MAX_BUFFER_BYTES = 1_048_576;
 // compute backoff delay with jitter
@@ -1900,7 +1904,16 @@ function connect(url) {
     let backoffTimer = null;
     // track the open timestamp so minUptime is checked on drop
     let openedAt = null;
-    // outbound reliable message buffer — messages queued during RECONNECTING
+    // set when the initial connect receives auth_error. the room follows the
+    // auth_error with a 4000 close; this flag lets the onclose handler map that
+    // close to cause 'auth' rather than 'initial-connect-failed'.
+    let initialAuthFailed = false;
+    // set when the app calls close() on an open connection. lets the onclose
+    // handler distinguish a consented client-initiated 4000 from a server-
+    // initiated 4000 (e.g. eviction).
+    let consentedClose = false;
+    // outbound reliable message buffer — messages queued during CONNECTING and
+    // RECONNECTING, flushed in order once the connection is established.
     const reliableBuffer = [];
     let reliableBufferBytes = 0;
     const listeners = {
@@ -1930,7 +1943,7 @@ function connect(url) {
         reliableBuffer.push({ payload: message, byteSize });
         reliableBufferBytes += byteSize;
         if (reliableBufferBytes > MAX_BUFFER_BYTES) {
-            enterClosed(1009, 'outbound buffer overflow');
+            enterClosed(1009, 'outbound buffer overflow', 'buffer-overflow');
         }
     }
     // flush the reliable buffer over the current websocket, then clear it
@@ -1987,8 +2000,10 @@ function connect(url) {
             globalThis.removeEventListener('pagehide', onBeforeUnload);
         }
     }
-    // transition to CLOSED permanently
-    function enterClosed(code, reason) {
+    // transition to CLOSED permanently. any messages buffered while connecting
+    // or reconnecting are discarded — a terminal close means they will never be
+    // delivered.
+    function enterClosed(code, reason, cause) {
         state = 'closed';
         clearTimers();
         removeUnloadHandlers();
@@ -1996,7 +2011,7 @@ function connect(url) {
         // clear outbound buffer
         reliableBuffer.length = 0;
         reliableBufferBytes = 0;
-        emit('close', code, reason);
+        emit('close', { code, reason, cause });
     }
     // --- websocket wiring ---
     // wire up event handlers on a websocket instance.
@@ -2009,20 +2024,11 @@ function connect(url) {
                 socket.close();
                 return;
             }
-            if (!isReconnect) {
-                // initial connection — transition to OPEN will happen when
-                // we receive __session token, but fire 'open' now since
-                // the ws is connected. actually, per existing behavior,
-                // 'open' fires on ws open for the initial connection.
-                state = 'open';
-                openedAt = Date.now();
-                // start minUptime timer — if we stay open this long, reset retry count
-                uptimeTimer = setTimeout(() => {
-                    retryCount = 0;
-                }, MIN_UPTIME);
-                emit('open');
-            }
-            // for reconnection, we wait for __session to confirm
+            // both the initial connect and reconnect defer the open/reconnect
+            // transition to the `session` protocol message. a raw ws open means
+            // the socket is connected but not yet authenticated or joined, so we
+            // do nothing here and wait for `session`. this makes open mean
+            // "authenticated and joined" and symmetrizes with the reconnect path.
         };
         socket.onmessage = (event) => {
             const { data } = event;
@@ -2036,8 +2042,11 @@ function connect(url) {
                     sessionToken = msg.token;
                     clientId = msg.clientId;
                     if (isReconnect && state === 'reconnecting') {
-                        // reconnection confirmed — server accepted our session
+                        // reconnection confirmed — server accepted our session.
+                        // reset the attempt counter now that we are authenticated
+                        // and joined again.
                         state = 'open';
+                        retryCount = 0;
                         openedAt = Date.now();
                         // start minUptime timer
                         uptimeTimer = setTimeout(() => {
@@ -2046,17 +2055,38 @@ function connect(url) {
                         // flush outbound reliable buffer before notifying user code
                         flushReliableBuffer(socket);
                         emit('reconnect');
+                        return;
+                    }
+                    if (!isReconnect && state === 'connecting') {
+                        // initial connection confirmed — the client is now
+                        // authenticated and joined. minUptime timer starts here,
+                        // at session receipt, not at raw ws open.
+                        state = 'open';
+                        openedAt = Date.now();
+                        // start minUptime timer
+                        uptimeTimer = setTimeout(() => {
+                            retryCount = 0;
+                        }, MIN_UPTIME);
+                        // flush anything buffered while connecting, in order,
+                        // BEFORE emitting open (mirrors the reconnect path).
+                        flushReliableBuffer(socket);
+                        emit('open');
+                        return;
                     }
                     return;
                 }
                 if (msg.type === 'auth_error') {
                     if (isReconnect && state === 'reconnecting') {
                         // server rejected our session — give up permanently
-                        enterClosed(4000, 'session rejected');
                         socket.close();
+                        enterClosed(4000, 'session rejected', 'session');
                         return;
                     }
-                    // initial connection auth error
+                    // initial connection auth error. open was never emitted
+                    // (it is deferred to session), so no 'open' leaks. surface
+                    // the error and mark the auth failure so the follow-up 4000
+                    // close maps to cause 'auth'.
+                    initialAuthFailed = true;
                     emit('authError', msg.error);
                     return;
                 }
@@ -2082,8 +2112,15 @@ function connect(url) {
                 return;
             }
             if (state === 'connecting') {
-                // initial connection failed — permanent close
-                enterClosed(event.code, event.reason);
+                // initial connection ended before a session arrived. if the
+                // room sent auth_error first, this is an auth rejection;
+                // otherwise the socket closed before authenticating.
+                if (initialAuthFailed) {
+                    enterClosed(event.code, event.reason, 'auth');
+                }
+                else {
+                    enterClosed(event.code, event.reason, 'initial-connect-failed');
+                }
                 return;
             }
             if (state === 'reconnecting') {
@@ -2093,8 +2130,10 @@ function connect(url) {
             }
             // state === 'open'
             if (event.code === 4000) {
-                // consented close — permanent
-                enterClosed(event.code, event.reason);
+                // a 4000 close on a live connection. if the app called close()
+                // this is a consented departure; otherwise the server closed us
+                // (e.g. eviction, kick) — those read as 'server'.
+                enterClosed(event.code, event.reason, consentedClose ? 'consented' : 'server');
                 return;
             }
             // unexpected drop — start reconnection if we have a session token
@@ -2111,8 +2150,9 @@ function connect(url) {
                 startReconnect();
             }
             else {
-                // no session token — can't reconnect
-                enterClosed(event.code, event.reason);
+                // no session token — can't reconnect. the server closed a live
+                // connection we cannot resume.
+                enterClosed(event.code, event.reason, 'server');
             }
         };
         socket.onerror = (event) => {
@@ -2123,6 +2163,12 @@ function connect(url) {
     function startReconnect() {
         if (state !== 'reconnecting')
             return;
+        if (retryCount >= MAX_RECONNECT_ATTEMPTS) {
+            // gave up — enter a terminal close the app can react to (e.g. by
+            // re-matchmaking). 1006 is the abnormal-closure code.
+            enterClosed(1006, 'reconnection attempts exhausted', 'reconnect-failed');
+            return;
+        }
         retryCount++;
         const delay = computeDelay(retryCount);
         backoffTimer = setTimeout(() => {
@@ -2130,7 +2176,7 @@ function connect(url) {
             if (state !== 'reconnecting')
                 return;
             if (!sessionToken) {
-                enterClosed(1006, 'no session token');
+                enterClosed(1006, 'no session token', 'server');
                 return;
             }
             const reconnectUrl = buildReconnectUrl(url, sessionToken);
@@ -2157,12 +2203,13 @@ function connect(url) {
                 ws.send(frameUserMessage(message));
                 return;
             }
-            if (state === 'reconnecting' && reliable) {
-                // disconnected, reliable — buffer
+            if ((state === 'connecting' || state === 'reconnecting') && reliable) {
+                // not yet established (or dropped), reliable — buffer and flush
+                // in order once the connection is (re)established.
                 bufferReliable(message);
                 return;
             }
-            // CLOSED, CONNECTING, or unreliable during RECONNECTING — silently drop
+            // CLOSED, or unreliable during CONNECTING/RECONNECTING — silently drop
         },
         on(event, callback) {
             const set = listeners[event];
@@ -2183,6 +2230,9 @@ function connect(url) {
             if (state === 'closed')
                 return;
             if (state === 'open' && ws) {
+                // mark the consented close so the onclose handler reports
+                // cause 'consented' for the resulting 4000.
+                consentedClose = true;
                 sendLeaveAndClose(ws);
                 // enterClosed will be called from the onclose handler
                 return;
@@ -2198,7 +2248,7 @@ function connect(url) {
                     ws.onopen = null;
                     ws.close();
                 }
-                enterClosed(4000, 'client closed during reconnection');
+                enterClosed(4000, 'client closed during reconnection', 'consented');
                 return;
             }
             if (state === 'connecting' && ws) {
@@ -2207,7 +2257,7 @@ function connect(url) {
                 ws.onmessage = null;
                 ws.onopen = null;
                 ws.close();
-                enterClosed(4000, 'client closed during connect');
+                enterClosed(4000, 'client closed during connect', 'consented');
                 return;
             }
         },

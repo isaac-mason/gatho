@@ -10,6 +10,27 @@ export type SendMessage = string | ArrayBuffer | ArrayBufferView | Blob;
 // inbound message — mirrors MessageEvent.data with binaryType 'arraybuffer'
 export type ReceiveMessage = string | ArrayBuffer;
 
+// why the connection reached its terminal CLOSED state. lets the app react
+// without decoding raw close codes:
+//   'consented'              — the app called close() (intentional departure).
+//   'auth'                   — the room rejected the initial connect (auth_error).
+//   'session'                — the room rejected our session on reconnect.
+//   'reconnect-failed'       — reconnection gave up after the attempt cap.
+//   'buffer-overflow'        — the outbound reliable buffer exceeded its cap.
+//   'initial-connect-failed' — the initial ws closed before a session arrived.
+//   'server'                 — the server closed a live, authenticated connection.
+export type CloseCause =
+    | 'consented'
+    | 'auth'
+    | 'session'
+    | 'reconnect-failed'
+    | 'buffer-overflow'
+    | 'initial-connect-failed'
+    | 'server';
+
+// payload delivered to close listeners.
+export type CloseInfo = { code: number; reason: string; cause: CloseCause };
+
 type BufferedMessage = {
     payload: SendMessage;
     byteSize: number;
@@ -36,7 +57,7 @@ export type RoomConnection = {
     on(event: 'drop', callback: () => void): () => void;
     on(event: 'reconnect', callback: () => void): () => void;
     on(event: 'authError', callback: (error: unknown) => void): () => void;
-    on(event: 'close', callback: (code: number, reason: string) => void): () => void;
+    on(event: 'close', callback: (info: CloseInfo) => void): () => void;
     on(event: 'error', callback: (error: Event) => void): () => void;
 
     // remove a previously registered listener by reference
@@ -45,7 +66,7 @@ export type RoomConnection = {
     off(event: 'drop', callback: () => void): void;
     off(event: 'reconnect', callback: () => void): void;
     off(event: 'authError', callback: (error: unknown) => void): void;
-    off(event: 'close', callback: (code: number, reason: string) => void): void;
+    off(event: 'close', callback: (info: CloseInfo) => void): void;
     off(event: 'error', callback: (error: Event) => void): void;
 
     // close the connection. sends __leave protocol message before closing
@@ -60,7 +81,7 @@ type ListenerMap = {
     drop: Set<() => void>;
     reconnect: Set<() => void>;
     authError: Set<(error: unknown) => void>;
-    close: Set<(code: number, reason: string) => void>;
+    close: Set<(info: CloseInfo) => void>;
     error: Set<(error: Event) => void>;
 };
 
@@ -119,6 +140,14 @@ export function connect(url: string): RoomConnection {
     let backoffTimer: ReturnType<typeof setTimeout> | null = null;
     // track the open timestamp so minUptime is checked on drop
     let openedAt: number | null = null;
+    // set when the initial connect receives auth_error. the room follows the
+    // auth_error with a 4000 close; this flag lets the onclose handler map that
+    // close to cause 'auth' rather than 'initial-connect-failed'.
+    let initialAuthFailed = false;
+    // set when the app calls close() on an open connection. lets the onclose
+    // handler distinguish a consented client-initiated 4000 from a server-
+    // initiated 4000 (e.g. eviction).
+    let consentedClose = false;
 
     // outbound reliable message buffer — messages queued during CONNECTING and
     // RECONNECTING, flushed in order once the connection is established.
@@ -152,7 +181,7 @@ export function connect(url: string): RoomConnection {
         reliableBuffer.push({ payload: message, byteSize });
         reliableBufferBytes += byteSize;
         if (reliableBufferBytes > MAX_BUFFER_BYTES) {
-            enterClosed(1009, 'outbound buffer overflow');
+            enterClosed(1009, 'outbound buffer overflow', 'buffer-overflow');
         }
     }
 
@@ -223,7 +252,7 @@ export function connect(url: string): RoomConnection {
     // transition to CLOSED permanently. any messages buffered while connecting
     // or reconnecting are discarded — a terminal close means they will never be
     // delivered.
-    function enterClosed(code: number, reason: string): void {
+    function enterClosed(code: number, reason: string, cause: CloseCause): void {
         state = 'closed';
         clearTimers();
         removeUnloadHandlers();
@@ -231,7 +260,7 @@ export function connect(url: string): RoomConnection {
         // clear outbound buffer
         reliableBuffer.length = 0;
         reliableBufferBytes = 0;
-        emit('close', code, reason);
+        emit('close', { code, reason, cause });
     }
 
     // --- websocket wiring ---
@@ -314,12 +343,16 @@ export function connect(url: string): RoomConnection {
                 if (msg.type === 'auth_error') {
                     if (isReconnect && state === 'reconnecting') {
                         // server rejected our session — give up permanently
-                        enterClosed(4000, 'session rejected');
                         socket.close();
+                        enterClosed(4000, 'session rejected', 'session');
                         return;
                     }
 
-                    // initial connection auth error
+                    // initial connection auth error. open was never emitted
+                    // (it is deferred to session), so no 'open' leaks. surface
+                    // the error and mark the auth failure so the follow-up 4000
+                    // close maps to cause 'auth'.
+                    initialAuthFailed = true;
                     emit('authError', msg.error);
                     return;
                 }
@@ -351,8 +384,14 @@ export function connect(url: string): RoomConnection {
             }
 
             if (state === 'connecting') {
-                // initial connection failed — permanent close
-                enterClosed(event.code, event.reason);
+                // initial connection ended before a session arrived. if the
+                // room sent auth_error first, this is an auth rejection;
+                // otherwise the socket closed before authenticating.
+                if (initialAuthFailed) {
+                    enterClosed(event.code, event.reason, 'auth');
+                } else {
+                    enterClosed(event.code, event.reason, 'initial-connect-failed');
+                }
                 return;
             }
 
@@ -364,8 +403,10 @@ export function connect(url: string): RoomConnection {
 
             // state === 'open'
             if (event.code === 4000) {
-                // consented close — permanent
-                enterClosed(event.code, event.reason);
+                // a 4000 close on a live connection. if the app called close()
+                // this is a consented departure; otherwise the server closed us
+                // (e.g. eviction, kick) — those read as 'server'.
+                enterClosed(event.code, event.reason, consentedClose ? 'consented' : 'server');
                 return;
             }
 
@@ -384,8 +425,9 @@ export function connect(url: string): RoomConnection {
                 emit('drop');
                 startReconnect();
             } else {
-                // no session token — can't reconnect
-                enterClosed(event.code, event.reason);
+                // no session token — can't reconnect. the server closed a live
+                // connection we cannot resume.
+                enterClosed(event.code, event.reason, 'server');
             }
         };
 
@@ -402,7 +444,7 @@ export function connect(url: string): RoomConnection {
         if (retryCount >= MAX_RECONNECT_ATTEMPTS) {
             // gave up — enter a terminal close the app can react to (e.g. by
             // re-matchmaking). 1006 is the abnormal-closure code.
-            enterClosed(1006, 'reconnection attempts exhausted');
+            enterClosed(1006, 'reconnection attempts exhausted', 'reconnect-failed');
             return;
         }
 
@@ -414,7 +456,7 @@ export function connect(url: string): RoomConnection {
 
             if (state !== 'reconnecting') return;
             if (!sessionToken) {
-                enterClosed(1006, 'no session token');
+                enterClosed(1006, 'no session token', 'server');
                 return;
             }
 
@@ -480,6 +522,9 @@ export function connect(url: string): RoomConnection {
             if (state === 'closed') return;
 
             if (state === 'open' && ws) {
+                // mark the consented close so the onclose handler reports
+                // cause 'consented' for the resulting 4000.
+                consentedClose = true;
                 sendLeaveAndClose(ws);
                 // enterClosed will be called from the onclose handler
                 return;
@@ -496,7 +541,7 @@ export function connect(url: string): RoomConnection {
                     ws.onopen = null;
                     ws.close();
                 }
-                enterClosed(4000, 'client closed during reconnection');
+                enterClosed(4000, 'client closed during reconnection', 'consented');
                 return;
             }
 
@@ -506,7 +551,7 @@ export function connect(url: string): RoomConnection {
                 ws.onmessage = null;
                 ws.onopen = null;
                 ws.close();
-                enterClosed(4000, 'client closed during connect');
+                enterClosed(4000, 'client closed during connect', 'consented');
                 return;
             }
         },

@@ -136,7 +136,7 @@ test('network drop → onDrop fires → allowReconnection → client reconnects 
             conn.on('reconnect', () => {
                 (window as W).__events.reconnects++;
             });
-            conn.on('close', (code: number) => {
+            conn.on('close', ({ code }: { code: number }) => {
                 (window as W).__events.closes++;
                 (window as W).__events.closeCode = code;
             });
@@ -507,7 +507,7 @@ test('reconnect window expiry — onLeave fires, client enters closed on next at
             const conn = (window as W).__gatho.connect(url);
             (window as W).__conn = conn;
             (window as W).__events = { closes: 0, closeCode: 0 };
-            conn.on('close', (code: number) => {
+            conn.on('close', ({ code }: { code: number }) => {
                 (window as W).__events.closes++;
                 (window as W).__events.closeCode = code;
             });

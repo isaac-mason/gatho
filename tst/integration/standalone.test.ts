@@ -218,7 +218,7 @@ describe('standalone room', () => {
 
         // clean up — stop the reconnection loop
         let closeCode = 0;
-        conn.on('close', (code) => {
+        conn.on('close', ({ code }) => {
             closeCode = code;
         });
         conn.close();

@@ -4,6 +4,12 @@ export type SendOptions = {
 };
 export type SendMessage = string | ArrayBuffer | ArrayBufferView | Blob;
 export type ReceiveMessage = string | ArrayBuffer;
+export type CloseCause = 'consented' | 'auth' | 'session' | 'reconnect-failed' | 'buffer-overflow' | 'initial-connect-failed' | 'server';
+export type CloseInfo = {
+    code: number;
+    reason: string;
+    cause: CloseCause;
+};
 export type RoomConnection = {
     readonly state: ConnectionState;
     readonly clientId: string | null;
@@ -13,14 +19,14 @@ export type RoomConnection = {
     on(event: 'drop', callback: () => void): () => void;
     on(event: 'reconnect', callback: () => void): () => void;
     on(event: 'authError', callback: (error: unknown) => void): () => void;
-    on(event: 'close', callback: (code: number, reason: string) => void): () => void;
+    on(event: 'close', callback: (info: CloseInfo) => void): () => void;
     on(event: 'error', callback: (error: Event) => void): () => void;
     off(event: 'open', callback: () => void): void;
     off(event: 'message', callback: (message: ReceiveMessage) => void): void;
     off(event: 'drop', callback: () => void): void;
     off(event: 'reconnect', callback: () => void): void;
     off(event: 'authError', callback: (error: unknown) => void): void;
-    off(event: 'close', callback: (code: number, reason: string) => void): void;
+    off(event: 'close', callback: (info: CloseInfo) => void): void;
     off(event: 'error', callback: (error: Event) => void): void;
     close(): void;
 };

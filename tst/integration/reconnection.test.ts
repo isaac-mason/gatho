@@ -54,7 +54,7 @@ describe('reconnection lifecycle', () => {
         await waitUntil(() => conn.state === 'open');
 
         let closeCode = 0;
-        conn.on('close', (code) => {
+        conn.on('close', ({ code }) => {
             closeCode = code;
         });
 
@@ -247,7 +247,7 @@ describe('reconnection lifecycle', () => {
         await waitUntil(() => conn.state === 'reconnecting');
 
         let closeCode = 0;
-        conn.on('close', (code) => {
+        conn.on('close', ({ code }) => {
             closeCode = code;
         });
 

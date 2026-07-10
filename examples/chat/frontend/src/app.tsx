@@ -132,11 +132,11 @@ function Chat({ roomName, room, onLeave }: { roomName: string; room: RoomConnect
             });
         };
 
-        const onClose = (code: number, reason: string) => {
+        const onClose = ({ code, reason, cause }: { code: number; reason: string; cause: string }) => {
             setConnected(false);
             setMessages((prev) => [
                 ...prev,
-                { type: 'leave', user: 'system', text: `disconnected: ${reason || code}`, timestamp: Date.now() },
+                { type: 'leave', user: 'system', text: `disconnected (${cause}): ${reason || code}`, timestamp: Date.now() },
             ]);
         };
 
