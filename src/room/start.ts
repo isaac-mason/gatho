@@ -1,3 +1,4 @@
+import { CloseCode } from '../common/close-code';
 import { jwtVerify } from '../common/jwt';
 import { createLogger, type Logger } from '../common/logger';
 import type { Notifier, ProcessMetricsMessage } from '../common/notify-protocol';
@@ -607,7 +608,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             // before doing any auth or state work.
             if (versionMismatch) {
                 socket.send(packProtocol({ type: 'auth_error', error: versionMismatch }), true);
-                socket.close(4000, 'protocol version mismatch');
+                socket.close(CloseCode.CONSENTED, 'protocol version mismatch');
                 return;
             }
 
@@ -719,7 +720,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             // before touching reconnection state.
             if (versionMismatch) {
                 socket.send(packProtocol({ type: 'auth_error', error: versionMismatch }), true);
-                socket.close(4000, 'protocol version mismatch');
+                socket.close(CloseCode.CONSENTED, 'protocol version mismatch');
                 return;
             }
 

@@ -1,3 +1,4 @@
+import { CloseCode } from '../common/close-code';
 import { frameUserMessage, packProtocol, PROTOCOL_VERSION, unpackFrame } from '../common/protocol';
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
@@ -220,7 +221,7 @@ export function connect(url: string): RoomConnection {
     function sendLeaveAndClose(socket: WebSocket): void {
         if (socket.readyState === WebSocket.OPEN) {
             socket.send(packProtocol({ type: 'leave' }));
-            socket.close(4000, 'consented leave');
+            socket.close(CloseCode.CONSENTED, 'consented leave');
         } else {
             socket.close();
         }
@@ -344,7 +345,7 @@ export function connect(url: string): RoomConnection {
                     if (isReconnect && state === 'reconnecting') {
                         // server rejected our session — give up permanently
                         socket.close();
-                        enterClosed(4000, 'session rejected', 'session');
+                        enterClosed(CloseCode.CONSENTED, 'session rejected', 'session');
                         return;
                     }
 
@@ -402,7 +403,7 @@ export function connect(url: string): RoomConnection {
             }
 
             // state === 'open'
-            if (event.code === 4000) {
+            if (event.code === CloseCode.CONSENTED) {
                 // a 4000 close on a live connection. if the app called close()
                 // this is a consented departure; otherwise the server closed us
                 // (e.g. eviction, kick) — those read as 'server'.
@@ -541,7 +542,7 @@ export function connect(url: string): RoomConnection {
                     ws.onopen = null;
                     ws.close();
                 }
-                enterClosed(4000, 'client closed during reconnection', 'consented');
+                enterClosed(CloseCode.CONSENTED, 'client closed during reconnection', 'consented');
                 return;
             }
 
@@ -551,7 +552,7 @@ export function connect(url: string): RoomConnection {
                 ws.onmessage = null;
                 ws.onopen = null;
                 ws.close();
-                enterClosed(4000, 'client closed during connect', 'consented');
+                enterClosed(CloseCode.CONSENTED, 'client closed during connect', 'consented');
                 return;
             }
         },

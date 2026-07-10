@@ -25,15 +25,9 @@ export type {
 
 // --- close codes ---
 
-// websocket close codes that gatho uses to distinguish disconnect reasons.
-// 4000 (CONSENTED) = the client explicitly called close() — sent __leave first.
-// everything else fires onDrop, giving the room code a chance to call allowReconnection.
-export const CloseCode = {
-    NORMAL: 1000,
-    GOING_AWAY: 1001,
-    ABNORMAL: 1006,
-    CONSENTED: 4000,
-} as const;
+// re-exported from common/ so the client can share the constant without
+// importing gatho/room. see src/common/close-code.ts.
+export { CloseCode } from '../common/close-code';
 
 // --- auth result ---
 

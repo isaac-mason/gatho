@@ -58,7 +58,6 @@ export type CreateServerOptions = {
 export type RoomDetails = {
     roomId: string;
     roomType: string;
-    workerRunning: boolean;
     endpoint: string | null;
     /** the room's lifecycle as the server observes it */
     status: 'starting' | 'ready' | 'stopped';
@@ -833,7 +832,6 @@ function getRoomDetails(s: ServerState, roomId: string): RoomDetails | null {
     return {
         roomId,
         roomType: roomProcess.roomType,
-        workerRunning: true,
         endpoint: roomProcess.endpoint,
         status: roomProcess.status(),
         lastHeartbeatAt: s.lastHeartbeats.get(roomId) ?? null,
@@ -846,7 +844,6 @@ function getAllRoomDetails(s: ServerState): RoomDetails[] {
         details.push({
             roomId: roomProcess.roomId,
             roomType: roomProcess.roomType,
-            workerRunning: true,
             endpoint: roomProcess.endpoint,
             status: roomProcess.status(),
             lastHeartbeatAt: s.lastHeartbeats.get(roomProcess.roomId) ?? null,
