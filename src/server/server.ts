@@ -502,13 +502,23 @@ function stopRoomSubscription(s: ServerState): void {
 // returned by the heartbeat. push-based subscribeRoomAssignments handles new
 // assignments instantly; this loop is the safety net for missed pushes plus the
 // authoritative source for "which rooms should this server be running right now".
-async function heartbeatTick(s: ServerState, adminEndpoint: string): Promise<void> {
+async function heartbeatTick(s: ServerState, adminEndpoint: string, isCurrent: () => boolean): Promise<void> {
     const result = await s.driver.heartbeat({
         serverId: s.serverId,
         endpoint: adminEndpoint,
         tags: s.serverTags,
         roomTypes: Array.from(s.knownRoomTypes),
     });
+
+    // the heartbeat round-trip may have outlived this tick's timeout: a fresh
+    // tick is already reconciling against newer state. discard our now-stale
+    // conclusions rather than writing them back and destroying rooms the newer
+    // tick's desired-set still wants.
+    if (!isCurrent()) {
+        log.warn('discarding stale heartbeat tick result', { serverId: s.serverId });
+        return;
+    }
+
     if (result.registered && s.previouslyRegistered) {
         log.warn('restored missing server entry — record was reaped while alive', {
             serverId: s.serverId,
@@ -532,7 +542,7 @@ async function heartbeatTick(s: ServerState, adminEndpoint: string): Promise<voi
 async function startHeartbeatLoop(s: ServerState, adminEndpoint: string, intervalMs: number): Promise<void> {
     if (s.heartbeatPunctuator) return;
 
-    s.heartbeatPunctuator = await punctuate('heartbeat loop', () => heartbeatTick(s, adminEndpoint), {
+    s.heartbeatPunctuator = await punctuate('heartbeat loop', (isCurrent) => heartbeatTick(s, adminEndpoint, isCurrent), {
         intervalMs,
         timeoutMs: HEARTBEAT_TICK_TIMEOUT_MS,
         logger: log.child({ serverId: s.serverId }),
@@ -598,9 +608,19 @@ async function runLeaderDuties(s: ServerState): Promise<void> {
 async function startLeaderLoop(s: ServerState): Promise<void> {
     s.leaderPunctuator = await punctuate(
         'leader loop',
-        async () => {
+        async (isCurrent) => {
             if (s.isLeader) {
                 const renewed = await s.driver.renewLeader(s.serverId);
+                // a renewal that outlived this tick's timeout must not write
+                // leadership state or run duties: a fresh tick is authoritative
+                // and may already have re-renewed or dropped leadership. the
+                // duties themselves are driver-side idempotent (they only reap
+                // genuinely-stale servers / orphaned rooms), but the s.isLeader
+                // write and the wasted work are the real hazard here.
+                if (!isCurrent()) {
+                    log.warn('discarding stale leader renewal result', { serverId: s.serverId });
+                    return;
+                }
                 if (!renewed) {
                     log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
                     s.isLeader = false;
@@ -609,6 +629,10 @@ async function startLeaderLoop(s: ServerState): Promise<void> {
                 await runLeaderDuties(s);
             } else {
                 const acquired = await s.driver.tryAcquireLeader(s.serverId);
+                if (!isCurrent()) {
+                    log.warn('discarding stale leader acquisition result', { serverId: s.serverId });
+                    return;
+                }
                 if (acquired) {
                     s.isLeader = true;
                     log.info('acquired leadership', { serverId: s.serverId });

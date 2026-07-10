@@ -137,6 +137,11 @@ export type Driver = {
      *  only relevant for drivers that run background work (e.g. memoryDriver prune interval). */
     destroy?: () => void;
     _internal: {
+        /** true if this driver keeps all state in-process (memory driver): server
+         *  and sdk share one object, so a wildcard/unset serverEndpoint is harmless.
+         *  false for networked drivers (redis) where the endpoint is published to
+         *  peers and sdks — start() fails fast on a wildcard endpoint in that case. */
+        local: boolean;
         /** register a new room */
         registerRoom(roomId: string, roomType: string, serverId: string, data: RoomData, tags: Record<string, string>): Promise<void>;
         /** unregister a room */
@@ -152,10 +157,13 @@ export type Driver = {
         /** mark a room as running — called by the server when the worker sends 'ready'.
          *  stores the room's client-facing endpoint and the room secret (used to mint jwts). */
         roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<void>;
-        /** report that a room failed (spawn failure, worker crash, stalled heartbeat, etc.) */
+        /** report that a room failed (spawn failure, worker crash, stalled heartbeat, etc.).
+         *  publishes a room-failed signal (carrying `reason`) so any waitForRoom waiter
+         *  rejects immediately with a RoomFailedError, THEN deletes the room records. */
         roomFailure(roomId: string, reason: string): Promise<void>;
         /** wait for a room to become 'running'. resolves with RoomInfo once ready,
-         *  or rejects if the room doesn't become ready within timeoutMs.
+         *  rejects with RoomFailedError (carrying the reason) if the room fails first,
+         *  or rejects with RoomTimeoutError if neither happens within timeoutMs.
          *  implementations should check initial state (already running) before subscribing. */
         waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo>;
         /** allocates a spot for a client, mints a jwt signed with the room's secret.

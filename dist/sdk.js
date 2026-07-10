@@ -1,4 +1,4 @@
-export { GathoError, InvalidTagError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from 'gatho/driver';
+export { GathoError, InvalidTagError, RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from 'gatho/driver';
 
 // errors thrown by sdk calls — re-exported from `gatho/driver` (canonical home)
 // so consumers don't have to import the driver module just to `instanceof` them.

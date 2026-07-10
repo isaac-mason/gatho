@@ -24,6 +24,14 @@ export declare class RoomTimeoutError extends GathoError {
     readonly timeoutMs: number;
     constructor(roomId: string, timeoutMs: number);
 }
+/** thrown when a room fails to start (spawn failure, worker crash, stalled heartbeat)
+ *  while a waiter is blocked on waitForRoom. carries the failure reason so callers
+ *  learn the real cause immediately instead of burning the full startup timeout. */
+export declare class RoomFailedError extends GathoError {
+    readonly roomId: string;
+    readonly reason: string;
+    constructor(roomId: string, reason: string);
+}
 /** thrown when a room was confirmed running but its data couldn't be fetched (race condition) */
 export declare class RoomStartError extends GathoError {
     readonly roomId: string;

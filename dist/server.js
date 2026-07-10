@@ -2286,14 +2286,20 @@ function runner(fn) {
     };
 }
 
-/** race a promise against a timeout. rejects with `${label} timeout` if it doesn't settle in time. */
-async function withTimeout(p, ms, label) {
+/** race a promise against a timeout. rejects with `${label} timeout` if it doesn't
+ *  settle in time. `onTimeout` (if given) fires synchronously when the timeout wins
+ *  the race — the underlying promise is not cancelled, so this is the hook to mark
+ *  its result stale. */
+async function withTimeout(p, ms, label, onTimeout) {
     let timer;
     try {
         return await Promise.race([
             p,
             new Promise((_, reject) => {
-                timer = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
+                timer = setTimeout(() => {
+                    onTimeout?.();
+                    reject(new Error(`${label} timeout`));
+                }, ms);
             }),
         ]);
     }
@@ -2312,13 +2318,28 @@ async function withTimeout(p, ms, label) {
  * previous run exceeded the interval). avoids both pending-promise pile-up
  * (no overlap by construction) and the "skip a full interval" gap that
  * setInterval + skip-on-overlap produces when a run runs long.
+ *
+ * `run` receives an `isCurrent()` predicate. it returns true while this tick is
+ * still the live one and becomes false the instant the tick times out (the next
+ * tick may then start) or the punctuator is stopped. withTimeout rejects a slow
+ * run but cannot cancel the underlying promise — it keeps executing. a run that
+ * outlives its timeout MUST check isCurrent() before any destructive action so
+ * it doesn't act on conclusions drawn from now-stale state while a fresh tick is
+ * already reconciling.
  */
 async function punctuate(label, run, opts) {
     const log$1 = opts.logger ?? log;
     let stopped = false;
     let timer;
+    // monotonically increasing tick epoch. a run captures its epoch on entry;
+    // isCurrent() reads true only while the live epoch still matches. the epoch
+    // advances the moment a run stops being authoritative — on timeout, on
+    // stop, or when the run completes and the next tick is scheduled — so an
+    // orphaned run (rejected by withTimeout but still executing) sees false.
+    let epoch = 0;
     function stop() {
         stopped = true;
+        epoch++;
         if (timer) {
             clearTimeout(timer);
             timer = undefined;
@@ -2328,8 +2349,15 @@ async function punctuate(label, run, opts) {
         if (stopped)
             return;
         const startedAt = Date.now();
+        const myEpoch = epoch;
+        const isCurrent = () => !stopped && epoch === myEpoch;
         try {
-            await withTimeout(run(), opts.timeoutMs, label);
+            // onTimeout advances the epoch so the still-executing run's
+            // isCurrent() flips to false the instant the tick is abandoned.
+            await withTimeout(run(isCurrent), opts.timeoutMs, label, () => {
+                if (epoch === myEpoch)
+                    epoch++;
+            });
         }
         catch (err) {
             log$1.error(`${label} error`, { err });
@@ -2338,6 +2366,11 @@ async function punctuate(label, run, opts) {
             return;
         const elapsed = Date.now() - startedAt;
         const delay = Math.max(0, opts.intervalMs - elapsed);
+        // advance the epoch (idempotent if the timeout already did) so the
+        // just-finished run — and any orphaned timed-out run — reads not-current,
+        // then schedule the next tick with its own fresh epoch.
+        if (epoch === myEpoch)
+            epoch++;
         timer = setTimeout(tick, delay);
     }
     await tick();
@@ -2678,13 +2711,21 @@ function stopRoomSubscription(s) {
 // returned by the heartbeat. push-based subscribeRoomAssignments handles new
 // assignments instantly; this loop is the safety net for missed pushes plus the
 // authoritative source for "which rooms should this server be running right now".
-async function heartbeatTick(s, adminEndpoint) {
+async function heartbeatTick(s, adminEndpoint, isCurrent) {
     const result = await s.driver.heartbeat({
         serverId: s.serverId,
         endpoint: adminEndpoint,
         tags: s.serverTags,
         roomTypes: Array.from(s.knownRoomTypes),
     });
+    // the heartbeat round-trip may have outlived this tick's timeout: a fresh
+    // tick is already reconciling against newer state. discard our now-stale
+    // conclusions rather than writing them back and destroying rooms the newer
+    // tick's desired-set still wants.
+    if (!isCurrent()) {
+        log.warn('discarding stale heartbeat tick result', { serverId: s.serverId });
+        return;
+    }
     if (result.registered && s.previouslyRegistered) {
         log.warn('restored missing server entry — record was reaped while alive', {
             serverId: s.serverId,
@@ -2705,7 +2746,7 @@ async function heartbeatTick(s, adminEndpoint) {
 async function startHeartbeatLoop(s, adminEndpoint, intervalMs) {
     if (s.heartbeatPunctuator)
         return;
-    s.heartbeatPunctuator = await punctuate('heartbeat loop', () => heartbeatTick(s, adminEndpoint), {
+    s.heartbeatPunctuator = await punctuate('heartbeat loop', (isCurrent) => heartbeatTick(s, adminEndpoint, isCurrent), {
         intervalMs,
         timeoutMs: HEARTBEAT_TICK_TIMEOUT_MS,
         logger: log.child({ serverId: s.serverId }),
@@ -2758,9 +2799,19 @@ async function runLeaderDuties(s) {
 // errors/timeouts log under 'leader loop error' and retry next tick — we
 // don't flip isLeader on driver error because the lock ttl may still be live.
 async function startLeaderLoop(s) {
-    s.leaderPunctuator = await punctuate('leader loop', async () => {
+    s.leaderPunctuator = await punctuate('leader loop', async (isCurrent) => {
         if (s.isLeader) {
             const renewed = await s.driver.renewLeader(s.serverId);
+            // a renewal that outlived this tick's timeout must not write
+            // leadership state or run duties: a fresh tick is authoritative
+            // and may already have re-renewed or dropped leadership. the
+            // duties themselves are driver-side idempotent (they only reap
+            // genuinely-stale servers / orphaned rooms), but the s.isLeader
+            // write and the wasted work are the real hazard here.
+            if (!isCurrent()) {
+                log.warn('discarding stale leader renewal result', { serverId: s.serverId });
+                return;
+            }
             if (!renewed) {
                 log.warn('lost leadership (renewal failed)', { serverId: s.serverId });
                 s.isLeader = false;
@@ -2770,6 +2821,10 @@ async function startLeaderLoop(s) {
         }
         else {
             const acquired = await s.driver.tryAcquireLeader(s.serverId);
+            if (!isCurrent()) {
+                log.warn('discarding stale leader acquisition result', { serverId: s.serverId });
+                return;
+            }
             if (acquired) {
                 s.isLeader = true;
                 log.info('acquired leadership', { serverId: s.serverId });
@@ -2910,15 +2965,30 @@ function getAllRoomDetails(s) {
     return details;
 }
 /* start */
+// wildcard hosts don't identify a reachable address. with a networked driver the
+// bind host becomes the published serverEndpoint, so a wildcard means every server
+// registers the same unroutable endpoint and they evict each other's rooms forever.
+const WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '']);
 async function start(options) {
     const { _internal: driver } = options.driver;
     const runners = new Map(Object.entries(options.rooms));
+    const host = options.host ?? '0.0.0.0';
+    // fail fast: a networked driver publishes this server's endpoint to peers and
+    // sdks. if the operator left serverEndpoint unset and the bind host is a
+    // wildcard, the derived endpoint (http://0.0.0.0:port) is unroutable and every
+    // server registers the same one — they mutually evict each other's rooms. a
+    // local (in-process) driver shares state directly, so the endpoint is moot.
+    if (!driver.local && !options.serverEndpoint && WILDCARD_HOSTS.has(host)) {
+        throw new Error('gatho: serverEndpoint is required with a networked driver when binding a wildcard host ' +
+            `(${host || 'unset'}). the endpoint is published to other servers and sdks, so it must be a ` +
+            'url they can reach — set serverEndpoint to e.g. "http://10.0.0.5:3000".');
+    }
     const s = {
         options,
         driver,
         runners,
         port: options.port ?? 3000,
-        host: options.host ?? '0.0.0.0',
+        host,
         serverId: randomUUID(),
         knownRoomTypes: new Set(Object.keys(options.rooms)),
         processes: new Map(),

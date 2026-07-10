@@ -90,6 +90,18 @@ class RoomTimeoutError extends GathoError {
         this.timeoutMs = timeoutMs;
     }
 }
+/** thrown when a room fails to start (spawn failure, worker crash, stalled heartbeat)
+ *  while a waiter is blocked on waitForRoom. carries the failure reason so callers
+ *  learn the real cause immediately instead of burning the full startup timeout. */
+class RoomFailedError extends GathoError {
+    roomId;
+    reason;
+    constructor(roomId, reason) {
+        super('room-failed', `room ${roomId} failed to start: ${reason}`);
+        this.roomId = roomId;
+        this.reason = reason;
+    }
+}
 /** thrown when a room was confirmed running but its data couldn't be fetched (race condition) */
 class RoomStartError extends GathoError {
     roomId;
@@ -307,7 +319,10 @@ function createMemoryDriver() {
             events.emit(`room-ready:${roomId}`, roomToInfo(r));
         }
     }
-    async function roomFailure(roomId, _reason) {
+    async function roomFailure(roomId, reason) {
+        // publish the failure BEFORE deleting so a waitForRoom waiter rejects
+        // with the real cause rather than eventually timing out.
+        events.emit(`room-failed:${roomId}`, reason);
         deleteClientsForRoom(roomId);
         rooms.delete(roomId);
     }
@@ -319,13 +334,21 @@ function createMemoryDriver() {
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 events.removeListener(`room-ready:${roomId}`, onReady);
+                events.removeListener(`room-failed:${roomId}`, onFailed);
                 reject(new RoomTimeoutError(roomId, timeoutMs));
             }, timeoutMs);
             function onReady(info) {
                 clearTimeout(timer);
+                events.removeListener(`room-failed:${roomId}`, onFailed);
                 resolve(info);
             }
+            function onFailed(reason) {
+                clearTimeout(timer);
+                events.removeListener(`room-ready:${roomId}`, onReady);
+                reject(new RoomFailedError(roomId, reason));
+            }
             events.once(`room-ready:${roomId}`, onReady);
+            events.once(`room-failed:${roomId}`, onFailed);
         });
     }
     async function getRoomInfo(roomId) {
@@ -535,6 +558,7 @@ function createMemoryDriver() {
             clearInterval(pruneTimer);
         },
         _internal: {
+            local: true,
             registerRoom,
             unregisterRoom,
             roomReady,
@@ -830,7 +854,10 @@ function createRedisDriver(options = {}) {
         // notify waiters via pub/sub
         await client.publish(keys.roomReady(roomId), roomId);
     }
-    async function roomFailure(roomId, _reason) {
+    async function roomFailure(roomId, reason) {
+        // publish the failure BEFORE deleting the records so a waitForRoom waiter
+        // rejects with the real cause rather than eventually timing out.
+        await client.publish(keys.roomFailed(roomId), reason);
         await unregisterRoom(roomId);
     }
     async function waitForRoom(roomId, timeoutMs) {
@@ -838,23 +865,24 @@ function createRedisDriver(options = {}) {
         const existing = await getRoomInfo(roomId);
         if (existing && existing.status === 'running')
             return existing;
-        const channel = keys.roomReady(roomId);
+        const readyChannel = keys.roomReady(roomId);
+        const failedChannel = keys.roomFailed(roomId);
         return new Promise((resolve, reject) => {
             let settled = false;
-            let unsub = null;
+            const unsubs = [];
             const cleanup = () => {
                 if (settled)
                     return;
                 settled = true;
                 clearTimeout(timer);
-                if (unsub)
-                    unsub();
+                for (const u of unsubs)
+                    u();
             };
             const timer = setTimeout(() => {
                 cleanup();
                 reject(new RoomTimeoutError(roomId, timeoutMs));
             }, timeoutMs);
-            const listener = (_ch, _msg) => {
+            const readyListener = (_ch, _msg) => {
                 cleanup();
                 // fetch full room info
                 getRoomInfo(roomId)
@@ -868,12 +896,22 @@ function createRedisDriver(options = {}) {
                 })
                     .catch(reject);
             };
-            subscribeChannel(channel, listener)
-                .then((unsubFn) => {
-                unsub = unsubFn;
+            const failedListener = (_ch, msg) => {
+                cleanup();
+                reject(new RoomFailedError(roomId, msg));
+            };
+            // subscribe to both the ready and failed channels. either one settles
+            // the promise; whichever fires first wins.
+            Promise.all([
+                subscribeChannel(readyChannel, readyListener),
+                subscribeChannel(failedChannel, failedListener),
+            ])
+                .then(([unsubReady, unsubFailed]) => {
+                unsubs.push(unsubReady, unsubFailed);
                 // if we settled while awaiting subscribe (timeout fired), clean up
                 if (settled) {
-                    unsubFn();
+                    unsubReady();
+                    unsubFailed();
                     return;
                 }
                 // re-check after subscribing — the room might have become
@@ -1206,6 +1244,7 @@ function createRedisDriver(options = {}) {
     }
     return {
         _internal: {
+            local: false,
             registerRoom,
             unregisterRoom,
             roomReady,
@@ -1262,6 +1301,8 @@ function createKeys(prefix) {
         leader: `${prefix}leader`,
         // pub/sub channel for room-ready notifications
         roomReady: (roomId) => `${prefix}room-ready:${roomId}`,
+        // pub/sub channel for room-failed notifications
+        roomFailed: (roomId) => `${prefix}room-failed:${roomId}`,
         // pub/sub channel for room assignment notifications (per-server)
         roomAssigned: (serverId) => `${prefix}room-assigned:${serverId}`,
         // schema version — checked on server registration
@@ -1269,5 +1310,5 @@ function createKeys(prefix) {
     };
 }
 
-export { DriverConfigError, GathoError, InvalidTagError, PayloadTooLargeError, RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, createMemoryDriver, createRedisDriver };
+export { DriverConfigError, GathoError, InvalidTagError, PayloadTooLargeError, RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES, RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, createMemoryDriver, createRedisDriver };
 //# sourceMappingURL=driver.js.map

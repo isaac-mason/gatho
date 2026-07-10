@@ -14,7 +14,17 @@ export type CreateRoomOptions = {
     data: RoomData;
     /** mutable string key/value tags for userland categorization */
     tags: Record<string, string>;
-    /** how long to wait for the room to become running (ms, default 10000) */
+    /** how long to wait for the room to become running (ms, default 10000).
+     *
+     *  this is a client-side backstop only. spawn failures (bad argv, missing
+     *  image, crash on boot) now reject createRoom immediately with a
+     *  RoomFailedError carrying the real reason — the timeout is not burned.
+     *  the server's own roomStartupTimeoutMs (default 30000) governs how long a
+     *  room may take to send its first notify message before the server kills it
+     *  and reports failure; with fast failure the two no longer need to be
+     *  aligned. keep timeoutMs comfortably above the slowest legitimate spawn
+     *  (e.g. a cold docker image pull) so a slow-but-healthy start isn't cut off
+     *  before the server has a chance to fail it. */
     timeoutMs?: number;
 };
 /** options for joining a room */
@@ -54,6 +64,6 @@ export type GathoSDK = {
     removeServerTags(serverId: string, keys: string[]): Promise<void>;
 };
 export type { ClientInfo, ClientReservation, ListRoomsFilter, ListServersFilter, RoomInfo, RoomStatus, ServerInfo, TagFilter };
-export { GathoError, InvalidTagError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, } from 'gatho/driver';
+export { GathoError, InvalidTagError, RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, } from 'gatho/driver';
 /** create a new gatho sdk instance with the given options */
 export declare function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK;
