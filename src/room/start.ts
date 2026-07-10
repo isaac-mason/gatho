@@ -3,7 +3,7 @@ import { jwtVerify } from '../common/jwt';
 import { createLogger, type Logger } from '../common/logger';
 import type { Notifier, ProcessMetricsMessage } from '../common/notify-protocol';
 import { frameUserMessage, PROTOCOL_VERSION, packProtocol, unpackFrame } from '../common/protocol';
-import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
+import type { AuthResult, BroadcastOptions, Client, ClientCollection, Room, SendOptions } from './index';
 import { connectNotify, parseNotifyTarget } from './ipc';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
 import { wsTransport } from './transport/ws';
@@ -310,20 +310,45 @@ function createRoom<ClientData>(
                 bufferForClient(tracked, framed);
             }
         },
-        broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions) {
+        broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: BroadcastOptions<ClientData>) {
             if (!state.alive) return;
             if (!state.server) return;
 
             const framed = frameUserMessage(message);
             const reliable = options?.reliable !== false;
+            const except = options?.except;
 
-            state.server.publish(BROADCAST_TOPIC, framed, true);
-
-            if (reliable) {
-                for (const tracked of state.clients.values()) {
-                    if (!tracked.socket) {
-                        bufferForClient(tracked, framed);
+            if (except === undefined) {
+                // fast path: no exclusions — fan out via the transport's pub/sub in a
+                // single publish, and buffer once per disconnected client for reconnect.
+                state.server.publish(BROADCAST_TOPIC, framed, true);
+                if (reliable) {
+                    for (const tracked of state.clients.values()) {
+                        if (!tracked.socket) {
+                            bufferForClient(tracked, framed);
+                        }
                     }
+                }
+                return;
+            }
+
+            // exclusion path: the pub/sub topic can't skip a member, so we abandon it
+            // and iterate every tracked client, sending (or buffering) per socket while
+            // skipping the excluded ids. an excluded client gets nothing — no live send
+            // and no reliable buffering, so it never receives the message on reconnect.
+            const excludedIds = new Set<string>();
+            if (Array.isArray(except)) {
+                for (const c of except) excludedIds.add(c.id);
+            } else {
+                excludedIds.add(except.id);
+            }
+
+            for (const tracked of state.clients.values()) {
+                if (excludedIds.has(tracked.id)) continue;
+                if (tracked.socket) {
+                    tracked.socket.send(framed, true);
+                } else if (reliable) {
+                    bufferForClient(tracked, framed);
                 }
             }
         },

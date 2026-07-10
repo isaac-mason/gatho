@@ -35,12 +35,16 @@ export type ClientCollection<ClientData> = {
 export type SendOptions = {
     reliable?: boolean;
 };
+export type BroadcastOptions<ClientData = Record<string, unknown>> = {
+    reliable?: boolean;
+    except?: Client<ClientData> | Client<ClientData>[];
+};
 export type Room<ClientData = Record<string, unknown>> = {
     readonly roomId: string;
     readonly roomType: string;
     readonly serverId: string | undefined;
     send(client: Client<ClientData>, message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
-    broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
+    broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: BroadcastOptions<ClientData>): void;
     readonly clients: ClientCollection<ClientData>;
     allowReconnection(client: Client<ClientData>, windowMs: number): void;
     disconnect(client: Client<ClientData>): void;

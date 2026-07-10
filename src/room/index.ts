@@ -69,8 +69,18 @@ export type ClientCollection<ClientData> = {
 
 // --- room handle ---
 
-// options for room.send() and room.broadcast()
+// options for room.send()
 export type SendOptions = { reliable?: boolean };
+
+// options for room.broadcast()
+export type BroadcastOptions<ClientData = Record<string, unknown>> = {
+    reliable?: boolean;
+    // clients to exclude from this broadcast. the classic "echo to everyone but the
+    // sender" case. excluded clients receive nothing — not even a buffered copy for
+    // reconnect delivery. setting this abandons the pub/sub fast path for a per-socket
+    // send that skips the excluded ids.
+    except?: Client<ClientData> | Client<ClientData>[];
+};
 
 // the Room handle — returned by start(), also passed as first arg to all callbacks
 export type Room<ClientData = Record<string, unknown>> = {
@@ -81,7 +91,7 @@ export type Room<ClientData = Record<string, unknown>> = {
 
     // messaging
     send(client: Client<ClientData>, message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
-    broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
+    broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: BroadcastOptions<ClientData>): void;
 
     // clients
     readonly clients: ClientCollection<ClientData>;

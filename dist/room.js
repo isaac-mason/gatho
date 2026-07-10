@@ -2574,12 +2574,40 @@ function createRoom(state, maxBufferBytes, callbacks) {
                 return;
             const framed = frameUserMessage(message);
             const reliable = options?.reliable !== false;
-            state.server.publish(BROADCAST_TOPIC, framed, true);
-            if (reliable) {
-                for (const tracked of state.clients.values()) {
-                    if (!tracked.socket) {
-                        bufferForClient(tracked, framed);
+            const except = options?.except;
+            if (except === undefined) {
+                // fast path: no exclusions — fan out via the transport's pub/sub in a
+                // single publish, and buffer once per disconnected client for reconnect.
+                state.server.publish(BROADCAST_TOPIC, framed, true);
+                if (reliable) {
+                    for (const tracked of state.clients.values()) {
+                        if (!tracked.socket) {
+                            bufferForClient(tracked, framed);
+                        }
                     }
+                }
+                return;
+            }
+            // exclusion path: the pub/sub topic can't skip a member, so we abandon it
+            // and iterate every tracked client, sending (or buffering) per socket while
+            // skipping the excluded ids. an excluded client gets nothing — no live send
+            // and no reliable buffering, so it never receives the message on reconnect.
+            const excludedIds = new Set();
+            if (Array.isArray(except)) {
+                for (const c of except)
+                    excludedIds.add(c.id);
+            }
+            else {
+                excludedIds.add(except.id);
+            }
+            for (const tracked of state.clients.values()) {
+                if (excludedIds.has(tracked.id))
+                    continue;
+                if (tracked.socket) {
+                    tracked.socket.send(framed, true);
+                }
+                else if (reliable) {
+                    bufferForClient(tracked, framed);
                 }
             }
         },
