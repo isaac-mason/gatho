@@ -2714,6 +2714,21 @@ function startRoom(state, transport, options) {
                 socket.close(4000, 'protocol version mismatch');
                 return;
             }
+            // one-shot seats: a reservation jwt is redeemed exactly once. if this
+            // clientId is already tracked we reject rather than overwrite. two cases:
+            //  - live socket: a duplicate connection with the same seat token —
+            //    reject so the existing session is never disturbed.
+            //  - null socket (reconnection window): the seat is held for a client
+            //    that dropped. resumption MUST go through the session-token reconnect
+            //    path — the jwt was already spent on the first open(), so a fresh jwt
+            //    open() here would silently reset session state. reject it too.
+            // rejecting before onAuth also means the duplicate never overwrites the
+            // sessionTokens entry, so the old session token can no longer leak.
+            if (state.clients.has(clientId)) {
+                socket.send(packProtocol({ type: 'auth_error', error: 'seat already in use' }), true);
+                socket.close(4000, 'seat already in use');
+                return;
+            }
             (async () => {
                 let result;
                 try {

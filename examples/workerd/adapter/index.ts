@@ -22,8 +22,8 @@
 // performs the actual I/O in the one context where that socket is valid. This
 // makes send/echo/broadcast all work within a single isolate. See README.
 
-import { type NotifyMessage, start, type StartOptions } from 'gatho/room';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from 'gatho/room';
+import { type NotifyMessage, type StartOptions, start } from 'gatho/room';
 
 // workerd globals — declared loosely to avoid a dependency on @cloudflare/workers-types.
 declare const WebSocketPair: {
@@ -267,21 +267,30 @@ class WorkerdRoom {
         }
 
         conn.ws.addEventListener('message', (e) => {
+            // generation guard: ignore frames from a connection that is no longer the
+            // current one for this clientId (replaced by a reconnect). mirrors the ws
+            // transport — a stale socket must not drive room logic against a live client.
+            if (this.conns.get(clientId) !== conn) return;
             const { ab, isBinary } = toArrayBuffer(e.data);
             handlers.message(clientId, ab, isBinary);
         });
         conn.ws.addEventListener('close', (e) => {
             conn.closed = true;
             conn.signal();
-            if (this.conns.get(clientId) === conn) {
-                for (const t of conn.topics) this.topics.get(t)?.delete(clientId);
-                this.conns.delete(clientId);
-            }
+            // a stale connection (already replaced in `conns` by a reconnect) self-cleans
+            // its own drain loop above but must not touch the new connection's mapping or
+            // drive the room-side close — only the current connection owns those.
+            if (this.conns.get(clientId) !== conn) return;
+            for (const t of conn.topics) this.topics.get(t)?.delete(clientId);
+            this.conns.delete(clientId);
             handlers.close(clientId, e.code || 1006);
         });
         conn.ws.addEventListener('error', () => {
             conn.closed = true;
             conn.signal();
+            if (this.conns.get(clientId) !== conn) return;
+            for (const t of conn.topics) this.topics.get(t)?.delete(clientId);
+            this.conns.delete(clientId);
             handlers.close(clientId, 1006);
         });
     }

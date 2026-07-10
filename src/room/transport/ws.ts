@@ -145,6 +145,12 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                         }
 
                         ws.on('message', (data: Buffer | ArrayBuffer | Buffer[], isBinary: boolean) => {
+                            // generation guard: ignore frames from a socket that is no
+                            // longer the current one for this clientId (a newer socket
+                            // replaced it, e.g. a reconnect). without this a lingering
+                            // stale socket could drive room logic against a live client.
+                            if (clientSockets.get(clientId) !== ws) return;
+
                             // normalize to arraybuffer — consistent with transport interface.
                             // we copy into a fresh ArrayBuffer to avoid SharedArrayBuffer issues
                             // with Buffer.buffer on some runtimes.
@@ -166,7 +172,14 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                         });
 
                         ws.on('close', (code: number) => {
-                            // clean up topic subscriptions
+                            // generation guard: is this socket still the current one
+                            // for its clientId? a stale socket (replaced by a reconnect
+                            // via completeUpgrade, which already dropped it from
+                            // clientSockets) must self-clean but MUST NOT touch the new
+                            // socket's mapping or drive room-side close logic.
+                            const isCurrent = clientSockets.get(clientId) === ws;
+
+                            // clean up this socket's own topic subscriptions
                             for (const topic of state.topics) {
                                 const subs = topics.get(topic);
                                 if (subs) {
@@ -178,8 +191,12 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                             }
 
                             connections.delete(ws);
-                            clientSockets.delete(clientId);
 
+                            if (!isCurrent) return;
+
+                            // only the current socket owns the reverse mapping and the
+                            // room-side close — the normal single-socket close path.
+                            clientSockets.delete(clientId);
                             handlers.close(clientId, code);
                         });
                     });
