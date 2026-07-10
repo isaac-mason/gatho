@@ -728,13 +728,9 @@ async function startRoom<ClientData, JoinData extends Record<string, unknown>>(
 
             if (options.onMessage) {
                 if (frame.frame === 'user_text') {
-                    safeCall(state.log, 'onMessage', () =>
-                        options.onMessage!(tracked.handle as Client<ClientData>, frame.text),
-                    );
+                    safeCall(state.log, 'onMessage', () => options.onMessage!(tracked.handle as Client<ClientData>, frame.text));
                 } else {
-                    safeCall(state.log, 'onMessage', () =>
-                        options.onMessage!(tracked.handle as Client<ClientData>, frame.data),
-                    );
+                    safeCall(state.log, 'onMessage', () => options.onMessage!(tracked.handle as Client<ClientData>, frame.data));
                 }
             }
         },

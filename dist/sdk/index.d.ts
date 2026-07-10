@@ -36,10 +36,13 @@ export type JoinOptions = {
     /** how long until the reservation expires (ms). optional — defaults to 30000. */
     ttl?: number;
     /** arbitrary data included in the jwt and delivered to onAuth as joinData.
-     *  keep small — the jwt travels in a url query param (~2-3KB practical limit). */
+     *  keep it small — the whole jwt travels in a url query param, and urls have a
+     *  ~8KB practical limit across proxies and servers. capped at 2048 bytes
+     *  serialized; join() throws PayloadTooLargeError if exceeded. */
     data?: Record<string, unknown>;
     /** immutable string key/value tags persisted on the client record.
-     *  visible on ClientInfo in listRooms / listServers responses. */
+     *  visible on ClientInfo in listRooms / listServers responses. capped at 512
+     *  bytes serialized; join() throws PayloadTooLargeError if exceeded. */
     tags?: Record<string, string>;
 };
 /** gatho sdk */

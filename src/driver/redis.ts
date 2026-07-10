@@ -363,10 +363,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
 
             // subscribe to both the ready and failed channels. either one settles
             // the promise; whichever fires first wins.
-            Promise.all([
-                subscribeChannel(readyChannel, readyListener),
-                subscribeChannel(failedChannel, failedListener),
-            ])
+            Promise.all([subscribeChannel(readyChannel, readyListener), subscribeChannel(failedChannel, failedListener)])
                 .then(([unsubReady, unsubFailed]) => {
                     unsubs.push(unsubReady, unsubFailed);
 
@@ -514,11 +511,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         };
     }
 
-    async function connectClient(
-        clientId: string,
-        roomId: string,
-        tags: Record<string, string>,
-    ): Promise<void> {
+    async function connectClient(clientId: string, roomId: string, tags: Record<string, string>): Promise<void> {
         // atomic upsert: write every field reserveClient writes, persist the key,
         // and ensure the room's client set contains us. self-healing — if the
         // hash was evicted (TTL fired during the reserve→connect ipc window) or

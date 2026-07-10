@@ -14,28 +14,37 @@ const dockerRunner = runner(async (ctx) => {
     // chan.socketDir is this room's own socket dir to bind-mount.
     const chan = await notify.uds(ctx, { socketDir: SOCKET_DIR });
 
-    const child = spawn('docker', [
-        'run',
-        // remove the container when it exits
-        '--rm',
-        // use host networking (simpler setup, you could also do port mapping)
-        '--network=host',
-        // give the container a name for easier debugging
-        '--name', `room-${ctx.roomId}`,
-        // limit memory
-        '--memory', '512m',
-        // limit CPU
-        '--cpus', '1',
-        // mount only THIS room's socket dir so the room can reach its own socket
-        // but not sibling rooms' sockets.
-        '-v', `${chan.socketDir}:${chan.socketDir}`,
-        // forward gatho env + the notify channel env to the container
-        ...Object.entries({ ...ctx.env, ...chan.env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
-        // set a game mode env var for the container based on ctx.data
-        '-e', `GAME_MODE=${gameMode}`,
-        // our docker image, runs gatho/room's create() + room.start() within
-        'my-game-image:latest',
-    ], { stdio: ['ignore', 'inherit', 'inherit'] });
+    const child = spawn(
+        'docker',
+        [
+            'run',
+            // remove the container when it exits
+            '--rm',
+            // use host networking (simpler setup, you could also do port mapping)
+            '--network=host',
+            // give the container a name for easier debugging
+            '--name',
+            `room-${ctx.roomId}`,
+            // limit memory
+            '--memory',
+            '512m',
+            // limit CPU
+            '--cpus',
+            '1',
+            // mount only THIS room's socket dir so the room can reach its own socket
+            // but not sibling rooms' sockets.
+            '-v',
+            `${chan.socketDir}:${chan.socketDir}`,
+            // forward gatho env + the notify channel env to the container
+            ...Object.entries({ ...ctx.env, ...chan.env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+            // set a game mode env var for the container based on ctx.data
+            '-e',
+            `GAME_MODE=${gameMode}`,
+            // our docker image, runs gatho/room's create() + room.start() within
+            'my-game-image:latest',
+        ],
+        { stdio: ['ignore', 'inherit', 'inherit'] },
+    );
 
     // when the child exits, tear down the channel and tell the server the room stopped
     child.on('exit', (code) => {

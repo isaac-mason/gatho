@@ -398,10 +398,7 @@ function createRedisDriver(options = {}) {
             };
             // subscribe to both the ready and failed channels. either one settles
             // the promise; whichever fires first wins.
-            Promise.all([
-                subscribeChannel(readyChannel, readyListener),
-                subscribeChannel(failedChannel, failedListener),
-            ])
+            Promise.all([subscribeChannel(readyChannel, readyListener), subscribeChannel(failedChannel, failedListener)])
                 .then(([unsubReady, unsubFailed]) => {
                 unsubs.push(unsubReady, unsubFailed);
                 // if we settled while awaiting subscribe (timeout fired), clean up

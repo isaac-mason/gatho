@@ -315,10 +315,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
 
         // mint jwt signed with the room's secret. tags travel as a separate
         // claim from user data so the room can forward them back over ipc.
-        const token = await jwtSign(
-            { clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags },
-            r.roomSecret,
-        );
+        const token = await jwtSign({ clientId, roomId, exp: expiresAt, data: data ?? {}, tags: clientTags }, r.roomSecret);
 
         clients.set(clientId, {
             clientId,
@@ -336,11 +333,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
         return { clientId, url: url.toString(), roomId, expiresAt };
     }
 
-    async function connectClient(
-        clientId: string,
-        roomId: string,
-        tags: Record<string, string>,
-    ): Promise<void> {
+    async function connectClient(clientId: string, roomId: string, tags: Record<string, string>): Promise<void> {
         // upsert: write every field reserveClient writes, mirroring the redis
         // driver's MULTI semantics. memory isn't subject to TTL eviction so the
         // record will normally exist, but we treat the ipc payload as the
