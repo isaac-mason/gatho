@@ -37,7 +37,7 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 
 ## Concepts
 
-A **room** (`gatho/room`) is a shared multiplayer session: a game match, a lobby, a collaborative space. Organise your application and state however you like, then call `start` to initialize the room.
+A **room** (`gatho/room`) is a shared multiplayer session: a game match, a lobby, a collaborative space. Organise your application and state however you like, then call `create` to build the room and `await room.start()` to bring it online.
 
 A **server** (`gatho/server`) hosts rooms. You run one or more of them, and each registers itself with the driver so the SDK knows it exists and can place rooms on it. You also tell the server how to run rooms. The built-in `subprocess()` runner spawns each room as its own child process, but you can run rooms in the same process, in a container, or anywhere else. Rooms report their health and status back to the server over a one-way notify channel, which is a Unix domain socket by default. The runner owns that channel, so a custom runner can carry it however its runtime needs. Run multiple servers when you want horizontal scale.
 
@@ -117,7 +117,9 @@ The helper returns `chan.env`, which holds `GATHO_NOTIFY_SOCKET` (a `uds:<path>`
 
 ### Running Rooms Standalone
 
-By default a room expects to be spawned by a gatho server. It reads `GATHO_*` env vars (set automatically when using `subprocess()`), or takes the same values via `options.server` when you are using a custom runner. It opens a Unix domain socket (UDS) back to the parent server to report heartbeats and client connects/disconnects, and it verifies seat tokens minted by `sdk.join()` on every new connection. `start()` throws at startup if no managed context is detected, so a mis-deployed room can't silently accept unauthenticated connections.
+By default a room expects to be spawned by a gatho server. It reads `GATHO_*` env vars (set automatically when using `subprocess()`), or takes the same values via `options.server` when you are using a custom runner. It opens a Unix domain socket (UDS) back to the parent server to report heartbeats and client connects/disconnects, and it verifies seat tokens minted by `sdk.join()` on every new connection. `create()` throws if no managed context is detected, so a mis-deployed room can't silently accept unauthenticated connections.
+
+A room is two-phase: `create(options)` builds the room synchronously (resolving config, storing your handlers, exposing `room.roomId` immediately), and `await room.start()` brings it online (dialing the notify channel, opening the transport, signalling ready). Lifecycle callbacks are passed to `create()` and no longer receive a `room` argument — reference the `room` handle returned by `create()` directly, and use the per-client verbs `client.send()`, `client.allowReconnection()`, and `client.disconnect()` on the client handle.
 
 For local dev or tests where you want to `bun run room.ts` and connect a client directly, pass `standalone: true`. The room picks a random `roomId`, skips the UDS, and accepts any connection.
 
@@ -125,7 +127,7 @@ For local dev or tests where you want to `bun run room.ts` and connect a client 
 
 ## Messages
 
-gatho is unopinionated about message format. `room.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` and `JSON.parse()` yourself. gatho stays out of the way.
+gatho is unopinionated about message format. `client.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` and `JSON.parse()` yourself. gatho stays out of the way.
 
 If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types. No code generation, no IDL files.
 
@@ -133,16 +135,18 @@ If you want good performance without sacrificing developer experience, [packcat]
 
 ## Client
 
-`gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself:
+`gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself. `connect(url, handlers)` takes a single-handler bag — one callback per event (`onOpen`, `onMessage`, `onDrop`, `onReconnect`, `onAuthError`, `onClose`, `onError`), all optional — and returns a connection with `send()`, `close()`, `state`, and `clientId`:
 
 - **Automatic reconnection.** On an unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter.
 - **Reliable messaging.** Messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. WebTransport support will build on this.
 - **Session continuity.** The server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off.
 - **Clean close.** `close()` sends a protocol-level leave message so the server knows the disconnect was intentional and skips the reconnection window.
 
-On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
+On the server side, opt in to reconnection by calling `client.allowReconnection(windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
 
-**Outbound backpressure.** Gatho exposes each socket's unflushed outbound buffer at the transport layer but ships no automatic eviction policy — bursty payloads (a voxel world sync) must not be killed by a threshold gatho guessed at, so the pacing and eviction decisions are yours. A full guide to pacing large sends and building your own stall policy is coming.
+The client's `onOpen` handler and the room's `onJoin` fire at the same protocol instant — receipt of the session message — so "joined" means the same thing on both ends.
+
+**Outbound backpressure.** Gatho exposes each socket's unflushed outbound buffer via `client.bufferedAmount` but ships no automatic eviction policy — bursty payloads (a voxel world sync) must not be killed by a threshold gatho guessed at, so the pacing and eviction decisions are yours. A full guide to pacing large sends and building your own stall policy is coming.
 
 <Snippet source="./src/reconnection.ts" />
 

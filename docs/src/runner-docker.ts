@@ -33,7 +33,7 @@ const dockerRunner = runner(async (ctx) => {
         ...Object.entries({ ...ctx.env, ...chan.env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
         // set a game mode env var for the container based on ctx.data
         '-e', `GAME_MODE=${gameMode}`,
-        // our docker image, runs gatho/room's start() within
+        // our docker image, runs gatho/room's create() + room.start() within
         'my-game-image:latest',
     ], { stdio: ['ignore', 'inherit', 'inherit'] });
 

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { unpackFrame } from '../../src/common/protocol';
-import { auth, start } from '../../src/room/index';
+import { auth, create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -105,11 +105,12 @@ describe('room broadcast except', () => {
     });
 
     it('broadcast with no except uses the pub/sub fast path — every subscriber gets it', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         const a = recordingSocket(subscribers());
         const b = recordingSocket(subscribers());
@@ -125,11 +126,12 @@ describe('room broadcast except', () => {
     });
 
     it('broadcast with except skips the excluded live client', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         const a = recordingSocket(subscribers());
         const b = recordingSocket(subscribers());
@@ -145,11 +147,12 @@ describe('room broadcast except', () => {
     });
 
     it('broadcast with except accepts an array of excluded clients', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         const a = recordingSocket(subscribers());
         const b = recordingSocket(subscribers());
@@ -169,13 +172,14 @@ describe('room broadcast except', () => {
     });
 
     it('does not buffer the message for an excluded disconnected client', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
             // hold the seat so the client stays tracked while disconnected.
-            onDrop: (r, client) => r.allowReconnection(client, 60_000),
+            onDrop: (client) => client.allowReconnection(60_000),
         });
+        await room.start();
 
         const a = recordingSocket(subscribers());
         const b = recordingSocket(subscribers());
@@ -208,12 +212,13 @@ describe('room broadcast except', () => {
     it('still buffers a normal (no-except) broadcast for a disconnected client', async () => {
         // control for the previous test: without except, a disconnected client IS
         // buffered and gets the message on reconnect.
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
-            onDrop: (r, client) => r.allowReconnection(client, 60_000),
+            onDrop: (client) => client.allowReconnection(60_000),
         });
+        await room.start();
 
         const a = recordingSocket(subscribers());
         handlers().open('a', a.socket, {}, {});

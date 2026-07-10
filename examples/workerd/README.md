@@ -47,8 +47,8 @@ in. Pieces:
   matchmaking join API (`POST /api/join` → fullest room with space, up to 32 per
   room; a full house spins up a new *isolate*, not a new process) and empty-room
   cleanup.
-- **`rooms/landing.ts`** — the website's cursor room, ported to the plain-options
-  export. One workerd adaptation: the website's ~15Hz `setInterval` batch tick
+- **`rooms/landing.ts`** — the website's cursor room, ported to the `(room) =>
+  options` factory export. One workerd adaptation: the website's ~15Hz `setInterval` batch tick
   becomes an **armed-on-demand `setTimeout` flush** (first dirty move schedules a
   66ms flush) — workerd timers only fire while the isolate is active, and while
   cursors stream at ~20Hz it is; when everyone's idle there's nothing to flush.
@@ -85,18 +85,21 @@ workerd() runner  (host/host.ts)                     ├─ ADMIN socket   :Pa  
         └──────────◄─────────────────────────────┤ room isolate (v8, workerLoader)│
                                                   │  adapter/index.ts:            │
    real ws client ──────ws://:Pc/roomId?token──► │   WebSocketPair transport      │
-                                                  │   start(roomModule, {…})       │
+                                                  │   create(roomModule(room),{…}) │
                                                   └────────────────────────────────┘
 ```
 
 - **`rooms/*.ts`** — a room module. State lives at module scope; callbacks close
-  over it. It exports a **plain `StartOptions` object** (`export default { … }
-  satisfies StartOptions<…>`). This plain-export shape is **this example's own
-  convention, not a gatho API** — a workerd module can't call top-level `start()`
-  because env/bindings only arrive per-request, so the module exports options and
-  the adapter calls `start()` on the first request. Each loaded isolate evaluates
-  the module fresh, so module-scope state is per-room, exactly like a subprocess.
-- **`adapter/index.ts`** — `createWorkerdRoom(options)` → an `ExportedHandler`.
+  over it. It default-exports a **`RoomModule` factory** (`(room) => options`,
+  typed `RoomModule<ClientData>`). The two-phase room api drops the `room` param
+  from callbacks, so the factory threads the room handle in — capacity checks and
+  broadcasts use the closed-over handle. This factory shape is **this example's own
+  convention, not a gatho API** — a workerd module can't call top-level `create()`
+  because env/bindings only arrive per-request, so the module exports the factory
+  and the adapter calls `create(factory(room))` + `room.start()` on the first
+  request. Each loaded isolate evaluates the module fresh, so module-scope state is
+  per-room, exactly like a subprocess.
+- **`adapter/index.ts`** — `createWorkerdRoom(factory)` → an `ExportedHandler`.
   Implements the gatho `Transport` contract over `WebSocketPair`, and a `Notifier`
   over the injected `NOTIFIER` binding.
 - **`harness/harness.ts`** — the static entry worker: client routing, admission

@@ -2,19 +2,19 @@
 // spawned by the gatho server when a ping room is created.
 // client sends { type: "ping" }, room responds with { type: "pong", server, ts }
 
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 
 // room state
 let pingCount = 0;
 
 console.log(`[ping-room] starting room with pid ${process.pid}`);
 
-await start({
+const room = create({
     onAuth: () => {
         return auth.ok({ username: 'player' });
     },
 
-    onJoin: (room, client) => {
+    onJoin: (client) => {
         room.broadcast(
             JSON.stringify({
                 type: 'join',
@@ -24,13 +24,12 @@ await start({
         );
     },
 
-    onMessage: (room, client, message) => {
+    onMessage: (client, message) => {
         if (typeof message !== 'string') return;
         const parsed = JSON.parse(message) as { type?: string };
         if (parsed.type === 'ping') {
             pingCount++;
-            room.send(
-                client,
+            client.send(
                 JSON.stringify({
                     type: 'pong',
                     pingCount,
@@ -41,7 +40,7 @@ await start({
         }
     },
 
-    onLeave: (room, client) => {
+    onLeave: (client) => {
         room.broadcast(
             JSON.stringify({
                 type: 'leave',
@@ -51,3 +50,5 @@ await start({
         );
     },
 });
+
+await room.start();

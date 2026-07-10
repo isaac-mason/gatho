@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { unpackFrame } from '../../src/common/protocol';
-import { auth, start } from '../../src/room/index';
+import { auth, create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -57,11 +57,12 @@ describe('room.clients iterable', () => {
     });
 
     it('yields a handle per client via for..of', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: (_r, joinData: { name: string }) => auth.ok({ name: joinData.name }),
+            onAuth: (joinData: { name: string }) => auth.ok({ name: joinData.name }),
         });
+        await room.start();
 
         handlers().open('a', socket(), { name: 'alice' }, {});
         handlers().open('b', socket(), { name: 'bob' }, {});
@@ -79,11 +80,12 @@ describe('room.clients iterable', () => {
     });
 
     it('supports spread and Array.from without allocating via all()', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         handlers().open('a', socket(), {}, {});
         handlers().open('b', socket(), {}, {});
@@ -95,11 +97,12 @@ describe('room.clients iterable', () => {
     });
 
     it('yields nothing for an empty room', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         expect([...room.clients]).toEqual([]);
     });

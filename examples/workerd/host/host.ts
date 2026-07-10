@@ -73,7 +73,7 @@ async function bundleHarness(): Promise<string> {
 async function bundleRoom(entryPath: string): Promise<string> {
     const cached = roomBundleCache.get(entryPath);
     if (cached) return cached;
-    // generated entry: wrap the room options module (default export) in the adapter.
+    // generated entry: wrap the room factory module (default export) in the adapter.
     const stub = `
 import def from ${JSON.stringify(entryPath)};
 import { createWorkerdRoom } from ${JSON.stringify(ADAPTER)};
@@ -300,8 +300,8 @@ function prefixOutput(proc: ChildProcess): void {
 // --- the runner factory ---
 
 export type WorkerdRunnerOptions = {
-    /** path to the room module — default-exports a plain `StartOptions` object.
-     *  resolved against cwd. */
+    /** path to the room module — default-exports a `RoomModule` factory
+     *  `(room) => options`. resolved against cwd. */
     entry: string;
 };
 

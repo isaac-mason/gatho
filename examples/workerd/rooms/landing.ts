@@ -13,7 +13,8 @@
 // cursors stream (~20Hz per client) the isolate is active and the timeout fires
 // on schedule; when everyone is idle there's nothing to flush anyway.
 
-import { auth, type Room, type StartOptions } from 'gatho/room';
+import { auth, type Room } from 'gatho/room';
+import type { RoomModule } from '../adapter/index';
 import { clientCodec, serverCodec } from '../shared/protocol';
 
 const COLORS = ['#ff5c7c', '#5ca8ff', '#5cffa8', '#ffd95c', '#c45cff', '#ff8c5c', '#5cf0ff', '#a8ff5c'];
@@ -66,7 +67,7 @@ function scheduleFlush(room: Room<ClientData>): void {
     }, TICK_MS);
 }
 
-export default {
+const landing: RoomModule<ClientData> = (room) => ({
     onAuth: () => {
         const color = COLORS[seq % COLORS.length];
         const name = `${NAMES[seq % NAMES.length]}-${seq}`;
@@ -74,7 +75,7 @@ export default {
         return auth.ok({ color, name });
     },
 
-    onJoin: (room, client) => {
+    onJoin: (client) => {
         const { color, name } = client.data;
         const cid = allocCid();
         state.set(client.id, { cid, color, name, x: 0, y: 0, announced: false, dirty: false });
@@ -84,11 +85,11 @@ export default {
         for (const s of state.values()) {
             if (s.announced) cursors.push({ cid: s.cid, color: s.color, name: s.name, x: s.x, y: s.y });
         }
-        room.send(client, serverCodec.pack({ type: 'snapshot', you: cid, color, name, cursors }));
+        client.send(serverCodec.pack({ type: 'snapshot', you: cid, color, name, cursors }));
         room.broadcast(serverCodec.pack({ type: 'presence', count: room.clients.count() }));
     },
 
-    onMessage: (room, client, message) => {
+    onMessage: (client, message) => {
         if (typeof message === 'string') return; // binary only
         const s = state.get(client.id);
         if (!s) return;
@@ -105,7 +106,7 @@ export default {
         }
     },
 
-    onLeave: (room, client) => {
+    onLeave: (client) => {
         const s = state.get(client.id);
         if (s) {
             if (s.announced) room.broadcast(serverCodec.pack({ type: 'leave', cid: s.cid }));
@@ -113,4 +114,6 @@ export default {
         }
         room.broadcast(serverCodec.pack({ type: 'presence', count: room.clients.count() }));
     },
-} satisfies StartOptions<ClientData>;
+});
+
+export default landing;

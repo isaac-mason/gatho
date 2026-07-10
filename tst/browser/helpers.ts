@@ -5,8 +5,8 @@ import { readFileSync } from 'fs';
 import { createServer as createHttpServer } from 'http';
 import { resolve } from 'path';
 import type { Room } from 'gatho/room';
-import { auth, start } from 'gatho/room';
-import type { StartOptions } from 'gatho/room';
+import { auth, create } from 'gatho/room';
+import type { CreateOptions } from 'gatho/room';
 
 const CLIENT_BUNDLE_PATH = resolve(import.meta.dirname, '../../dist/client.js');
 
@@ -65,15 +65,15 @@ export function startPageServer(): Promise<{ port: number; close: () => void }> 
 export async function startRoom<ClientData = Record<string, unknown>>(
     opts: Partial<
         Pick<
-            StartOptions<ClientData>,
+            CreateOptions<ClientData>,
             'onDrop' | 'onReconnect' | 'onLeave' | 'onJoin' | 'onMessage' | 'onShutdown' | 'maxBufferBytes'
         >
     > & {
         port: number;
-        onAuth?: StartOptions<ClientData>['onAuth'];
+        onAuth?: CreateOptions<ClientData>['onAuth'];
     },
 ): Promise<{ room: Room<ClientData>; wsPort: number }> {
-    const room = await start<ClientData>({
+    const room = create<ClientData>({
         standalone: true,
         port: opts.port,
         onAuth: opts.onAuth ?? (() => auth.ok({} as ClientData)),
@@ -85,6 +85,7 @@ export async function startRoom<ClientData = Record<string, unknown>>(
         onShutdown: opts.onShutdown,
         maxBufferBytes: opts.maxBufferBytes,
     });
+    await room.start();
 
     return { room: room as Room<ClientData>, wsPort: opts.port };
 }

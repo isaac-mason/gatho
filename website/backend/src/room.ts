@@ -1,4 +1,4 @@
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 import { clientCodec, serverCodec } from '../../shared/protocol';
 
 // each visitor is a live cursor. binary protocol (see ../../shared/protocol):
@@ -33,7 +33,7 @@ function allocCid(): number {
     return cid;
 }
 
-const room = await start({
+const room = create({
     onAuth: () => {
         const color = COLORS[seq % COLORS.length];
         const name = `${NAMES[seq % NAMES.length]}-${seq}`;
@@ -41,7 +41,7 @@ const room = await start({
         return auth.ok({ color, name });
     },
 
-    onJoin: (room, client) => {
+    onJoin: (client) => {
         const { color, name } = client.data as { color: string; name: string };
         const cid = allocCid();
         state.set(client.id, { cid, color, name, x: 0, y: 0, announced: false, dirty: false });
@@ -51,11 +51,11 @@ const room = await start({
         for (const s of state.values()) {
             if (s.announced) cursors.push({ cid: s.cid, color: s.color, name: s.name, x: s.x, y: s.y });
         }
-        room.send(client, serverCodec.pack({ type: 'snapshot', you: cid, color, name, cursors }));
+        client.send(serverCodec.pack({ type: 'snapshot', you: cid, color, name, cursors }));
         room.broadcast(serverCodec.pack({ type: 'presence', count: room.clients.count() }));
     },
 
-    onMessage: (room, client, message) => {
+    onMessage: (client, message) => {
         if (typeof message === 'string') return; // binary only
         const s = state.get(client.id);
         if (!s) return;
@@ -72,7 +72,7 @@ const room = await start({
         }
     },
 
-    onLeave: (room, client) => {
+    onLeave: (client) => {
         const s = state.get(client.id);
         if (s) {
             if (s.announced) room.broadcast(serverCodec.pack({ type: 'leave', cid: s.cid }));
@@ -81,6 +81,8 @@ const room = await start({
         room.broadcast(serverCodec.pack({ type: 'presence', count: room.clients.count() }));
     },
 });
+
+await room.start();
 
 // batch movement broadcasts at ~15Hz — one binary frame with just the cursors
 // that moved this tick.

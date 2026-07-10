@@ -99,15 +99,15 @@ test('network drop → onDrop fires → allowReconnection → client reconnects 
 
     const { room } = await startRoom({
         port,
-        onJoin: (_r, client) => {
+        onJoin: (client) => {
             joinClientId = client.id;
         },
-        onDrop: (r, client, code) => {
+        onDrop: (client, code) => {
             dropCode = code;
             dropClientId = client.id;
-            r.allowReconnection(client, 10_000);
+            client.allowReconnection(10_000);
         },
-        onReconnect: (_r, client) => {
+        onReconnect: (client) => {
             reconnectClientId = client.id;
         },
         onLeave: () => {
@@ -122,24 +122,25 @@ test('network drop → onDrop fires → allowReconnection → client reconnects 
 
         const wsUrl = `ws://127.0.0.1:${port}`;
         await page.evaluate((url) => {
-            const conn = (window as W).__gatho.connect(url);
-            (window as W).__conn = conn;
             (window as W).__events = {
                 drops: 0,
                 reconnects: 0,
                 closes: 0,
                 closeCode: 0,
             };
-            conn.on('drop', () => {
-                (window as W).__events.drops++;
+            const conn = (window as W).__gatho.connect(url, {
+                onDrop: () => {
+                    (window as W).__events.drops++;
+                },
+                onReconnect: () => {
+                    (window as W).__events.reconnects++;
+                },
+                onClose: ({ code }: { code: number }) => {
+                    (window as W).__events.closes++;
+                    (window as W).__events.closeCode = code;
+                },
             });
-            conn.on('reconnect', () => {
-                (window as W).__events.reconnects++;
-            });
-            conn.on('close', ({ code }: { code: number }) => {
-                (window as W).__events.closes++;
-                (window as W).__events.closeCode = code;
-            });
+            (window as W).__conn = conn;
         }, wsUrl);
 
         // wait for connection to be open
@@ -210,12 +211,12 @@ test('server reliable buffer: messages sent during drop are delivered on reconne
 
     const { room } = await startRoom({
         port,
-        onJoin: (_r, client) => {
+        onJoin: (client) => {
             joinedClient = client;
         },
-        onDrop: (r, client) => {
+        onDrop: (client) => {
             clientDropped = true;
-            r.allowReconnection(client, 10_000);
+            client.allowReconnection(10_000);
         },
     });
 
@@ -226,12 +227,13 @@ test('server reliable buffer: messages sent during drop are delivered on reconne
 
         const wsUrl = `ws://127.0.0.1:${port}`;
         await page.evaluate((url) => {
-            const conn = (window as W).__gatho.connect(url);
-            (window as W).__conn = conn;
             (window as W).__messages = [] as unknown[];
-            conn.on('message', (msg: unknown) => {
-                (window as W).__messages.push(msg);
+            const conn = (window as W).__gatho.connect(url, {
+                onMessage: (msg: unknown) => {
+                    (window as W).__messages.push(msg);
+                },
             });
+            (window as W).__conn = conn;
         }, wsUrl);
 
         await expect(async () => {
@@ -248,9 +250,9 @@ test('server reliable buffer: messages sent during drop are delivered on reconne
         }).toPass({ timeout: 5000 });
 
         // send reliable messages while client is disconnected
-        room.send(joinedClient!, JSON.stringify({ buffered: 1 }));
-        room.send(joinedClient!, JSON.stringify({ buffered: 2 }));
-        room.send(joinedClient!, JSON.stringify({ buffered: 3 }));
+        joinedClient!.send(JSON.stringify({ buffered: 1 }));
+        joinedClient!.send(JSON.stringify({ buffered: 2 }));
+        joinedClient!.send(JSON.stringify({ buffered: 3 }));
 
         // wait for client to reconnect and receive buffered messages
         await expect(async () => {
@@ -279,10 +281,10 @@ test('client reliable buffer: messages sent during reconnecting are flushed on r
 
     const { room } = await startRoom({
         port,
-        onDrop: (r, client) => {
-            r.allowReconnection(client, 10_000);
+        onDrop: (client) => {
+            client.allowReconnection(10_000);
         },
-        onMessage: (_r, _client, msg) => {
+        onMessage: (_client, msg) => {
             serverReceived.push(msg);
         },
     });
@@ -351,10 +353,10 @@ test('unreliable messages from client are dropped during reconnecting', async ({
 
     const { room } = await startRoom({
         port,
-        onDrop: (r, client) => {
-            r.allowReconnection(client, 10_000);
+        onDrop: (client) => {
+            client.allowReconnection(10_000);
         },
-        onMessage: (_r, _client, msg) => {
+        onMessage: (_client, msg) => {
             serverReceived.push(msg);
         },
     });
@@ -426,8 +428,8 @@ test('session token rotates after reconnect — old token rejected', async ({ pa
 
     const { room } = await startRoom({
         port,
-        onDrop: (r, client) => {
-            r.allowReconnection(client, 10_000);
+        onDrop: (client) => {
+            client.allowReconnection(10_000);
         },
         onReconnect: () => {
             reconnected = true;
@@ -487,10 +489,10 @@ test('reconnect window expiry — onLeave fires, client enters closed on next at
 
     const { room } = await startRoom({
         port,
-        onDrop: (r, client) => {
+        onDrop: (client) => {
             dropCount++;
             // very short window — 1 second
-            r.allowReconnection(client, 1000);
+            client.allowReconnection(1000);
         },
         onLeave: () => {
             leaveCount++;
@@ -504,13 +506,14 @@ test('reconnect window expiry — onLeave fires, client enters closed on next at
 
         const wsUrl = `ws://127.0.0.1:${port}`;
         await page.evaluate((url) => {
-            const conn = (window as W).__gatho.connect(url);
-            (window as W).__conn = conn;
             (window as W).__events = { closes: 0, closeCode: 0 };
-            conn.on('close', ({ code }: { code: number }) => {
-                (window as W).__events.closes++;
-                (window as W).__events.closeCode = code;
+            const conn = (window as W).__gatho.connect(url, {
+                onClose: ({ code }: { code: number }) => {
+                    (window as W).__events.closes++;
+                    (window as W).__events.closeCode = code;
+                },
             });
+            (window as W).__conn = conn;
         }, wsUrl);
 
         await expect(async () => {
@@ -563,12 +566,12 @@ test('server buffer overflow evicts client when maxBufferBytes exceeded', async 
         port,
         // tiny buffer limit for testing: 1kb
         maxBufferBytes: 1024,
-        onJoin: (_r, client) => {
+        onJoin: (client) => {
             joinedClient = client;
         },
-        onDrop: (r, client) => {
+        onDrop: (client) => {
             dropCount++;
-            r.allowReconnection(client, 30_000);
+            client.allowReconnection(30_000);
         },
         onLeave: () => {
             leaveCount++;
@@ -603,8 +606,8 @@ test('server buffer overflow evicts client when maxBufferBytes exceeded', async 
         // server uses Buffer.byteLength (utf8), so ASCII chars are 1 byte each.
         // JSON.stringify({ data: "x"*600 }) ≈ 614 bytes, two sends ≈ 1228 > 1024.
         const bigMsg = { data: 'x'.repeat(600) };
-        room.send(joinedClient!, JSON.stringify(bigMsg));
-        room.send(joinedClient!, JSON.stringify(bigMsg));
+        joinedClient!.send(JSON.stringify(bigMsg));
+        joinedClient!.send(JSON.stringify(bigMsg));
 
         // buffer overflow should have evicted the client
         await expect(async () => {
@@ -629,9 +632,9 @@ test('broadcast reliable buffers for disconnected clients, delivered on reconnec
 
     const { room } = await startRoom({
         port,
-        onDrop: (r, client) => {
+        onDrop: (client) => {
             clientDropped = true;
-            r.allowReconnection(client, 10_000);
+            client.allowReconnection(10_000);
         },
     });
 
@@ -642,12 +645,13 @@ test('broadcast reliable buffers for disconnected clients, delivered on reconnec
 
         const wsUrl = `ws://127.0.0.1:${port}`;
         await page.evaluate((url) => {
-            const conn = (window as W).__gatho.connect(url);
-            (window as W).__conn = conn;
             (window as W).__messages = [] as unknown[];
-            conn.on('message', (msg: unknown) => {
-                (window as W).__messages.push(msg);
+            const conn = (window as W).__gatho.connect(url, {
+                onMessage: (msg: unknown) => {
+                    (window as W).__messages.push(msg);
+                },
             });
+            (window as W).__conn = conn;
         }, wsUrl);
 
         await expect(async () => {
@@ -689,8 +693,8 @@ test('client drop and reconnect events fire correctly through state transitions'
 
     const { room } = await startRoom({
         port,
-        onDrop: (r, client) => {
-            r.allowReconnection(client, 10_000);
+        onDrop: (client) => {
+            client.allowReconnection(10_000);
         },
     });
 
@@ -701,23 +705,24 @@ test('client drop and reconnect events fire correctly through state transitions'
 
         const wsUrl = `ws://127.0.0.1:${port}`;
         await page.evaluate((url) => {
-            const conn = (window as W).__gatho.connect(url);
-            (window as W).__conn = conn;
             (window as W).__stateLog = [] as string[];
 
-            // track all state transitions
-            conn.on('open', () => {
-                (window as W).__stateLog.push('open');
+            // track all state transitions via the single-handler bag
+            const conn = (window as W).__gatho.connect(url, {
+                onOpen: () => {
+                    (window as W).__stateLog.push('open');
+                },
+                onDrop: () => {
+                    (window as W).__stateLog.push('drop');
+                },
+                onReconnect: () => {
+                    (window as W).__stateLog.push('reconnect');
+                },
+                onClose: () => {
+                    (window as W).__stateLog.push('close');
+                },
             });
-            conn.on('drop', () => {
-                (window as W).__stateLog.push('drop');
-            });
-            conn.on('reconnect', () => {
-                (window as W).__stateLog.push('reconnect');
-            });
-            conn.on('close', () => {
-                (window as W).__stateLog.push('close');
-            });
+            (window as W).__conn = conn;
         }, wsUrl);
 
         // wait for initial open

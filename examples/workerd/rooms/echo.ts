@@ -2,33 +2,38 @@
 // isolate evaluates this module fresh, so module-scope state is per-room — exactly
 // like a subprocess room.
 //
-// It exports a plain options object (this example's OWN convention, NOT a gatho
-// API): a workerd module can't call top-level `start()` because env/bindings only
-// arrive per-request, so the module exports the options and the adapter calls
-// `start(options, { transport, server })` on the first request. See README.
+// It exports a factory `(room) => options` (this example's OWN convention, NOT a
+// gatho API): a workerd module can't call top-level `create()` because env/bindings
+// only arrive per-request, so the module exports a factory and the adapter runs
+// `create(factory(room))` + `room.start()` on the first request. the two-phase room
+// api drops the `room` param from callbacks, so the factory threads the handle in.
+// See README.
 
-import { auth, type StartOptions } from 'gatho/room';
+import { auth } from 'gatho/room';
+import type { RoomModule } from '../adapter/index';
 
 type ClientData = { name: string };
 
 let messageCount = 0;
 
-export default {
-    onAuth: (_room, joinData: { name?: string }) => auth.ok({ name: joinData.name ?? 'anon' }),
+const echo: RoomModule<ClientData> = (room) => ({
+    onAuth: (joinData: { name?: string }) => auth.ok({ name: joinData.name ?? 'anon' }),
 
-    onJoin: (room, client) => {
+    onJoin: (client) => {
         room.broadcast(JSON.stringify({ type: 'join', name: client.data.name, count: room.clients.count() }));
     },
 
-    onMessage: (room, client, message) => {
+    onMessage: (client, message) => {
         if (typeof message !== 'string') return;
         messageCount++;
         // echo back to the sender AND broadcast to everyone — proves both paths.
-        room.send(client, JSON.stringify({ type: 'echo', from: client.data.name, text: message, seq: messageCount }));
+        client.send(JSON.stringify({ type: 'echo', from: client.data.name, text: message, seq: messageCount }));
         room.broadcast(JSON.stringify({ type: 'broadcast', from: client.data.name, text: message }));
     },
 
-    onLeave: (room, client) => {
+    onLeave: (client) => {
         room.broadcast(JSON.stringify({ type: 'leave', name: client.data.name, count: room.clients.count() }));
     },
-} satisfies StartOptions<ClientData>;
+});
+
+export default echo;

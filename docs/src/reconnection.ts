@@ -1,13 +1,15 @@
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 
-await start({
+const room = create({
     onAuth: () => auth.ok(),
 
-    onDrop: (room, client) => {
-        room.allowReconnection(client, 30_000); // hold seat for 30s
+    onDrop: (client) => {
+        client.allowReconnection(30_000); // hold seat for 30s
     },
 
-    onReconnect: (room, client) => {
-        room.send(client, JSON.stringify({ type: 'welcome-back' }));
+    onReconnect: (client) => {
+        client.send(JSON.stringify({ type: 'welcome-back' }));
     },
 });
+
+await room.start();

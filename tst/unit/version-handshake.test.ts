@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION, unpackFrame } from '../../src/common/protocol';
-import { auth, start } from '../../src/room/index';
+import { auth, create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -69,11 +69,12 @@ describe('protocol version handshake', () => {
 
     beforeEach(async () => {
         captured = {};
-        await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(captured),
             onAuth: () => auth.ok({}),
         });
+        await room.start();
     });
 
     function handlers(): TransportHandlers {

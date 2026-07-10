@@ -1,6 +1,6 @@
 import { connect } from 'gatho/client';
 import type { Room } from 'gatho/room';
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 import { afterEach, describe, expect, it } from 'vitest';
 
 function sleep(ms: number): Promise<void> {
@@ -9,9 +9,10 @@ function sleep(ms: number): Promise<void> {
 
 // collect messages from a connection, with a helper to wait for N messages.
 function collectMessages(url: string) {
-    const conn = connect(url);
     const messages: unknown[] = [];
-    conn.on('message', (msg) => messages.push(msg));
+    const conn = connect(url, {
+        onMessage: (msg) => messages.push(msg),
+    });
 
     async function waitFor(n: number, timeoutMs = 3000): Promise<unknown[]> {
         const t0 = Date.now();
@@ -38,10 +39,11 @@ describe('standalone room', () => {
     });
 
     it('starts with auto-generated roomId and default roomType', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         // roomId should be a uuid (auto-generated)
         expect(room.roomId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
@@ -52,12 +54,13 @@ describe('standalone room', () => {
     });
 
     it('accepts connections without jwt tokens (dev mode)', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19876,
             onAuth: () => auth.ok({}),
-            onMessage: (r, client, msg) => r.send(client, msg),
+            onMessage: (client, msg) => client.send(msg),
         });
+        await room.start();
 
         const { conn, waitFor } = collectMessages('ws://127.0.0.1:19876');
         await sleep(200);
@@ -70,12 +73,13 @@ describe('standalone room', () => {
     });
 
     it('echo round-trip — send message, receive same message back', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19877,
             onAuth: () => auth.ok({}),
-            onMessage: (r, client, msg) => r.send(client, msg),
+            onMessage: (client, msg) => client.send(msg),
         });
+        await room.start();
 
         const { conn, waitFor } = collectMessages('ws://127.0.0.1:19877');
         await sleep(200);
@@ -91,12 +95,13 @@ describe('standalone room', () => {
     });
 
     it('broadcast reaches all connected clients', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19878,
             onAuth: () => auth.ok({}),
-            onMessage: (r, _client, msg) => r.broadcast(msg),
+            onMessage: (_client, msg) => room!.broadcast(msg),
         });
+        await room.start();
 
         const c1 = collectMessages('ws://127.0.0.1:19878');
         const c2 = collectMessages('ws://127.0.0.1:19878');
@@ -119,20 +124,21 @@ describe('standalone room', () => {
         let joinedCount = 0;
         let leftCount = 0;
 
-        room = await start({
+        room = create({
             standalone: true,
             port: 19879,
             onAuth: () => auth.ok({}),
-            onJoin: (r) => {
+            onJoin: () => {
                 joinedCount++;
                 // send current client count to all
-                r.broadcast(JSON.stringify({ clients: r.clients.count() }));
+                room!.broadcast(JSON.stringify({ clients: room!.clients.count() }));
             },
-            onLeave: (r) => {
+            onLeave: () => {
                 leftCount++;
-                r.broadcast(JSON.stringify({ clients: r.clients.count() }));
+                room!.broadcast(JSON.stringify({ clients: room!.clients.count() }));
             },
         });
+        await room.start();
 
         const c1 = collectMessages('ws://127.0.0.1:19879');
         await sleep(300);
@@ -164,22 +170,22 @@ describe('standalone room', () => {
     });
 
     it('onAuth rejection closes the connection', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19880,
             onAuth: () => auth.fail('not allowed'),
         });
-
-        const conn = connect('ws://127.0.0.1:19880');
+        await room.start();
 
         let authError: unknown = null;
-        conn.on('authError', (err) => {
-            authError = err;
-        });
-
         let closed = false;
-        conn.on('close', () => {
-            closed = true;
+        connect('ws://127.0.0.1:19880', {
+            onAuthError: (err) => {
+                authError = err;
+            },
+            onClose: () => {
+                closed = true;
+            },
         });
 
         await sleep(500);
@@ -192,16 +198,22 @@ describe('standalone room', () => {
     });
 
     it('room.stop() closes all connections gracefully', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19881,
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
-        const conn = connect('ws://127.0.0.1:19881');
         let dropped = false;
-        conn.on('drop', () => {
-            dropped = true;
+        let closeCode = 0;
+        const conn = connect('ws://127.0.0.1:19881', {
+            onDrop: () => {
+                dropped = true;
+            },
+            onClose: ({ code }) => {
+                closeCode = code;
+            },
         });
         await sleep(300);
 
@@ -217,17 +229,13 @@ describe('standalone room', () => {
         expect(conn.state).toBe('reconnecting');
 
         // clean up — stop the reconnection loop
-        let closeCode = 0;
-        conn.on('close', ({ code }) => {
-            closeCode = code;
-        });
         conn.close();
         expect(closeCode).toBe(4000);
         expect(conn.state).toBe('closed');
     });
 
     it('server config fields are reflected on room handle', async () => {
-        room = await start({
+        room = create({
             server: {
                 roomId: 'custom-id',
                 roomType: 'custom-type',
@@ -236,101 +244,34 @@ describe('standalone room', () => {
             },
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         expect(room.roomId).toBe('custom-id');
         expect(room.roomType).toBe('custom-type');
         expect(room.serverId).toBe('srv-1');
     });
 
-    it('multiple listeners fire for the same event', async () => {
-        room = await start({
+    it('the single onMessage handler receives every message', async () => {
+        room = create({
             standalone: true,
             port: 19882,
             onAuth: () => auth.ok({}),
-            onMessage: (r, client, msg) => r.send(client, msg),
+            onMessage: (client, msg) => client.send(msg),
         });
+        await room.start();
 
-        const conn = connect('ws://127.0.0.1:19882');
         const a: unknown[] = [];
-        const b: unknown[] = [];
-
-        conn.on('message', (msg) => a.push(msg));
-        conn.on('message', (msg) => b.push(msg));
+        const conn = connect('ws://127.0.0.1:19882', {
+            onMessage: (msg) => a.push(msg),
+        });
 
         await sleep(200);
         conn.send(JSON.stringify({ x: 1 }));
-        await sleep(200);
-
-        // both listeners should have received the message
-        expect(a).toEqual([JSON.stringify({ x: 1 })]);
-        expect(b).toEqual([JSON.stringify({ x: 1 })]);
-
-        conn.close();
-    });
-
-    it('on() returns an unsubscribe function that removes the listener', async () => {
-        room = await start({
-            standalone: true,
-            port: 19883,
-            onAuth: () => auth.ok({}),
-            onMessage: (r, client, msg) => r.send(client, msg),
-        });
-
-        const conn = connect('ws://127.0.0.1:19883');
-        const a: unknown[] = [];
-        const b: unknown[] = [];
-
-        const unsub = conn.on('message', (msg) => a.push(msg));
-        conn.on('message', (msg) => b.push(msg));
-
-        await sleep(200);
-        conn.send(JSON.stringify({ x: 1 }));
-        await sleep(200);
-
-        // both received first message
-        expect(a).toEqual([JSON.stringify({ x: 1 })]);
-        expect(b).toEqual([JSON.stringify({ x: 1 })]);
-
-        // unsubscribe first listener
-        unsub();
-
         conn.send(JSON.stringify({ x: 2 }));
         await sleep(200);
 
-        // only b should have received the second message
-        expect(a).toEqual([JSON.stringify({ x: 1 })]);
-        expect(b).toEqual([JSON.stringify({ x: 1 }), JSON.stringify({ x: 2 })]);
-
-        conn.close();
-    });
-
-    it('off() removes a listener by reference', async () => {
-        room = await start({
-            standalone: true,
-            port: 19884,
-            onAuth: () => auth.ok({}),
-            onMessage: (r, client, msg) => r.send(client, msg),
-        });
-
-        const conn = connect('ws://127.0.0.1:19884');
-        const a: unknown[] = [];
-
-        const handler = (msg: unknown) => a.push(msg);
-        conn.on('message', handler);
-
-        await sleep(200);
-        conn.send(JSON.stringify({ x: 1 }));
-        await sleep(200);
-
-        expect(a).toEqual([JSON.stringify({ x: 1 })]);
-
-        conn.off('message', handler);
-
-        conn.send(JSON.stringify({ x: 2 }));
-        await sleep(200);
-
-        // should not have received the second message
-        expect(a).toEqual([JSON.stringify({ x: 1 })]);
+        // the single handler received both messages in order.
+        expect(a).toEqual([JSON.stringify({ x: 1 }), JSON.stringify({ x: 2 })]);
 
         conn.close();
     });

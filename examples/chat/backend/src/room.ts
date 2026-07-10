@@ -1,14 +1,14 @@
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 
 const messages: Array<{ user: string; text: string; timestamp: number }> = [];
 
-await start({
-    onAuth: (_room, joinData: { displayName?: string }) => {
+const room = create({
+    onAuth: (joinData: { displayName?: string }) => {
         const username = joinData.displayName || 'anonymous';
         return auth.ok({ username });
     },
 
-    onJoin: (room, client) => {
+    onJoin: (client) => {
         room.broadcast(
             JSON.stringify({
                 type: 'join',
@@ -18,7 +18,7 @@ await start({
         );
     },
 
-    onMessage: (room, client, message) => {
+    onMessage: (client, message) => {
         if (typeof message !== 'string') return;
         const parsed = JSON.parse(message) as { text: string };
         const msg = {
@@ -37,7 +37,7 @@ await start({
         );
     },
 
-    onLeave: (room, client) => {
+    onLeave: (client) => {
         room.broadcast(
             JSON.stringify({
                 type: 'leave',
@@ -47,3 +47,5 @@ await start({
         );
     },
 });
+
+await room.start();

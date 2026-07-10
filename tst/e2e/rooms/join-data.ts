@@ -1,9 +1,10 @@
 // join-data room — sends joinData back to the client on join
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 
-await start({
-    onAuth: (_room, joinData: Record<string, unknown>) => auth.ok({ joinData }),
-    onJoin: (room, client) => {
-        room.send(client, JSON.stringify({ type: 'join-data', data: client.data.joinData }));
+const room = create({
+    onAuth: (joinData: Record<string, unknown>) => auth.ok({ joinData }),
+    onJoin: (client) => {
+        client.send(JSON.stringify({ type: 'join-data', data: client.data.joinData }));
     },
 });
+await room.start();

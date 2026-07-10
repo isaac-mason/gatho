@@ -4,7 +4,7 @@
 // `WebSocketPair`, and wraps a room options module as an `ExportedHandler` that
 // the harness loads into a v8 isolate via the `workerLoader` binding.
 //
-// The room engine (`start` from 'gatho/room') is runtime-neutral: we hand it a
+// The room engine (`create` from 'gatho/room') is runtime-neutral: we hand it a
 // custom transport and a `Notifier` OBJECT, so it never touches node:net, ws, or
 // http.
 //
@@ -22,8 +22,18 @@
 // performs the actual I/O in the one context where that socket is valid. This
 // makes send/echo/broadcast all work within a single isolate. See README.
 
-import type { ClientSocket, Transport, TransportHandlers, TransportServer } from 'gatho/room';
-import { type NotifyMessage, type StartOptions, start } from 'gatho/room';
+import type { ClientSocket, Room, Transport, TransportHandlers, TransportServer } from 'gatho/room';
+import { create, type CreateOptions, type NotifyMessage } from 'gatho/room';
+
+// a room module's default export under this example's convention: a factory that
+// receives the room handle and returns its create() options. the two-phase room
+// api drops the `room` param from callbacks — capacity checks and messaging use
+// the closed-over handle instead. a workerd module can't call top-level create()
+// (env/bindings arrive per-request), so it exports this factory and the adapter
+// runs create() + start() on the first request, feeding the handle back in.
+export type RoomModule<ClientData = unknown> = (
+    room: Room<ClientData>,
+) => CreateOptions<ClientData, Record<string, unknown>>;
 
 // workerd globals — declared loosely to avoid a dependency on @cloudflare/workers-types.
 declare const WebSocketPair: {
@@ -83,7 +93,7 @@ class WorkerdRoom {
     private topics = new Map<string, Set<string>>(); // topic -> clientIds
     private outbox: NotifyMessage[] = []; // notify messages queued for the next flush
 
-    constructor(private def: StartOptions<unknown, Record<string, unknown>>) {}
+    constructor(private def: RoomModule) {}
 
     // --- lifecycle ---
 
@@ -116,8 +126,14 @@ class WorkerdRoom {
             },
         };
 
-        this.startPromise = start({
-            ...this.def,
+        // build the room synchronously, then bring it online. create() resolves the
+        // managed context from `server`; start() opens the transport and dials notify.
+        // the room module is a factory that closes over `room` — create() runs to
+        // completion before any callback can fire, so the binding is always set by
+        // the time a callback reads it (the same self-reference the direct api uses).
+        let room: Room<unknown>;
+        room = create({
+            ...this.def(new Proxy({} as Room<unknown>, { get: (_t, prop) => room[prop as keyof Room<unknown>] })),
             transport,
             port: 0,
             server: {
@@ -127,7 +143,8 @@ class WorkerdRoom {
                 roomSecret: env.GATHO_ROOM_SECRET,
                 serverId: env.GATHO_SERVER_ID,
             },
-        }).then(() => undefined);
+        });
+        this.startPromise = room.start();
 
         return this.startPromise;
     }
@@ -360,12 +377,13 @@ function toSendable(data: OutboundData): string | ArrayBuffer | ArrayBufferView 
  * Wrap a room options module as a workerd `ExportedHandler`. The harness loads the
  * bundled result as the room isolate's `mainModule` default export.
  *
- * `def` is the room's default export — a plain `StartOptions` object (the example's
- * own convention; see README). A workerd module can't call top-level `start()`
- * because env/bindings only arrive per-request, so the module exports options and
- * the adapter calls `start()` on the first request.
+ * `def` is the room's default export — a `RoomModule` factory `(room) => options`
+ * (the example's own convention; see README). A workerd module can't call top-level
+ * `create()` because env/bindings only arrive per-request, so the module exports the
+ * factory and the adapter calls `create()` + `room.start()` on the first request,
+ * feeding the room handle back into the factory.
  */
-export function createWorkerdRoom(def: StartOptions<unknown, Record<string, unknown>>): {
+export function createWorkerdRoom(def: RoomModule): {
     fetch(req: Request, env: RoomEnv, ctx: ExecutionContext): Promise<Response>;
 } {
     const room = new WorkerdRoom(def);

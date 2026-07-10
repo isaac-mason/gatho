@@ -1,7 +1,8 @@
 // echo room — sends every message back to the sender
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 
-await start({
+const room = create({
     onAuth: () => auth.ok({}),
-    onMessage: (room, client, message) => room.send(client, message),
+    onMessage: (client, message) => client.send(message),
 });
+await room.start();

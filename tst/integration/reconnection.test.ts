@@ -6,7 +6,7 @@
 
 import { connect } from 'gatho/client';
 import type { Client, Room } from 'gatho/room';
-import { auth, start } from 'gatho/room';
+import { auth, create } from 'gatho/room';
 import { afterEach, describe, expect, it } from 'vitest';
 
 function sleep(ms: number): Promise<void> {
@@ -38,7 +38,7 @@ describe('reconnection lifecycle', () => {
         let dropCalled = false;
         let leaveCalled = false;
 
-        room = await start({
+        room = create({
             standalone: true,
             port: 19901,
             onAuth: () => auth.ok({}),
@@ -49,14 +49,15 @@ describe('reconnection lifecycle', () => {
                 leaveCalled = true;
             },
         });
-
-        const conn = connect('ws://127.0.0.1:19901');
-        await waitUntil(() => conn.state === 'open');
+        await room.start();
 
         let closeCode = 0;
-        conn.on('close', ({ code }) => {
-            closeCode = code;
+        const conn = connect('ws://127.0.0.1:19901', {
+            onClose: ({ code }) => {
+                closeCode = code;
+            },
         });
+        await waitUntil(() => conn.state === 'open');
 
         // client.close() sends __leave + closes with 4000
         conn.close();
@@ -74,7 +75,7 @@ describe('reconnection lifecycle', () => {
     it('no onDrop defined — all disconnects are permanent (backward compat)', async () => {
         let leaveCalled = false;
 
-        room = await start({
+        room = create({
             standalone: true,
             port: 19903,
             onAuth: () => auth.ok({}),
@@ -83,6 +84,7 @@ describe('reconnection lifecycle', () => {
                 leaveCalled = true;
             },
         });
+        await room.start();
 
         const conn = connect('ws://127.0.0.1:19903');
         await waitUntil(() => conn.state === 'open');
@@ -95,27 +97,28 @@ describe('reconnection lifecycle', () => {
         expect(leaveCalled).toBe(true);
     });
 
-    it('room.disconnect(client) — server-initiated consented close, removes from tracking', async () => {
+    it('client.disconnect() — server-initiated consented close, removes from tracking', async () => {
         let dropCalled = false;
         let leaveCalled = false;
         let leaveClientId = '';
         let joinedClient: Client | null = null;
 
-        room = await start({
+        room = create({
             standalone: true,
             port: 19904,
             onAuth: () => auth.ok({}),
-            onJoin: (_r, client) => {
+            onJoin: (client) => {
                 joinedClient = client;
             },
             onDrop: () => {
                 dropCalled = true;
             },
-            onLeave: (_r, client) => {
+            onLeave: (client) => {
                 leaveCalled = true;
                 leaveClientId = client.id;
             },
         });
+        await room.start();
 
         const conn = connect('ws://127.0.0.1:19904');
         await waitUntil(() => conn.state === 'open');
@@ -124,7 +127,7 @@ describe('reconnection lifecycle', () => {
         expect(room!.clients.count()).toBe(1);
 
         // server-initiated disconnect — should skip onDrop, fire onLeave
-        room!.disconnect(joinedClient!);
+        joinedClient!.disconnect();
         await sleep(300);
 
         expect(dropCalled).toBe(false);
@@ -142,17 +145,18 @@ describe('reconnection lifecycle', () => {
         const leftIds: string[] = [];
         const joinedIds: string[] = [];
 
-        room = await start({
+        room = create({
             standalone: true,
             port: 19906,
             onAuth: () => auth.ok({}),
-            onJoin: (_r, client) => {
+            onJoin: (client) => {
                 joinedIds.push(client.id);
             },
-            onLeave: (_r, client) => {
+            onLeave: (client) => {
                 leftIds.push(client.id);
             },
         });
+        await room.start();
 
         const c1 = connect('ws://127.0.0.1:19906');
         const c2 = connect('ws://127.0.0.1:19906');
@@ -180,7 +184,7 @@ describe('reconnection lifecycle', () => {
         // so onDrop should NOT fire on room.stop() — only onLeave.
         let dropCalled = false;
 
-        room = await start({
+        room = create({
             standalone: true,
             port: 19907,
             onAuth: () => auth.ok({}),
@@ -188,6 +192,7 @@ describe('reconnection lifecycle', () => {
                 dropCalled = true;
             },
         });
+        await room.start();
 
         const conn = connect('ws://127.0.0.1:19907');
         await waitUntil(() => conn.state === 'open');
@@ -204,11 +209,12 @@ describe('reconnection lifecycle', () => {
     });
 
     it('client send during reconnecting state buffers reliable messages', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19912,
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         const conn = connect('ws://127.0.0.1:19912');
         await waitUntil(() => conn.state === 'open');
@@ -232,24 +238,25 @@ describe('reconnection lifecycle', () => {
     });
 
     it('client send buffer overflow transitions to closed', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19913,
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
-        const conn = connect('ws://127.0.0.1:19913');
+        let closeCode = 0;
+        const conn = connect('ws://127.0.0.1:19913', {
+            onClose: ({ code }) => {
+                closeCode = code;
+            },
+        });
         await waitUntil(() => conn.state === 'open');
 
         // force into reconnecting state
         await room!.stop();
         room = null;
         await waitUntil(() => conn.state === 'reconnecting');
-
-        let closeCode = 0;
-        conn.on('close', ({ code }) => {
-            closeCode = code;
-        });
 
         // send enough data to overflow the 1mb client buffer.
         // each message is JSON serialized, then byte size is string.length * 2.
@@ -268,17 +275,18 @@ describe('reconnection lifecycle', () => {
         const joinedIds: string[] = [];
         const leftIds: string[] = [];
 
-        room = await start({
+        room = create({
             standalone: true,
             port: 19915,
             onAuth: () => auth.ok({}),
-            onJoin: (_r, client) => {
+            onJoin: (client) => {
                 joinedIds.push(client.id);
             },
-            onLeave: (_r, client) => {
+            onLeave: (client) => {
                 leftIds.push(client.id);
             },
         });
+        await room.start();
 
         const c1 = connect('ws://127.0.0.1:19915');
         const c2 = connect('ws://127.0.0.1:19915');
@@ -303,11 +311,12 @@ describe('reconnection lifecycle', () => {
     });
 
     it('onAuth rejection during reconnection — client receives authError', async () => {
-        room = await start({
+        room = create({
             standalone: true,
             port: 19916,
             onAuth: () => auth.ok({}),
         });
+        await room.start();
 
         // connect with a fake session param — should be treated as reconnection attempt
         // but the session is invalid, so server sends __auth_error
@@ -327,17 +336,18 @@ describe('reconnection lifecycle', () => {
         let joinData: TestData | null = null;
         let leaveData: TestData | null = null;
 
-        room = await start<TestData>({
+        room = create<TestData>({
             standalone: true,
             port: 19917,
             onAuth: () => auth.ok({ role: 'admin' }),
-            onJoin: (_r, client) => {
+            onJoin: (client) => {
                 joinData = client.data;
             },
-            onLeave: (_r, client) => {
+            onLeave: (client) => {
                 leaveData = client.data;
             },
         });
+        await room.start();
 
         const conn = connect('ws://127.0.0.1:19917');
         await waitUntil(() => joinData !== null);

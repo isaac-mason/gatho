@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { frameUserMessage, unpackFrame } from '../../src/common/protocol';
-import { type AuthResult, auth, start } from '../../src/room/index';
+import { type AuthResult, auth, create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -123,14 +123,15 @@ describe('room auth + socket identity', () => {
 
     it('rejects a duplicate connection for a clientId that already has a live socket', async () => {
         const messages: string[] = [];
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
-            onMessage: (_r, _c, msg) => {
+            onMessage: (_c, msg) => {
                 if (typeof msg === 'string') messages.push(msg);
             },
         });
+        await room.start();
 
         // first connection authenticates and is tracked.
         const a = recordingSocket(subscribers());
@@ -155,7 +156,7 @@ describe('room auth + socket identity', () => {
         expect(a.closed).toBeNull();
         expect(a.subscribed).toBe(true);
         const client = room.clients.get('c1')!;
-        room.send(client, 'direct');
+        client.send('direct');
         expect(a.userTexts).toContain('direct');
         room.broadcast('to-all');
         expect(a.userTexts).toContain('to-all');
@@ -165,14 +166,15 @@ describe('room auth + socket identity', () => {
     });
 
     it('rejects a fresh-jwt open for a clientId in the reconnection window (socket === null)', async () => {
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
-            onDrop: (r, client) => {
-                r.allowReconnection(client, 60_000);
+            onDrop: (client) => {
+                client.allowReconnection(60_000);
             },
         });
+        await room.start();
 
         // establish, then drop (non-consented) so the seat is held with socket === null.
         const a = recordingSocket(subscribers());
@@ -195,7 +197,7 @@ describe('room auth + socket identity', () => {
 
     it('does not subscribe a client to broadcasts until onAuth resolves ok', async () => {
         let releaseAuth: (() => void) | null = null;
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () =>
@@ -203,6 +205,7 @@ describe('room auth + socket identity', () => {
                     releaseAuth = () => resolve(auth.ok({}));
                 }),
         });
+        await room.start();
 
         const rec = recordingSocket(subscribers());
         handlers().open('c1', rec.socket, {}, {});
@@ -223,7 +226,7 @@ describe('room auth + socket identity', () => {
 
     it('never subscribes a client whose onAuth fails', async () => {
         let releaseAuth: (() => void) | null = null;
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () =>
@@ -231,6 +234,7 @@ describe('room auth + socket identity', () => {
                     releaseAuth = () => resolve(auth.fail('nope'));
                 }),
         });
+        await room.start();
 
         const rec = recordingSocket(subscribers());
         handlers().open('c1', rec.socket, {}, {});
@@ -250,7 +254,7 @@ describe('room auth + socket identity', () => {
     it('does not evict a client that reconnects while onDrop awaits', async () => {
         let releaseDrop: (() => void) | null = null;
         let leaveCount = 0;
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
@@ -262,6 +266,7 @@ describe('room auth + socket identity', () => {
                 leaveCount++;
             },
         });
+        await room.start();
 
         // to reconnect we need a valid session token — capture it from the session msg.
         const a = recordingSocket(subscribers());
@@ -290,7 +295,7 @@ describe('room auth + socket identity', () => {
     it('a client evicted after onDrop (no reconnect) fires onLeave exactly once', async () => {
         let releaseDrop: (() => void) | null = null;
         let leaveCount = 0;
-        const room = await start({
+        const room = create({
             standalone: true,
             transport: stubTransport(sink),
             onAuth: () => auth.ok({}),
@@ -302,6 +307,7 @@ describe('room auth + socket identity', () => {
                 leaveCount++;
             },
         });
+        await room.start();
 
         const a = recordingSocket(subscribers());
         handlers().open('c1', a.socket, {}, {});
