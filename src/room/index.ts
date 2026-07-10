@@ -65,6 +65,9 @@ export type ClientCollection<ClientData> = {
     forEach(callback: (client: Client<ClientData>, id: string) => void): void;
     ids(): string[];
     all(): Client<ClientData>[];
+    // iterate client handles directly — `for (const c of room.clients)` — without
+    // allocating an intermediate array (unlike `all()`). yields one handle per client.
+    [Symbol.iterator](): IterableIterator<Client<ClientData>>;
 };
 
 // --- room handle ---

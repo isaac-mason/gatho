@@ -31,6 +31,7 @@ export type ClientCollection<ClientData> = {
     forEach(callback: (client: Client<ClientData>, id: string) => void): void;
     ids(): string[];
     all(): Client<ClientData>[];
+    [Symbol.iterator](): IterableIterator<Client<ClientData>>;
 };
 export type SendOptions = {
     reliable?: boolean;

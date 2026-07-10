@@ -223,6 +223,14 @@ function createClientCollection<ClientData>(clients: Map<string, TrackedClient>)
         all() {
             return Array.from(clients.values()).map((c) => createClient<ClientData>(c));
         },
+        *[Symbol.iterator](): IterableIterator<Client<ClientData>> {
+            // yield a handle per tracked client without materializing an array —
+            // cheap per-tick iteration. wrapping each into a Client handle is the
+            // only allocation, unavoidable given the tracked/handle split.
+            for (const c of clients.values()) {
+                yield createClient<ClientData>(c);
+            }
+        },
     };
 }
 
