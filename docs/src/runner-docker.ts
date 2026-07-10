@@ -9,9 +9,9 @@ const SOCKET_DIR = '/tmp/gatho-ipc';
 const dockerRunner = runner(async (ctx) => {
     const gameMode = String(ctx.data.gameMode ?? 'classic');
 
-    // establish the notify channel — a uds the room dials back on to report
-    // heartbeats and client presence. chan.env carries GATHO_NOTIFY_SOCKET /
-    // GATHO_NOTIFY_SOCKET; chan.socketDir is this room's own socket dir to bind-mount.
+    // establish the notify channel: a uds the room dials back on to report
+    // heartbeats and client presence. chan.env carries GATHO_NOTIFY_SOCKET, and
+    // chan.socketDir is this room's own socket dir to bind-mount.
     const chan = await notify.uds(ctx, { socketDir: SOCKET_DIR });
 
     const child = spawn('docker', [

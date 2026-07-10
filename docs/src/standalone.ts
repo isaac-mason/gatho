@@ -1,6 +1,6 @@
 import { auth, start } from 'gatho/room';
 
-// opt in to standalone mode — skips jwt auth and ipc.
+// opt in to standalone mode, which skips jwt auth and ipc.
 // throws if `standalone` is omitted and no GATHO_* env vars are set.
 await start({
     standalone: true,

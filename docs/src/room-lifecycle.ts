@@ -18,17 +18,17 @@ await start({
         room.broadcast(JSON.stringify({ type: 'echo', from: client.id, message }));
     },
 
-    // non-consented disconnect — call allowReconnection to hold the seat
+    // non-consented disconnect: call allowReconnection to hold the seat
     onDrop: (room, client) => {
         room.allowReconnection(client, 30_000);
     },
 
-    // client reconnected within the window — buffered messages already flushed
+    // client reconnected within the window; buffered messages already flushed
     onReconnect: (room, client) => {
         room.send(client, JSON.stringify({ type: 'welcome-back' }));
     },
 
-    // client permanently left — consented close, eviction, or window expired
+    // client permanently left: consented close, eviction, or window expired
     onLeave: (room, client) => {
         room.broadcast(JSON.stringify({ type: 'left', id: client.id }));
     },
