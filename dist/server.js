@@ -3068,11 +3068,11 @@ const SIGKILL_DELAY_MS = 5_000;
 /**
  * spawn-a-child-process room runner.
  *
- * the subprocess should call `gatho/room`'s `start()` function
- * (`import { start } from 'gatho/room'`).
+ * the subprocess should build its room with `gatho/room`'s `create()` and call
+ * `await room.start()` (`import { create } from 'gatho/room'`).
  *
  * establishes a uds notify channel, then starts the process with at least the standard
- * gatho environment variables, which `start()` picks up automatically:
+ * gatho environment variables, which `create()` picks up automatically:
  * - `GATHO_ROOM_ID`: the room's unique identifier
  * - `GATHO_ROOM_TYPE`: the room type string
  * - `GATHO_SERVER_ID`: the id of the server this room is running on

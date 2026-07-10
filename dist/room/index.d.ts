@@ -1,7 +1,7 @@
 export type { Notifier, NotifyMessage, } from '../common/notify-protocol';
 export { createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec } from '../common/notify-protocol';
-export type { ServerConfig, StartOptions } from './start';
-export { start } from './start';
+export type { CreateOptions, ServerConfig } from './start';
+export { create } from './start';
 export type { WsTransportConfig } from './transport/index';
 export { wsTransport } from './transport/index';
 export type { ClientSocket, Transport, TransportHandlers, TransportListenConfig, TransportServer, } from './transport/types';
@@ -20,9 +20,16 @@ export declare const auth: {
         error: unknown;
     };
 };
+export type SendOptions = {
+    reliable?: boolean;
+};
 export type Client<ClientData = Record<string, unknown>> = {
-    id: string;
-    data: ClientData;
+    readonly id: string;
+    readonly data: ClientData;
+    send(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
+    allowReconnection(windowMs: number): void;
+    disconnect(): void;
+    readonly bufferedAmount: number;
 };
 export type ClientCollection<ClientData> = {
     get(id: string): Client<ClientData> | undefined;
@@ -33,9 +40,6 @@ export type ClientCollection<ClientData> = {
     all(): Client<ClientData>[];
     [Symbol.iterator](): IterableIterator<Client<ClientData>>;
 };
-export type SendOptions = {
-    reliable?: boolean;
-};
 export type BroadcastOptions<ClientData = Record<string, unknown>> = {
     reliable?: boolean;
     except?: Client<ClientData> | Client<ClientData>[];
@@ -44,10 +48,8 @@ export type Room<ClientData = Record<string, unknown>> = {
     readonly roomId: string;
     readonly roomType: string;
     readonly serverId: string | undefined;
-    send(client: Client<ClientData>, message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
     broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: BroadcastOptions<ClientData>): void;
     readonly clients: ClientCollection<ClientData>;
-    allowReconnection(client: Client<ClientData>, windowMs: number): void;
-    disconnect(client: Client<ClientData>): void;
+    start(): Promise<void>;
     stop(): Promise<void>;
 };

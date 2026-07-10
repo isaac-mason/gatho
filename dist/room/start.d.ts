@@ -1,7 +1,7 @@
 import type { Notifier } from '../common/notify-protocol';
 import type { AuthResult, Client, Room } from './index';
 import type { Transport } from './transport/types';
-/** server-managed config passed to `start()`. all fields fall back to `GATHO_*` env vars.
+/** server-managed config passed to `create()`. all fields fall back to `GATHO_*` env vars.
  *  when the server spawns a room process, it sets these env vars automatically.
  *  you can also pass them explicitly for custom setups. */
 export type ServerConfig = {
@@ -23,7 +23,7 @@ export type ServerConfig = {
     /** server identity — falls back to `GATHO_SERVER_ID`. */
     serverId?: string;
 };
-/** options for starting a room via `start()`.
+/** options for building a room via `create()`.
  *
  *  two modes depending on how the room is invoked:
  *
@@ -35,16 +35,19 @@ export type ServerConfig = {
  *
  *  - **standalone mode** (opt-in via `standalone: true`) — the room runs independently
  *    with a random roomId, no ipc, and no jwt verification. accepts any connection.
- *    useful for local dev and tests. `start()` throws if no managed context is
+ *    useful for local dev and tests. `room.start()` throws if no managed context is
  *    detected and `standalone` is not explicitly set — this prevents accidentally
  *    deploying a room that silently skips auth.
+ *
+ *  callbacks do NOT receive `room` — capacity checks and messaging use the
+ *  `room` handle returned by `create()`, which is in scope in the same block.
  *
  *  generic parameters:
  *  - `ClientData` — the data shape returned by `onAuth` via `auth.ok(data)`.
  *    inferred from the return type of `onAuth`.
  *  - `JoinData` — the data shape passed to `onAuth`. matches the `data` bag
  *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in. */
-export type StartOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
+export type CreateOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
     /** server-managed config. when provided, fields override `GATHO_*` env vars.
      *  when omitted, env vars are checked instead — if `GATHO_NOTIFY_SOCKET` is
      *  set, the room connects its notify channel automatically. mutually
@@ -53,8 +56,8 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
     /** explicit opt-in to run without a managed server context. required when
      *  neither `GATHO_NOTIFY_SOCKET`/`GATHO_ROOM_SECRET` env vars are set nor
      *  `options.server.notify`/`options.server.roomSecret` are provided —
-     *  otherwise `start()` throws. when `true`, all managed config (env vars and
-     *  `options.server`) is ignored; a warning is logged if any was present. */
+     *  otherwise `room.start()` throws. when `true`, all managed config (env vars
+     *  and `options.server`) is ignored; a warning is logged if any was present. */
     standalone?: boolean;
     /** port for the ws server. `0` = os-assigned (default).
      *  in managed mode this is typically left as 0 since the server
@@ -72,32 +75,46 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
      *  if omitted, all connections are accepted with empty client data.
      *
      *  `joinData` is the arbitrary data bag from `sdk.join({ data })`, or `{}` if omitted.
-     *  `room` gives access to current room state (e.g. `room.clients.count()` for capacity checks).
+     *  capacity checks use the closed-over `room` handle (e.g. `room.clients.count()`).
      *  annotate the joinData parameter to get type inference:
      *  ```ts
-     *  onAuth: (room, joinData: { displayName?: string }) =>
+     *  onAuth: (joinData: { displayName?: string }) =>
      *    auth.ok({ username: joinData.displayName ?? 'anon' })
      *  ``` */
-    onAuth?: (room: Room<unknown>, joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
-    /** fires after a client is authenticated and added to the room. */
-    onJoin?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
+    onAuth?: (joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
+    /** fires after a client is authenticated and added to the room.
+     *  this is the room-side view of the same protocol instant as the client's
+     *  `onOpen` — both fire on receipt of the `session` message (the client is
+     *  authenticated and joined). */
+    onJoin?: (client: Client<NoInfer<ClientData>>) => void | Promise<void>;
     /** fires when a connected client sends a websocket message.
      *  text frames arrive as `string`, binary frames as `ArrayBuffer`. */
-    onMessage?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>, message: string | ArrayBuffer) => void | Promise<void>;
+    onMessage?: (client: Client<NoInfer<ClientData>>, message: string | ArrayBuffer) => void | Promise<void>;
     /** fires when a client permanently leaves the room (consented close,
      *  reconnection window expired, or eviction). */
-    onLeave?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
+    onLeave?: (client: Client<NoInfer<ClientData>>) => void | Promise<void>;
     /** fires on non-consented disconnect (close code != 4000).
-     *  call `room.allowReconnection(client, ms)` inside to hold the seat
+     *  call `client.allowReconnection(ms)` inside to hold the seat
      *  for the given duration. if you don't call it, the client is evicted
      *  immediately. if `onDrop` is not defined, all disconnects are permanent. */
-    onDrop?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>, code: number) => void | Promise<void>;
+    onDrop?: (client: Client<NoInfer<ClientData>>, code: number) => void | Promise<void>;
     /** fires when a previously-dropped client reconnects within their
      *  reconnection window. buffered reliable messages are flushed automatically
      *  before this callback runs. */
-    onReconnect?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
+    onReconnect?: (client: Client<NoInfer<ClientData>>) => void | Promise<void>;
     /** fires on SIGTERM or `room.stop()`. after this returns (or if not provided),
      *  all connections are closed and the room shuts down. */
     onShutdown?: () => void | Promise<void>;
 };
-export declare function start<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(options: StartOptions<ClientData, JoinData>): Promise<Room<ClientData>>;
+/** build a room (synchronous). resolves managed context (env vars / `options.server`),
+ *  builds the RoomState and the {@link Room} handle, and stores the lifecycle
+ *  callbacks. does NOT open the transport or dial the notify channel — call
+ *  `await room.start()` for that.
+ *
+ *  design: the two-phase split puts everything SYNCHRONOUS here (env reads, the
+ *  fail-closed standalone check, identity assignment) so `room.roomId` etc. are
+ *  readable immediately and the fail-closed throw is a plain synchronous throw.
+ *  the only ASYNC work (notify dial, transport listen, ready signal, heartbeat,
+ *  SIGTERM hook) lives in `room.start()`, whose failure mode is a rejected
+ *  promise the caller awaits. */
+export declare function create<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(options: CreateOptions<ClientData, JoinData>): Room<ClientData>;

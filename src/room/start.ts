@@ -48,6 +48,12 @@ type TrackedClient = {
     // the server can pass them to driver.connectClient. enables self-heal
     // if the driver's client record was evicted between reserve and connect.
     tags: Record<string, string>;
+    // the single stable Client handle for this client's whole lifetime. built
+    // once at open() and reused across every callback and room.clients access.
+    // `alive` flips false on eviction/shutdown so the handle's verbs become
+    // silent no-ops (the handle may outlive the tracked record in user code).
+    handle: Client<unknown>;
+    alive: boolean;
 };
 
 type BufferedMessage = {
@@ -62,11 +68,21 @@ type RoomState = {
     roomSecret: string | null;
     clients: Map<string, TrackedClient>;
     sessionTokens: Map<string, string>; // token -> clientId
+    // resolved notify source (Notifier object or uri string), dialed at start().
+    // undefined in standalone mode.
+    notifySource: Notifier | string | undefined;
     ipc: Notifier | null;
     heartbeatInterval: ReturnType<typeof setInterval> | null;
+    // false until start() opens the transport; true after. broadcast/client
+    // verbs before start() are a programming error and throw. distinct from
+    // `alive` (which flips false on stop()) so post-stop stays a silent no-op.
+    started: boolean;
     alive: boolean;
     server: TransportServer | null;
     sigtermHandler: (() => void) | null;
+    // one-shot dev insurance: a warn fires if a created room hasn't been started
+    // within ~5s. cleared by start(). unref'd so it never holds the process.
+    startWarnTimer: ReturnType<typeof setTimeout> | null;
     log: Logger;
 };
 
@@ -75,7 +91,7 @@ const BROADCAST_TOPIC = 'room';
 
 // --- start options ---
 
-/** server-managed config passed to `start()`. all fields fall back to `GATHO_*` env vars.
+/** server-managed config passed to `create()`. all fields fall back to `GATHO_*` env vars.
  *  when the server spawns a room process, it sets these env vars automatically.
  *  you can also pass them explicitly for custom setups. */
 export type ServerConfig = {
@@ -102,7 +118,7 @@ export type ServerConfig = {
     serverId?: string;
 };
 
-/** options for starting a room via `start()`.
+/** options for building a room via `create()`.
  *
  *  two modes depending on how the room is invoked:
  *
@@ -114,16 +130,19 @@ export type ServerConfig = {
  *
  *  - **standalone mode** (opt-in via `standalone: true`) — the room runs independently
  *    with a random roomId, no ipc, and no jwt verification. accepts any connection.
- *    useful for local dev and tests. `start()` throws if no managed context is
+ *    useful for local dev and tests. `room.start()` throws if no managed context is
  *    detected and `standalone` is not explicitly set — this prevents accidentally
  *    deploying a room that silently skips auth.
+ *
+ *  callbacks do NOT receive `room` — capacity checks and messaging use the
+ *  `room` handle returned by `create()`, which is in scope in the same block.
  *
  *  generic parameters:
  *  - `ClientData` — the data shape returned by `onAuth` via `auth.ok(data)`.
  *    inferred from the return type of `onAuth`.
  *  - `JoinData` — the data shape passed to `onAuth`. matches the `data` bag
  *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in. */
-export type StartOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
+export type CreateOptions<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>> = {
     /** server-managed config. when provided, fields override `GATHO_*` env vars.
      *  when omitted, env vars are checked instead — if `GATHO_NOTIFY_SOCKET` is
      *  set, the room connects its notify channel automatically. mutually
@@ -133,8 +152,8 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
     /** explicit opt-in to run without a managed server context. required when
      *  neither `GATHO_NOTIFY_SOCKET`/`GATHO_ROOM_SECRET` env vars are set nor
      *  `options.server.notify`/`options.server.roomSecret` are provided —
-     *  otherwise `start()` throws. when `true`, all managed config (env vars and
-     *  `options.server`) is ignored; a warning is logged if any was present. */
+     *  otherwise `room.start()` throws. when `true`, all managed config (env vars
+     *  and `options.server`) is ignored; a warning is logged if any was present. */
     standalone?: boolean;
 
     /** port for the ws server. `0` = os-assigned (default).
@@ -156,47 +175,99 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
      *  if omitted, all connections are accepted with empty client data.
      *
      *  `joinData` is the arbitrary data bag from `sdk.join({ data })`, or `{}` if omitted.
-     *  `room` gives access to current room state (e.g. `room.clients.count()` for capacity checks).
+     *  capacity checks use the closed-over `room` handle (e.g. `room.clients.count()`).
      *  annotate the joinData parameter to get type inference:
      *  ```ts
-     *  onAuth: (room, joinData: { displayName?: string }) =>
+     *  onAuth: (joinData: { displayName?: string }) =>
      *    auth.ok({ username: joinData.displayName ?? 'anon' })
      *  ``` */
-    onAuth?: (room: Room<unknown>, joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
+    onAuth?: (joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
 
-    /** fires after a client is authenticated and added to the room. */
-    onJoin?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
+    /** fires after a client is authenticated and added to the room.
+     *  this is the room-side view of the same protocol instant as the client's
+     *  `onOpen` — both fire on receipt of the `session` message (the client is
+     *  authenticated and joined). */
+    onJoin?: (client: Client<NoInfer<ClientData>>) => void | Promise<void>;
 
     /** fires when a connected client sends a websocket message.
      *  text frames arrive as `string`, binary frames as `ArrayBuffer`. */
-    onMessage?: (
-        room: Room<NoInfer<ClientData>>,
-        client: Client<NoInfer<ClientData>>,
-        message: string | ArrayBuffer,
-    ) => void | Promise<void>;
+    onMessage?: (client: Client<NoInfer<ClientData>>, message: string | ArrayBuffer) => void | Promise<void>;
 
     /** fires when a client permanently leaves the room (consented close,
      *  reconnection window expired, or eviction). */
-    onLeave?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
+    onLeave?: (client: Client<NoInfer<ClientData>>) => void | Promise<void>;
 
     /** fires on non-consented disconnect (close code != 4000).
-     *  call `room.allowReconnection(client, ms)` inside to hold the seat
+     *  call `client.allowReconnection(ms)` inside to hold the seat
      *  for the given duration. if you don't call it, the client is evicted
      *  immediately. if `onDrop` is not defined, all disconnects are permanent. */
-    onDrop?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>, code: number) => void | Promise<void>;
+    onDrop?: (client: Client<NoInfer<ClientData>>, code: number) => void | Promise<void>;
 
     /** fires when a previously-dropped client reconnects within their
      *  reconnection window. buffered reliable messages are flushed automatically
      *  before this callback runs. */
-    onReconnect?: (room: Room<NoInfer<ClientData>>, client: Client<NoInfer<ClientData>>) => void | Promise<void>;
+    onReconnect?: (client: Client<NoInfer<ClientData>>) => void | Promise<void>;
 
     /** fires on SIGTERM or `room.stop()`. after this returns (or if not provided),
      *  all connections are closed and the room shuts down. */
     onShutdown?: () => void | Promise<void>;
 };
 
-function createClient<ClientData>(tracked: TrackedClient): Client<ClientData> {
-    return { id: tracked.id, data: tracked.data as ClientData };
+// build the single stable Client handle for a tracked client. the handle
+// carries the per-client verbs and closes over the tracked record, so id/data
+// read live and send/allowReconnection/disconnect act on the current socket.
+// `sendReliable` is injected so the handle can buffer-with-overflow-evict
+// without this factory needing the room/onLeave context directly.
+function makeClientHandle<ClientData>(
+    state: RoomState,
+    tracked: TrackedClient,
+    verbs: {
+        bufferForClient: (tracked: TrackedClient, payload: Uint8Array) => void;
+        evict: (tracked: TrackedClient) => void;
+    },
+): Client<ClientData> {
+    return {
+        get id() {
+            return tracked.id;
+        },
+        get data() {
+            return tracked.data as ClientData;
+        },
+        send(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions) {
+            // stale-handle verbs are silent no-ops.
+            if (!tracked.alive || !state.alive) return;
+
+            const framed = frameUserMessage(message);
+            const reliable = options?.reliable !== false;
+
+            if (tracked.socket) {
+                tracked.socket.send(framed, true);
+            } else if (reliable) {
+                verbs.bufferForClient(tracked, framed);
+            }
+        },
+        allowReconnection(windowMs: number) {
+            if (!tracked.alive) return;
+            // only meaningful when the client is disconnected
+            if (tracked.socket) return;
+
+            // set up the disconnect timer — when it fires, the client is evicted
+            tracked.disconnectTimer = setTimeout(() => {
+                tracked.disconnectTimer = null;
+                verbs.evict(tracked);
+            }, windowMs);
+        },
+        disconnect() {
+            if (!tracked.alive) return;
+            // server-initiated consented close — skip onDrop, straight to eviction
+            verbs.evict(tracked);
+        },
+        get bufferedAmount() {
+            // live socket buffer depth, 0 when disconnected/unobservable.
+            if (!tracked.alive) return 0;
+            return tracked.socket ? tracked.socket.bufferedAmount() : 0;
+        },
+    };
 }
 
 function createClientCollection<ClientData>(clients: Map<string, TrackedClient>): ClientCollection<ClientData> {
@@ -204,7 +275,7 @@ function createClientCollection<ClientData>(clients: Map<string, TrackedClient>)
         get(id: string) {
             const c = clients.get(id);
             if (!c) return undefined;
-            return createClient<ClientData>(c);
+            return c.handle as Client<ClientData>;
         },
         has(id: string) {
             return clients.has(id);
@@ -214,21 +285,19 @@ function createClientCollection<ClientData>(clients: Map<string, TrackedClient>)
         },
         forEach(callback) {
             for (const [id, c] of clients) {
-                callback(createClient<ClientData>(c), id);
+                callback(c.handle as Client<ClientData>, id);
             }
         },
         ids() {
             return Array.from(clients.keys());
         },
         all() {
-            return Array.from(clients.values()).map((c) => createClient<ClientData>(c));
+            return Array.from(clients.values()).map((c) => c.handle as Client<ClientData>);
         },
         *[Symbol.iterator](): IterableIterator<Client<ClientData>> {
-            // yield a handle per tracked client without materializing an array —
-            // cheap per-tick iteration. wrapping each into a Client handle is the
-            // only allocation, unavoidable given the tracked/handle split.
+            // yield each client's stable handle — no allocation per step.
             for (const c of clients.values()) {
-                yield createClient<ClientData>(c);
+                yield c.handle as Client<ClientData>;
             }
         },
     };
@@ -240,12 +309,17 @@ const DEFAULT_MAX_BUFFER_BYTES = 1_048_576;
 // permanently remove a client — cancel timers, invalidate session token,
 // fire onLeave, notify driver. used on reconnect window expiry, buffer overflow,
 // consented close, and disconnect without allowReconnection.
-function evictClient<ClientData>(
+function evictClient(
     state: RoomState,
     tracked: TrackedClient,
-    room: Room<ClientData>,
-    onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>,
+    onLeave?: (client: Client<unknown>) => void | Promise<void>,
 ): void {
+    // idempotency: eviction can be triggered from multiple paths (timer, buffer
+    // overflow, disconnect). mark dead once and bail on repeats so onLeave fires
+    // exactly once and the handle's verbs become no-ops immediately.
+    if (!tracked.alive) return;
+    tracked.alive = false;
+
     if (tracked.disconnectTimer) {
         clearTimeout(tracked.disconnectTimer);
         tracked.disconnectTimer = null;
@@ -264,24 +338,43 @@ function evictClient<ClientData>(
     // remove from clients map
     state.clients.delete(tracked.id);
 
-    // fire onLeave
+    // fire onLeave with the client's stable handle
     if (onLeave) {
-        safeCall(state.log, 'onLeave', () => onLeave(room, createClient<ClientData>(tracked)));
+        safeCall(state.log, 'onLeave', () => onLeave(tracked.handle));
     }
 
     // notify driver
     state.ipc?.send({ type: 'client-disconnected', clientId: tracked.id });
 }
 
-function createRoom<ClientData>(
+// callbacks (room param dropped — capacity checks/messaging use the closed-over
+// room handle). onLeave/onShutdown are read by createRoom, the rest by the
+// transport handlers.
+type RoomCallbacks<ClientData, JoinData extends Record<string, unknown>> = {
+    onAuth?: (joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
+    onJoin?: (client: Client<ClientData>) => void | Promise<void>;
+    onMessage?: (client: Client<ClientData>, message: string | ArrayBuffer) => void | Promise<void>;
+    onLeave?: (client: Client<ClientData>) => void | Promise<void>;
+    onDrop?: (client: Client<ClientData>, code: number) => void | Promise<void>;
+    onReconnect?: (client: Client<ClientData>) => void | Promise<void>;
+    onShutdown?: () => void | Promise<void>;
+};
+
+// per-room verbs context shared between the client handle factory and the
+// transport handlers: buffering + eviction closing over onLeave.
+type RoomVerbs = {
+    bufferForClient: (tracked: TrackedClient, payload: Uint8Array) => void;
+    evict: (tracked: TrackedClient) => void;
+};
+
+function createRoom<ClientData, JoinData extends Record<string, unknown>>(
     state: RoomState,
     maxBufferBytes: number,
-    callbacks: {
-        onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
-        onShutdown?: () => void | Promise<void>;
-    },
+    transport: Transport,
+    port: number | undefined,
+    callbacks: RoomCallbacks<ClientData, JoinData>,
 ): Room<ClientData> {
-    let room: Room<ClientData>;
+    const onLeave = callbacks.onLeave as ((client: Client<unknown>) => void | Promise<void>) | undefined;
 
     // buffer a reliable message for a disconnected client.
     // if byte cap exceeded, evict the client.
@@ -290,11 +383,16 @@ function createRoom<ClientData>(
         tracked.reliableBuffer.push({ payload, byteSize });
         tracked.reliableBufferBytes += byteSize;
         if (tracked.reliableBufferBytes > maxBufferBytes) {
-            evictClient(state, tracked, room, callbacks.onLeave);
+            evictClient(state, tracked, onLeave);
         }
     }
 
-    room = {
+    const verbs: RoomVerbs = {
+        bufferForClient,
+        evict: (tracked) => evictClient(state, tracked, onLeave),
+    };
+
+    const room: Room<ClientData> = {
         get roomId() {
             return state.roomId;
         },
@@ -304,21 +402,13 @@ function createRoom<ClientData>(
         get serverId() {
             return state.serverId;
         },
-        send(client: Client<ClientData>, message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions) {
-            if (!state.alive) return;
-            const tracked = state.clients.get(client.id);
-            if (!tracked) return;
-
-            const framed = frameUserMessage(message);
-            const reliable = options?.reliable !== false;
-
-            if (tracked.socket) {
-                tracked.socket.send(framed, true);
-            } else if (reliable) {
-                bufferForClient(tracked, framed);
-            }
-        },
         broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: BroadcastOptions<ClientData>) {
+            // pre-start broadcast is always a programming error — the transport
+            // isn't listening and no clients exist yet.
+            if (!state.started) {
+                throw new Error('gatho/room: room has not been started — call await room.start() before broadcasting');
+            }
+            // post-stop is a silent no-op.
             if (!state.alive) return;
             if (!state.server) return;
 
@@ -363,27 +453,11 @@ function createRoom<ClientData>(
         get clients() {
             return createClientCollection<ClientData>(state.clients);
         },
-        allowReconnection(client: Client<ClientData>, windowMs: number) {
-            const tracked = state.clients.get(client.id);
-            if (!tracked) return;
-            // only meaningful when the client is disconnected
-            if (tracked.socket) return;
-
-            // set up the disconnect timer — when it fires, the client is evicted
-            tracked.disconnectTimer = setTimeout(() => {
-                tracked.disconnectTimer = null;
-                evictClient(state, tracked, room, callbacks.onLeave);
-            }, windowMs);
-        },
-        disconnect(client: Client<ClientData>) {
-            const tracked = state.clients.get(client.id);
-            if (!tracked) return;
-
-            // server-initiated consented close — skip onDrop, straight to eviction
-            evictClient(state, tracked, room, callbacks.onLeave);
+        start() {
+            return startRoom<ClientData, JoinData>(state, transport, port, verbs, callbacks);
         },
         stop() {
-            return stopRoom(state, true, room, callbacks.onShutdown, callbacks.onLeave);
+            return stopRoom(state, true, callbacks.onShutdown, onLeave);
         },
     };
 
@@ -440,29 +514,44 @@ function startHeartbeat(state: RoomState): void {
     }, HEARTBEAT_INTERVAL_MS);
 }
 
-// --- ws server ---
+// --- ws server / start ---
 
-function startRoom<ClientData, JoinData extends Record<string, unknown>>(
+// bring the room online. this is the async half of the two-phase api,
+// exposed as `room.start()`: dial the notify channel (managed mode), open the
+// transport, signal ready, start heartbeats, install the SIGTERM hook.
+// idempotency-guarded — a second call throws.
+async function startRoom<ClientData, JoinData extends Record<string, unknown>>(
     state: RoomState,
     transport: Transport,
-    options: {
-        port?: number;
-        maxBufferBytes: number;
-        onAuth?: (room: Room<unknown>, joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
-        onJoin?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
-        onMessage?: (room: Room<ClientData>, client: Client<ClientData>, message: string | ArrayBuffer) => void | Promise<void>;
-        onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
-        onDrop?: (room: Room<ClientData>, client: Client<ClientData>, code: number) => void | Promise<void>;
-        onReconnect?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
-        onShutdown?: () => void | Promise<void>;
-    },
-): Promise<{ port: number; room: Room<ClientData> }> {
-    // the room handle is created once and shared — same object passed to callbacks
-    // and returned from start()
-    const room = createRoom<ClientData>(state, options.maxBufferBytes, {
-        onLeave: options.onLeave,
-        onShutdown: options.onShutdown,
-    });
+    port: number | undefined,
+    verbs: RoomVerbs,
+    callbacks: RoomCallbacks<ClientData, JoinData>,
+): Promise<void> {
+    if (state.started) {
+        throw new Error('gatho/room: room.start() has already been called');
+    }
+    state.started = true;
+
+    // stop the "created but not started" warn — we made it.
+    if (state.startWarnTimer) {
+        clearTimeout(state.startWarnTimer);
+        state.startWarnTimer = null;
+    }
+
+    // set up the notify link (managed mode). a Notifier object is used as-is
+    // (in-process hosting); a uri string is dialed over uds/tcp — node:net is
+    // loaded lazily inside the dialer, so non-node bundles that always pass a
+    // Notifier object never execute a node import.
+    const notifySource = state.notifySource;
+    let ipc: Notifier | null = null;
+    if (typeof notifySource === 'string') {
+        ipc = await connectNotify(parseNotifyTarget(notifySource));
+    } else if (notifySource) {
+        ipc = notifySource;
+    }
+    state.ipc = ipc;
+
+    const options = callbacks;
 
     const handlers: TransportHandlers = {
         async upgrade(query: string) {
@@ -564,7 +653,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 let result: AuthResult<ClientData>;
                 try {
                     result = await Promise.resolve(
-                        options.onAuth ? options.onAuth(room, joinData as JoinData) : { ok: true, data: {} as ClientData },
+                        options.onAuth ? options.onAuth(joinData as JoinData) : { ok: true, data: {} as ClientData },
                     );
                 } catch (err) {
                     // onAuth threw — bug in user code
@@ -584,7 +673,8 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 const sessionToken = randomHex(16);
                 state.sessionTokens.set(sessionToken, clientId);
 
-                // track client
+                // track client, building its single stable handle now — reused
+                // across every callback and room.clients access for its lifetime.
                 const tracked: TrackedClient = {
                     id: clientId,
                     data: result.data,
@@ -594,7 +684,10 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                     reliableBufferBytes: 0,
                     disconnectTimer: null,
                     tags,
+                    handle: undefined as unknown as Client<unknown>,
+                    alive: true,
                 };
+                tracked.handle = makeClientHandle<unknown>(state, tracked, verbs);
                 state.clients.set(clientId, tracked);
 
                 // subscribe to broadcasts only now that auth has passed — a
@@ -611,9 +704,9 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 // record was evicted between reserveClient and now.
                 state.ipc?.send({ type: 'client-connected', clientId, roomId: state.roomId, tags });
 
-                // run onJoin
+                // run onJoin with the client's stable handle
                 if (options.onJoin) {
-                    await Promise.resolve(options.onJoin(room, createClient<ClientData>(tracked)));
+                    await Promise.resolve(options.onJoin(tracked.handle as Client<ClientData>));
                 }
             })().catch((err) => {
                 state.log.error('onJoin threw unexpectedly', { clientId, err });
@@ -636,11 +729,11 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             if (options.onMessage) {
                 if (frame.frame === 'user_text') {
                     safeCall(state.log, 'onMessage', () =>
-                        options.onMessage!(room, createClient<ClientData>(tracked), frame.text),
+                        options.onMessage!(tracked.handle as Client<ClientData>, frame.text),
                     );
                 } else {
                     safeCall(state.log, 'onMessage', () =>
-                        options.onMessage!(room, createClient<ClientData>(tracked), frame.data),
+                        options.onMessage!(tracked.handle as Client<ClientData>, frame.data),
                     );
                 }
             }
@@ -693,7 +786,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
 
             // fire onReconnect
             if (options.onReconnect) {
-                safeCall(state.log, 'onReconnect', () => options.onReconnect!(room, createClient<ClientData>(tracked)));
+                safeCall(state.log, 'onReconnect', () => options.onReconnect!(tracked.handle as Client<ClientData>));
             }
 
             // notify driver: client is connected again. forward roomId + the
@@ -705,9 +798,11 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             const tracked = state.clients.get(clientId);
             if (!tracked) return;
 
+            const onLeave = options.onLeave as ((client: Client<unknown>) => void | Promise<void>) | undefined;
+
             // consented close (4000) or no onDrop defined — permanent leave
             if (code === 4000 || !options.onDrop) {
-                evictClient(state, tracked, room, options.onLeave);
+                evictClient(state, tracked, onLeave);
                 return;
             }
 
@@ -716,8 +811,8 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
 
             const onDrop = options.onDrop;
             (async () => {
-                // fire onDrop — room code may call allowReconnection inside
-                await Promise.resolve(onDrop(room, createClient<ClientData>(tracked), code));
+                // fire onDrop — room code may call client.allowReconnection inside
+                await Promise.resolve(onDrop(tracked.handle as Client<ClientData>, code));
 
                 // if allowReconnection was NOT called (no timer set), evict immediately.
                 // guard against a client that reconnected while onDrop awaited: require
@@ -727,7 +822,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 //    already no-ops post-reconnect, so this branch is the guaranteed
                 //    outcome of the race without the socket check.
                 if (!tracked.disconnectTimer && tracked.socket === null && state.clients.has(tracked.id)) {
-                    evictClient(state, tracked, room, options.onLeave);
+                    evictClient(state, tracked, onLeave);
                 }
             })().catch((err) => {
                 state.log.error('onDrop threw unexpectedly', { clientId, err });
@@ -735,22 +830,48 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
         },
     };
 
-    return transport.listen(handlers, { port: options.port }).then((server) => {
-        state.server = server;
-        return { port: server.port, room };
-    });
+    const server = await transport.listen(handlers, { port });
+    state.server = server;
+
+    // managed mode: start heartbeats and signal ready to the parent server.
+    if (ipc) {
+        startHeartbeat(state);
+        ipc.send({ type: 'ready', port: server.port });
+    }
+
+    // signal handling belongs to whoever owns the process — install only where
+    // there is one (node/bun/deno; workerd isolates have no signals).
+    if (typeof process !== 'undefined' && typeof process.on === 'function') {
+        const sigtermHandler = () => {
+            stopRoom(
+                state,
+                false,
+                callbacks.onShutdown,
+                callbacks.onLeave as ((client: Client<unknown>) => void | Promise<void>) | undefined,
+            ).catch((err) => {
+                state.log.error('error during shutdown', { err });
+            });
+        };
+        state.sigtermHandler = sigtermHandler;
+        process.on('SIGTERM', sigtermHandler);
+    }
 }
 
-async function stopRoom<ClientData>(
+async function stopRoom(
     state: RoomState,
     selfInitiated: boolean,
-    room: Room<ClientData> | null,
     onShutdown?: () => void | Promise<void>,
-    onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>,
+    onLeave?: (client: Client<unknown>) => void | Promise<void>,
 ): Promise<void> {
     if (!state.alive) return;
 
     state.alive = false;
+
+    // clear the created-but-not-started warn if stop() somehow runs before start().
+    if (state.startWarnTimer) {
+        clearTimeout(state.startWarnTimer);
+        state.startWarnTimer = null;
+    }
 
     // remove SIGTERM handler to prevent listener leak
     if (state.sigtermHandler) {
@@ -776,6 +897,9 @@ async function stopRoom<ClientData>(
 
     // fire onLeave for each client and clean up
     for (const tracked of trackedClients) {
+        // mark the handle dead so any verbs called from onLeave are no-ops.
+        tracked.alive = false;
+
         // cancel any pending disconnect timer
         if (tracked.disconnectTimer) {
             clearTimeout(tracked.disconnectTimer);
@@ -786,9 +910,9 @@ async function stopRoom<ClientData>(
         tracked.reliableBuffer.length = 0;
         tracked.reliableBufferBytes = 0;
 
-        // fire onLeave
-        if (onLeave && room) {
-            safeCall(state.log, 'onLeave', () => onLeave(room, createClient<ClientData>(tracked)));
+        // fire onLeave with the client's stable handle
+        if (onLeave) {
+            safeCall(state.log, 'onLeave', () => onLeave(tracked.handle));
         }
 
         // notify driver
@@ -821,15 +945,30 @@ const MANAGED_ENV_KEYS = [
     'GATHO_SERVER_ID',
 ] as const;
 
-export async function start<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(
-    options: StartOptions<ClientData, JoinData>,
-): Promise<Room<ClientData>> {
-    // --- resolve managed context ---
+// warn if a created room hasn't been started within this window — standalone
+// dev insurance. managed mode's server-side startup timeout already covers the
+// forgot-to-start case there.
+const START_WARN_MS = 5000;
+
+/** build a room (synchronous). resolves managed context (env vars / `options.server`),
+ *  builds the RoomState and the {@link Room} handle, and stores the lifecycle
+ *  callbacks. does NOT open the transport or dial the notify channel — call
+ *  `await room.start()` for that.
+ *
+ *  design: the two-phase split puts everything SYNCHRONOUS here (env reads, the
+ *  fail-closed standalone check, identity assignment) so `room.roomId` etc. are
+ *  readable immediately and the fail-closed throw is a plain synchronous throw.
+ *  the only ASYNC work (notify dial, transport listen, ready signal, heartbeat,
+ *  SIGTERM hook) lives in `room.start()`, whose failure mode is a rejected
+ *  promise the caller awaits. */
+export function create<ClientData, JoinData extends Record<string, unknown> = Record<string, unknown>>(
+    options: CreateOptions<ClientData, JoinData>,
+): Room<ClientData> {
+    // --- resolve managed context (synchronous) ---
 
     const presentEnvKeys = MANAGED_ENV_KEYS.filter((k) => readEnv(k) !== undefined);
     const hasServerOption = options.server !== undefined;
 
-    let server: ServerConfig | undefined;
     let roomId: string;
     let roomType: string;
     let notifySource: Notifier | string | undefined;
@@ -847,14 +986,13 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
                 .join(' and ');
             createLogger().warn(`gatho/room: standalone: true is set, ignoring managed context from ${bits}`);
         }
-        server = undefined;
         roomId = crypto.randomUUID();
         roomType = 'room';
         notifySource = undefined;
         roomSecret = null;
         serverId = undefined;
     } else {
-        server = options.server;
+        const server = options.server;
         roomId = server?.roomId ?? readEnv('GATHO_ROOM_ID') ?? crypto.randomUUID();
         roomType = server?.roomType ?? readEnv('GATHO_ROOM_TYPE') ?? 'room';
         roomSecret = server?.roomSecret ?? readEnv('GATHO_ROOM_SECRET') ?? null;
@@ -868,24 +1006,12 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
         // this prevents accidentally running a room with no auth in production.
         if (!notifySource && !roomSecret) {
             throw new Error(
-                'gatho/room start(): no managed server context detected ' +
+                'gatho/room create(): no managed server context detected ' +
                     '(no GATHO_NOTIFY_SOCKET / GATHO_ROOM_SECRET env vars, and no options.server.notify / roomSecret). ' +
                     'If running this room directly for local dev or tests, pass `standalone: true`. ' +
                     'Otherwise ensure the gatho server spawned this process so GATHO_* env vars are set.',
             );
         }
-    }
-
-    // set up the notify link (managed mode). a Notifier object is used as-is
-    // (in-process hosting); a uri string is dialed over uds/tcp — node:net is
-    // loaded lazily inside the dialer, so non-node bundles that always pass a
-    // Notifier object never execute a node import.
-    let ipc: Notifier | null = null;
-
-    if (typeof notifySource === 'string') {
-        ipc = await connectNotify(parseNotifyTarget(notifySource));
-    } else if (notifySource) {
-        ipc = notifySource;
     }
 
     const log = createLogger().child({ roomId, roomType });
@@ -897,44 +1023,45 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
         roomSecret,
         clients: new Map(),
         sessionTokens: new Map(),
-        ipc,
+        notifySource,
+        ipc: null,
         heartbeatInterval: null,
+        started: false,
         alive: true,
         server: null,
         sigtermHandler: null,
+        startWarnTimer: null,
         log,
     };
 
     const transport = options.transport ?? wsTransport();
 
-    const { port, room } = await startRoom<ClientData, JoinData>(state, transport, {
-        port: options.port,
-        maxBufferBytes: options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES,
-        onAuth: options.onAuth,
-        onJoin: options.onJoin,
-        onMessage: options.onMessage,
-        onLeave: options.onLeave,
-        onDrop: options.onDrop,
-        onReconnect: options.onReconnect,
-        onShutdown: options.onShutdown,
-    });
+    const room = createRoom<ClientData, JoinData>(
+        state,
+        options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES,
+        transport,
+        options.port,
+        {
+            onAuth: options.onAuth,
+            onJoin: options.onJoin,
+            onMessage: options.onMessage,
+            onLeave: options.onLeave,
+            onDrop: options.onDrop,
+            onReconnect: options.onReconnect,
+            onShutdown: options.onShutdown,
+        },
+    );
 
-    if (ipc) {
-        startHeartbeat(state);
-        ipc.send({ type: 'ready', port });
-    }
-
-    // signal handling belongs to whoever owns the process — install only where
-    // there is one (node/bun/deno; workerd isolates have no signals).
-    if (typeof process !== 'undefined' && typeof process.on === 'function') {
-        const sigtermHandler = () => {
-            stopRoom(state, false, room, options.onShutdown, options.onLeave).catch((err) => {
-                state.log.error('error during shutdown', { err });
-            });
-        };
-        state.sigtermHandler = sigtermHandler;
-        process.on('SIGTERM', sigtermHandler);
-    }
+    // dev insurance: warn if start() is never called. cleared by start()/stop().
+    // unref'd so it never keeps the process alive on its own.
+    const warnTimer = setTimeout(() => {
+        state.startWarnTimer = null;
+        if (!state.started) {
+            log.warn('gatho/room: room created but start() not called within 5s — did you forget `await room.start()`?');
+        }
+    }, START_WARN_MS);
+    if (typeof warnTimer.unref === 'function') warnTimer.unref();
+    state.startWarnTimer = warnTimer;
 
     return room;
 }

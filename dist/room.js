@@ -2474,8 +2474,57 @@ function safeCall(log, label, fn) {
 }
 // topic used for pub/sub broadcast
 const BROADCAST_TOPIC = 'room';
-function createClient(tracked) {
-    return { id: tracked.id, data: tracked.data };
+// build the single stable Client handle for a tracked client. the handle
+// carries the per-client verbs and closes over the tracked record, so id/data
+// read live and send/allowReconnection/disconnect act on the current socket.
+// `sendReliable` is injected so the handle can buffer-with-overflow-evict
+// without this factory needing the room/onLeave context directly.
+function makeClientHandle(state, tracked, verbs) {
+    return {
+        get id() {
+            return tracked.id;
+        },
+        get data() {
+            return tracked.data;
+        },
+        send(message, options) {
+            // stale-handle verbs are silent no-ops.
+            if (!tracked.alive || !state.alive)
+                return;
+            const framed = frameUserMessage(message);
+            const reliable = options?.reliable !== false;
+            if (tracked.socket) {
+                tracked.socket.send(framed, true);
+            }
+            else if (reliable) {
+                verbs.bufferForClient(tracked, framed);
+            }
+        },
+        allowReconnection(windowMs) {
+            if (!tracked.alive)
+                return;
+            // only meaningful when the client is disconnected
+            if (tracked.socket)
+                return;
+            // set up the disconnect timer — when it fires, the client is evicted
+            tracked.disconnectTimer = setTimeout(() => {
+                tracked.disconnectTimer = null;
+                verbs.evict(tracked);
+            }, windowMs);
+        },
+        disconnect() {
+            if (!tracked.alive)
+                return;
+            // server-initiated consented close — skip onDrop, straight to eviction
+            verbs.evict(tracked);
+        },
+        get bufferedAmount() {
+            // live socket buffer depth, 0 when disconnected/unobservable.
+            if (!tracked.alive)
+                return 0;
+            return tracked.socket ? tracked.socket.bufferedAmount() : 0;
+        },
+    };
 }
 function createClientCollection(clients) {
     return {
@@ -2483,7 +2532,7 @@ function createClientCollection(clients) {
             const c = clients.get(id);
             if (!c)
                 return undefined;
-            return createClient(c);
+            return c.handle;
         },
         has(id) {
             return clients.has(id);
@@ -2493,21 +2542,19 @@ function createClientCollection(clients) {
         },
         forEach(callback) {
             for (const [id, c] of clients) {
-                callback(createClient(c), id);
+                callback(c.handle, id);
             }
         },
         ids() {
             return Array.from(clients.keys());
         },
         all() {
-            return Array.from(clients.values()).map((c) => createClient(c));
+            return Array.from(clients.values()).map((c) => c.handle);
         },
         *[Symbol.iterator]() {
-            // yield a handle per tracked client without materializing an array —
-            // cheap per-tick iteration. wrapping each into a Client handle is the
-            // only allocation, unavoidable given the tracked/handle split.
+            // yield each client's stable handle — no allocation per step.
             for (const c of clients.values()) {
-                yield createClient(c);
+                yield c.handle;
             }
         },
     };
@@ -2517,7 +2564,13 @@ const DEFAULT_MAX_BUFFER_BYTES = 1_048_576;
 // permanently remove a client — cancel timers, invalidate session token,
 // fire onLeave, notify driver. used on reconnect window expiry, buffer overflow,
 // consented close, and disconnect without allowReconnection.
-function evictClient(state, tracked, room, onLeave) {
+function evictClient(state, tracked, onLeave) {
+    // idempotency: eviction can be triggered from multiple paths (timer, buffer
+    // overflow, disconnect). mark dead once and bail on repeats so onLeave fires
+    // exactly once and the handle's verbs become no-ops immediately.
+    if (!tracked.alive)
+        return;
+    tracked.alive = false;
     if (tracked.disconnectTimer) {
         clearTimeout(tracked.disconnectTimer);
         tracked.disconnectTimer = null;
@@ -2531,15 +2584,15 @@ function evictClient(state, tracked, room, onLeave) {
     tracked.socket?.close(4000, 'evicted');
     // remove from clients map
     state.clients.delete(tracked.id);
-    // fire onLeave
+    // fire onLeave with the client's stable handle
     if (onLeave) {
-        safeCall(state.log, 'onLeave', () => onLeave(room, createClient(tracked)));
+        safeCall(state.log, 'onLeave', () => onLeave(tracked.handle));
     }
     // notify driver
     state.ipc?.send({ type: 'client-disconnected', clientId: tracked.id });
 }
-function createRoom(state, maxBufferBytes, callbacks) {
-    let room;
+function createRoom(state, maxBufferBytes, transport, port, callbacks) {
+    const onLeave = callbacks.onLeave;
     // buffer a reliable message for a disconnected client.
     // if byte cap exceeded, evict the client.
     function bufferForClient(tracked, payload) {
@@ -2547,10 +2600,14 @@ function createRoom(state, maxBufferBytes, callbacks) {
         tracked.reliableBuffer.push({ payload, byteSize });
         tracked.reliableBufferBytes += byteSize;
         if (tracked.reliableBufferBytes > maxBufferBytes) {
-            evictClient(state, tracked, room, callbacks.onLeave);
+            evictClient(state, tracked, onLeave);
         }
     }
-    room = {
+    const verbs = {
+        bufferForClient,
+        evict: (tracked) => evictClient(state, tracked, onLeave),
+    };
+    const room = {
         get roomId() {
             return state.roomId;
         },
@@ -2560,22 +2617,13 @@ function createRoom(state, maxBufferBytes, callbacks) {
         get serverId() {
             return state.serverId;
         },
-        send(client, message, options) {
-            if (!state.alive)
-                return;
-            const tracked = state.clients.get(client.id);
-            if (!tracked)
-                return;
-            const framed = frameUserMessage(message);
-            const reliable = options?.reliable !== false;
-            if (tracked.socket) {
-                tracked.socket.send(framed, true);
-            }
-            else if (reliable) {
-                bufferForClient(tracked, framed);
-            }
-        },
         broadcast(message, options) {
+            // pre-start broadcast is always a programming error — the transport
+            // isn't listening and no clients exist yet.
+            if (!state.started) {
+                throw new Error('gatho/room: room has not been started — call await room.start() before broadcasting');
+            }
+            // post-stop is a silent no-op.
             if (!state.alive)
                 return;
             if (!state.server)
@@ -2622,28 +2670,11 @@ function createRoom(state, maxBufferBytes, callbacks) {
         get clients() {
             return createClientCollection(state.clients);
         },
-        allowReconnection(client, windowMs) {
-            const tracked = state.clients.get(client.id);
-            if (!tracked)
-                return;
-            // only meaningful when the client is disconnected
-            if (tracked.socket)
-                return;
-            // set up the disconnect timer — when it fires, the client is evicted
-            tracked.disconnectTimer = setTimeout(() => {
-                tracked.disconnectTimer = null;
-                evictClient(state, tracked, room, callbacks.onLeave);
-            }, windowMs);
-        },
-        disconnect(client) {
-            const tracked = state.clients.get(client.id);
-            if (!tracked)
-                return;
-            // server-initiated consented close — skip onDrop, straight to eviction
-            evictClient(state, tracked, room, callbacks.onLeave);
+        start() {
+            return startRoom(state, transport, port, verbs, callbacks);
         },
         stop() {
-            return stopRoom(state, true, room, callbacks.onShutdown, callbacks.onLeave);
+            return stopRoom(state, true, callbacks.onShutdown, onLeave);
         },
     };
     return room;
@@ -2692,14 +2723,35 @@ function startHeartbeat(state) {
         });
     }, HEARTBEAT_INTERVAL_MS);
 }
-// --- ws server ---
-function startRoom(state, transport, options) {
-    // the room handle is created once and shared — same object passed to callbacks
-    // and returned from start()
-    const room = createRoom(state, options.maxBufferBytes, {
-        onLeave: options.onLeave,
-        onShutdown: options.onShutdown,
-    });
+// --- ws server / start ---
+// bring the room online. this is the async half of the two-phase api,
+// exposed as `room.start()`: dial the notify channel (managed mode), open the
+// transport, signal ready, start heartbeats, install the SIGTERM hook.
+// idempotency-guarded — a second call throws.
+async function startRoom(state, transport, port, verbs, callbacks) {
+    if (state.started) {
+        throw new Error('gatho/room: room.start() has already been called');
+    }
+    state.started = true;
+    // stop the "created but not started" warn — we made it.
+    if (state.startWarnTimer) {
+        clearTimeout(state.startWarnTimer);
+        state.startWarnTimer = null;
+    }
+    // set up the notify link (managed mode). a Notifier object is used as-is
+    // (in-process hosting); a uri string is dialed over uds/tcp — node:net is
+    // loaded lazily inside the dialer, so non-node bundles that always pass a
+    // Notifier object never execute a node import.
+    const notifySource = state.notifySource;
+    let ipc = null;
+    if (typeof notifySource === 'string') {
+        ipc = await connectNotify(parseNotifyTarget(notifySource));
+    }
+    else if (notifySource) {
+        ipc = notifySource;
+    }
+    state.ipc = ipc;
+    const options = callbacks;
     const handlers = {
         async upgrade(query) {
             const params = new URLSearchParams(query);
@@ -2785,7 +2837,7 @@ function startRoom(state, transport, options) {
             (async () => {
                 let result;
                 try {
-                    result = await Promise.resolve(options.onAuth ? options.onAuth(room, joinData) : { ok: true, data: {} });
+                    result = await Promise.resolve(options.onAuth ? options.onAuth(joinData) : { ok: true, data: {} });
                 }
                 catch (err) {
                     // onAuth threw — bug in user code
@@ -2802,7 +2854,8 @@ function startRoom(state, transport, options) {
                 // generate session token
                 const sessionToken = randomHex(16);
                 state.sessionTokens.set(sessionToken, clientId);
-                // track client
+                // track client, building its single stable handle now — reused
+                // across every callback and room.clients access for its lifetime.
                 const tracked = {
                     id: clientId,
                     data: result.data,
@@ -2812,7 +2865,10 @@ function startRoom(state, transport, options) {
                     reliableBufferBytes: 0,
                     disconnectTimer: null,
                     tags,
+                    handle: undefined,
+                    alive: true,
                 };
+                tracked.handle = makeClientHandle(state, tracked, verbs);
                 state.clients.set(clientId, tracked);
                 // subscribe to broadcasts only now that auth has passed — a
                 // rejected client must never be subscribed, and broadcasts sent
@@ -2825,9 +2881,9 @@ function startRoom(state, transport, options) {
                 // full upsert — covers the case where the driver's client
                 // record was evicted between reserveClient and now.
                 state.ipc?.send({ type: 'client-connected', clientId, roomId: state.roomId, tags });
-                // run onJoin
+                // run onJoin with the client's stable handle
                 if (options.onJoin) {
-                    await Promise.resolve(options.onJoin(room, createClient(tracked)));
+                    await Promise.resolve(options.onJoin(tracked.handle));
                 }
             })().catch((err) => {
                 state.log.error('onJoin threw unexpectedly', { clientId, err });
@@ -2846,10 +2902,10 @@ function startRoom(state, transport, options) {
             }
             if (options.onMessage) {
                 if (frame.frame === 'user_text') {
-                    safeCall(state.log, 'onMessage', () => options.onMessage(room, createClient(tracked), frame.text));
+                    safeCall(state.log, 'onMessage', () => options.onMessage(tracked.handle, frame.text));
                 }
                 else {
-                    safeCall(state.log, 'onMessage', () => options.onMessage(room, createClient(tracked), frame.data));
+                    safeCall(state.log, 'onMessage', () => options.onMessage(tracked.handle, frame.data));
                 }
             }
         },
@@ -2892,7 +2948,7 @@ function startRoom(state, transport, options) {
             socket.send(packProtocol({ type: 'session', token: newToken, clientId }), true);
             // fire onReconnect
             if (options.onReconnect) {
-                safeCall(state.log, 'onReconnect', () => options.onReconnect(room, createClient(tracked)));
+                safeCall(state.log, 'onReconnect', () => options.onReconnect(tracked.handle));
             }
             // notify driver: client is connected again. forward roomId + the
             // tags we cached at original open() — same upsert path as fast.
@@ -2902,17 +2958,18 @@ function startRoom(state, transport, options) {
             const tracked = state.clients.get(clientId);
             if (!tracked)
                 return;
+            const onLeave = options.onLeave;
             // consented close (4000) or no onDrop defined — permanent leave
             if (code === 4000 || !options.onDrop) {
-                evictClient(state, tracked, room, options.onLeave);
+                evictClient(state, tracked, onLeave);
                 return;
             }
             // non-consented disconnect — mark as disconnected, fire onDrop
             tracked.socket = null;
             const onDrop = options.onDrop;
             (async () => {
-                // fire onDrop — room code may call allowReconnection inside
-                await Promise.resolve(onDrop(room, createClient(tracked), code));
+                // fire onDrop — room code may call client.allowReconnection inside
+                await Promise.resolve(onDrop(tracked.handle, code));
                 // if allowReconnection was NOT called (no timer set), evict immediately.
                 // guard against a client that reconnected while onDrop awaited: require
                 //  - still in the map (not already evicted by something else), and
@@ -2921,22 +2978,41 @@ function startRoom(state, transport, options) {
                 //    already no-ops post-reconnect, so this branch is the guaranteed
                 //    outcome of the race without the socket check.
                 if (!tracked.disconnectTimer && tracked.socket === null && state.clients.has(tracked.id)) {
-                    evictClient(state, tracked, room, options.onLeave);
+                    evictClient(state, tracked, onLeave);
                 }
             })().catch((err) => {
                 state.log.error('onDrop threw unexpectedly', { clientId, err });
             });
         },
     };
-    return transport.listen(handlers, { port: options.port }).then((server) => {
-        state.server = server;
-        return { port: server.port, room };
-    });
+    const server = await transport.listen(handlers, { port });
+    state.server = server;
+    // managed mode: start heartbeats and signal ready to the parent server.
+    if (ipc) {
+        startHeartbeat(state);
+        ipc.send({ type: 'ready', port: server.port });
+    }
+    // signal handling belongs to whoever owns the process — install only where
+    // there is one (node/bun/deno; workerd isolates have no signals).
+    if (typeof process !== 'undefined' && typeof process.on === 'function') {
+        const sigtermHandler = () => {
+            stopRoom(state, false, callbacks.onShutdown, callbacks.onLeave).catch((err) => {
+                state.log.error('error during shutdown', { err });
+            });
+        };
+        state.sigtermHandler = sigtermHandler;
+        process.on('SIGTERM', sigtermHandler);
+    }
 }
-async function stopRoom(state, selfInitiated, room, onShutdown, onLeave) {
+async function stopRoom(state, selfInitiated, onShutdown, onLeave) {
     if (!state.alive)
         return;
     state.alive = false;
+    // clear the created-but-not-started warn if stop() somehow runs before start().
+    if (state.startWarnTimer) {
+        clearTimeout(state.startWarnTimer);
+        state.startWarnTimer = null;
+    }
     // remove SIGTERM handler to prevent listener leak
     if (state.sigtermHandler) {
         process.removeListener('SIGTERM', state.sigtermHandler);
@@ -2957,6 +3033,8 @@ async function stopRoom(state, selfInitiated, room, onShutdown, onLeave) {
     state.sessionTokens.clear();
     // fire onLeave for each client and clean up
     for (const tracked of trackedClients) {
+        // mark the handle dead so any verbs called from onLeave are no-ops.
+        tracked.alive = false;
         // cancel any pending disconnect timer
         if (tracked.disconnectTimer) {
             clearTimeout(tracked.disconnectTimer);
@@ -2965,9 +3043,9 @@ async function stopRoom(state, selfInitiated, room, onShutdown, onLeave) {
         // clear reliable buffer
         tracked.reliableBuffer.length = 0;
         tracked.reliableBufferBytes = 0;
-        // fire onLeave
-        if (onLeave && room) {
-            safeCall(state.log, 'onLeave', () => onLeave(room, createClient(tracked)));
+        // fire onLeave with the client's stable handle
+        if (onLeave) {
+            safeCall(state.log, 'onLeave', () => onLeave(tracked.handle));
         }
         // notify driver
         state.ipc?.send({ type: 'client-disconnected', clientId: tracked.id });
@@ -2993,11 +3071,25 @@ const MANAGED_ENV_KEYS = [
     'GATHO_ROOM_SECRET',
     'GATHO_SERVER_ID',
 ];
-async function start(options) {
-    // --- resolve managed context ---
+// warn if a created room hasn't been started within this window — standalone
+// dev insurance. managed mode's server-side startup timeout already covers the
+// forgot-to-start case there.
+const START_WARN_MS = 5000;
+/** build a room (synchronous). resolves managed context (env vars / `options.server`),
+ *  builds the RoomState and the {@link Room} handle, and stores the lifecycle
+ *  callbacks. does NOT open the transport or dial the notify channel — call
+ *  `await room.start()` for that.
+ *
+ *  design: the two-phase split puts everything SYNCHRONOUS here (env reads, the
+ *  fail-closed standalone check, identity assignment) so `room.roomId` etc. are
+ *  readable immediately and the fail-closed throw is a plain synchronous throw.
+ *  the only ASYNC work (notify dial, transport listen, ready signal, heartbeat,
+ *  SIGTERM hook) lives in `room.start()`, whose failure mode is a rejected
+ *  promise the caller awaits. */
+function create(options) {
+    // --- resolve managed context (synchronous) ---
     const presentEnvKeys = MANAGED_ENV_KEYS.filter((k) => readEnv(k) !== undefined);
     const hasServerOption = options.server !== undefined;
-    let server;
     let roomId;
     let roomType;
     let notifySource;
@@ -3014,7 +3106,6 @@ async function start(options) {
                 .join(' and ');
             createLogger().warn(`gatho/room: standalone: true is set, ignoring managed context from ${bits}`);
         }
-        server = undefined;
         roomId = crypto.randomUUID();
         roomType = 'room';
         notifySource = undefined;
@@ -3022,7 +3113,7 @@ async function start(options) {
         serverId = undefined;
     }
     else {
-        server = options.server;
+        const server = options.server;
         roomId = server?.roomId ?? readEnv('GATHO_ROOM_ID') ?? crypto.randomUUID();
         roomType = server?.roomType ?? readEnv('GATHO_ROOM_TYPE') ?? 'room';
         roomSecret = server?.roomSecret ?? readEnv('GATHO_ROOM_SECRET') ?? null;
@@ -3033,22 +3124,11 @@ async function start(options) {
         // fail closed: require managed context OR explicit standalone opt-in.
         // this prevents accidentally running a room with no auth in production.
         if (!notifySource && !roomSecret) {
-            throw new Error('gatho/room start(): no managed server context detected ' +
+            throw new Error('gatho/room create(): no managed server context detected ' +
                 '(no GATHO_NOTIFY_SOCKET / GATHO_ROOM_SECRET env vars, and no options.server.notify / roomSecret). ' +
                 'If running this room directly for local dev or tests, pass `standalone: true`. ' +
                 'Otherwise ensure the gatho server spawned this process so GATHO_* env vars are set.');
         }
-    }
-    // set up the notify link (managed mode). a Notifier object is used as-is
-    // (in-process hosting); a uri string is dialed over uds/tcp — node:net is
-    // loaded lazily inside the dialer, so non-node bundles that always pass a
-    // Notifier object never execute a node import.
-    let ipc = null;
-    if (typeof notifySource === 'string') {
-        ipc = await connectNotify(parseNotifyTarget(notifySource));
-    }
-    else if (notifySource) {
-        ipc = notifySource;
     }
     const log = createLogger().child({ roomId, roomType });
     const state = {
@@ -3058,17 +3138,18 @@ async function start(options) {
         roomSecret,
         clients: new Map(),
         sessionTokens: new Map(),
-        ipc,
+        notifySource,
+        ipc: null,
         heartbeatInterval: null,
+        started: false,
         alive: true,
         server: null,
         sigtermHandler: null,
+        startWarnTimer: null,
         log,
     };
     const transport = options.transport ?? wsTransport();
-    const { port, room } = await startRoom(state, transport, {
-        port: options.port,
-        maxBufferBytes: options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES,
+    const room = createRoom(state, options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES, transport, options.port, {
         onAuth: options.onAuth,
         onJoin: options.onJoin,
         onMessage: options.onMessage,
@@ -3077,29 +3158,26 @@ async function start(options) {
         onReconnect: options.onReconnect,
         onShutdown: options.onShutdown,
     });
-    if (ipc) {
-        startHeartbeat(state);
-        ipc.send({ type: 'ready', port });
-    }
-    // signal handling belongs to whoever owns the process — install only where
-    // there is one (node/bun/deno; workerd isolates have no signals).
-    if (typeof process !== 'undefined' && typeof process.on === 'function') {
-        const sigtermHandler = () => {
-            stopRoom(state, false, room, options.onShutdown, options.onLeave).catch((err) => {
-                state.log.error('error during shutdown', { err });
-            });
-        };
-        state.sigtermHandler = sigtermHandler;
-        process.on('SIGTERM', sigtermHandler);
-    }
+    // dev insurance: warn if start() is never called. cleared by start()/stop().
+    // unref'd so it never keeps the process alive on its own.
+    const warnTimer = setTimeout(() => {
+        state.startWarnTimer = null;
+        if (!state.started) {
+            log.warn('gatho/room: room created but start() not called within 5s — did you forget `await room.start()`?');
+        }
+    }, START_WARN_MS);
+    if (typeof warnTimer.unref === 'function')
+        warnTimer.unref();
+    state.startWarnTimer = warnTimer;
     return room;
 }
 
 // gatho/room — room-side api
-// rooms are scripts. user initializes state in module scope, calls start()
-// which returns a Room handle. no defineRoom, no hook bags, no RoomContext.
-// the module IS the room: state closes over module scope, and instancing
-// happens by evaluating the module in a fresh process / worker / isolate.
+// rooms are scripts. user calls create() to build a Room handle (sync), then
+// awaits room.start() to bring it online. no defineRoom, no hook bags, no
+// RoomContext. the module IS the room: state closes over module scope, and
+// instancing happens by evaluating the module in a fresh process / worker /
+// isolate.
 // protocol helpers for non-node runtimes that need to speak the notify wire
 // protocol themselves (e.g. a workerd harness relaying room notifications over tcp)
 // helpers for returning auth results with correct literal types
@@ -3113,5 +3191,5 @@ const auth = {
     },
 };
 
-export { CloseCode, auth, createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec, start, wsTransport };
+export { CloseCode, auth, create, createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec, wsTransport };
 //# sourceMappingURL=room.js.map

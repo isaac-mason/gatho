@@ -1,8 +1,9 @@
 // gatho/room — room-side api
-// rooms are scripts. user initializes state in module scope, calls start()
-// which returns a Room handle. no defineRoom, no hook bags, no RoomContext.
-// the module IS the room: state closes over module scope, and instancing
-// happens by evaluating the module in a fresh process / worker / isolate.
+// rooms are scripts. user calls create() to build a Room handle (sync), then
+// awaits room.start() to bring it online. no defineRoom, no hook bags, no
+// RoomContext. the module IS the room: state closes over module scope, and
+// instancing happens by evaluating the module in a fresh process / worker /
+// isolate.
 
 export type {
     Notifier,
@@ -11,8 +12,8 @@ export type {
 // protocol helpers for non-node runtimes that need to speak the notify wire
 // protocol themselves (e.g. a workerd harness relaying room notifications over tcp)
 export { createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec } from '../common/notify-protocol';
-export type { ServerConfig, StartOptions } from './start';
-export { start } from './start';
+export type { CreateOptions, ServerConfig } from './start';
+export { create } from './start';
 export type { WsTransportConfig } from './transport/index';
 export { wsTransport } from './transport/index';
 export type {
@@ -49,12 +50,48 @@ export const auth = {
 
 // --- client ---
 
-// client representation within a room — plain data, no methods
+// options for client.send()
+export type SendOptions = { reliable?: boolean };
+
+// client handle within a room — carries identity, data, and per-client verbs.
+//
+// STABLE IDENTITY: one Client object is cached per tracked client for its whole
+// lifetime — the same reference is passed to every callback (onJoin, onMessage,
+// onDrop, onReconnect, onLeave) and returned from room.clients iteration/get.
+// this makes `Map<Client, T>` keys and `===` identity checks reliable.
+//
+// STALE HANDLES: after a client permanently leaves (onLeave / eviction) its
+// handle is dead. verbs on a dead handle (send, allowReconnection, disconnect)
+// are silent no-ops. `bufferedAmount` reads 0. this matches the pre-reshape
+// behavior of room.send with a stale client.
 export type Client<ClientData = Record<string, unknown>> = {
     // unique client identifier
-    id: string;
+    readonly id: string;
     // client-specific data populated from onAuth return value
-    data: ClientData;
+    readonly data: ClientData;
+
+    // send a message to this client.
+    // if the client is connected, sends immediately; if disconnected within a
+    // reconnection window, a reliable message (default) is buffered and flushed
+    // on reconnect. unreliable messages drop while disconnected. no-op on a
+    // stale handle.
+    send(message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
+
+    // reconnection — call from onDrop to hold this client's seat for windowMs.
+    // if not called, the client is evicted immediately on disconnect. no-op on
+    // a stale handle or while the client is connected.
+    allowReconnection(windowMs: number): void;
+
+    // server-initiated disconnect. closes with code 4000 (CONSENTED) — onDrop
+    // does NOT fire, straight to onLeave. no-op on a stale handle.
+    disconnect(): void;
+
+    // outbound socket buffer depth in bytes — the live socket's bufferedAmount,
+    // 0 when the client is disconnected or the transport can't report it. this
+    // is the backpressure pacing signal for large-payload streaming (chunk a big
+    // snapshot, check this between chunks, defer while it's high). gatho ships NO
+    // automatic backpressure policy — the pacing/eviction decision is yours.
+    readonly bufferedAmount: number;
 };
 
 // client collection interface
@@ -72,9 +109,6 @@ export type ClientCollection<ClientData> = {
 
 // --- room handle ---
 
-// options for room.send()
-export type SendOptions = { reliable?: boolean };
-
 // options for room.broadcast()
 export type BroadcastOptions<ClientData = Record<string, unknown>> = {
     reliable?: boolean;
@@ -85,7 +119,14 @@ export type BroadcastOptions<ClientData = Record<string, unknown>> = {
     except?: Client<ClientData> | Client<ClientData>[];
 };
 
-// the Room handle — returned by start(), also passed as first arg to all callbacks
+// the Room handle — built synchronously by create(), brought online by start().
+//
+// per-client verbs (send / allowReconnection / disconnect / bufferedAmount) live
+// on the Client handle, not here — there is one way to do each.
+//
+// PRE-START: broadcast() before start() throws (always a programming error).
+// clients is safe to read before start() (it is empty — no connections exist
+// until start() opens the transport). POST-STOP: broadcast() is a silent no-op.
 export type Room<ClientData = Record<string, unknown>> = {
     // identity
     readonly roomId: string;
@@ -93,20 +134,13 @@ export type Room<ClientData = Record<string, unknown>> = {
     readonly serverId: string | undefined;
 
     // messaging
-    send(client: Client<ClientData>, message: string | ArrayBuffer | ArrayBufferView, options?: SendOptions): void;
     broadcast(message: string | ArrayBuffer | ArrayBufferView, options?: BroadcastOptions<ClientData>): void;
 
     // clients
     readonly clients: ClientCollection<ClientData>;
 
-    // reconnection — call from onDrop to hold a client's seat for windowMs.
-    // if not called, the client is evicted immediately on disconnect.
-    allowReconnection(client: Client<ClientData>, windowMs: number): void;
-
-    // server-initiated disconnect. closes with code 4000 (CONSENTED) —
-    // onDrop does NOT fire, straight to onLeave.
-    disconnect(client: Client<ClientData>): void;
-
-    // lifecycle
+    // lifecycle — bring the room online (dial notify, listen, signal ready, start
+    // heartbeats). async; idempotent-guarded (a second call throws).
+    start(): Promise<void>;
     stop(): Promise<void>;
 };
