@@ -40,6 +40,7 @@ See the [CHANGELOG.md](./CHANGELOG.md) for a detailed list of changes in each ve
 - [Rooms](#rooms)
 - [Messages](#messages)
 - [Client](#client)
+- [Backpressure](#backpressure)
 - [Drivers](#drivers)
 
 ## Concepts
@@ -116,13 +117,17 @@ const gatho = createGathoSDK({ driver: createRedisDriver() });
 
 const servers = await gatho.getServers({ roomTypes: ['counter'] });
 
-if (servers.length === 0) {
+// placement policy is yours. here we pick the least-loaded server by current
+// room count; you could filter by tags (region, tier), weight by capacity, etc.
+const target = servers.sort((a, b) => a.rooms.length - b.rooms.length)[0];
+
+if (!target) {
     throw new Error('no servers available to run a counter room');
 }
 
 const room = await gatho.createRoom({
     type: 'counter',
-    serverId: servers[0].serverId,
+    serverId: target.serverId,
     // data and tags are optional (default {}) — pass them to seed the room's
     // create() data or to categorize the room for later filtering.
 });
@@ -132,6 +137,12 @@ const seat = await gatho.join({ roomId: room.roomId });
 
 console.log(seat.url);
 ```
+
+A few units and limits worth knowing up front:
+
+- **`join({ ttl })`** is in **milliseconds** and defaults to `30000` (30s) — how long the seat reservation stays valid before the client must connect.
+- The reservation token is a **JWT carried in the URL query string** returned by `join()`. URLs have a **~8KB practical limit** across proxies and servers, so keep join `data` compact.
+- `join({ data })` is capped at **2048 bytes** and `join({ tags })` at **512 bytes** (serialized); exceed either and `join()` throws a typed **`PayloadTooLargeError`**.
 
 And you can connect to URLs returned by `join()` with `gatho/client`:
 
@@ -178,7 +189,7 @@ Call `ctx.stopped(code)` whenever the room exits (crash, clean exit, killed) so 
 
 #### Child processes with `subprocess()`
 
-`subprocess()` is a factory for the common case. Give it the argv and it returns a runner that spawns a node/bun child process. It sets up a `notify.uds` channel, forwards the standard `GATHO_*` env, wires exit signalling, and handles graceful shutdown (SIGTERM first, then SIGKILL if that doesn't take). Use `options.env` for extra env vars, and `options.socketDir` or `options.killTimeoutMs` to tune the channel and shutdown. Per-room `ctx.data` isn't forwarded automatically, so reach for a custom runner when you need that.
+`subprocess()` is a factory for the common case. Give it the argv and it returns a runner that spawns a node/bun child process. It sets up a `notify.uds` channel, forwards the standard `GATHO_*` env, wires exit signalling, and handles graceful shutdown (SIGTERM first, then SIGKILL if that doesn't take). Use `options.env` for extra env vars, and `options.socketDir` or `options.killTimeoutMs` to tune the channel and shutdown. The `GATHO_*` vars carry room identity, not your gameplay config — to forward per-room config from `createRoom({ data })` into the child, pass `env` as a function of the spawn context: `subprocess(cmd, { env: (ctx) => ({ GAME_MODE: String(ctx.data.gameMode) }) })`.
 
 ```ts
 import { createMemoryDriver } from 'gatho/driver';
@@ -188,8 +199,14 @@ await start({
     rooms: {
         // subprocess() is a factory: give it the argv and it returns a runner.
         // options.env adds extra env vars alongside the standard GATHO_* set.
+        // pass a function to forward per-room config from ctx.data into the
+        // child's environment — this is how createRoom({ data }) reaches the room
+        // process (GATHO_* covers identity, not your gameplay config).
         game: subprocess(['bun', 'run', './game-room.ts'], {
-            env: { REGION: 'eu-west' },
+            env: (ctx) => ({
+                REGION: 'eu-west',
+                GAME_MODE: String(ctx.data.gameMode ?? 'ffa'),
+            }),
         }),
     },
     driver: createMemoryDriver(),
@@ -275,6 +292,8 @@ The helper returns `chan.env`, which holds `GATHO_NOTIFY_SOCKET` (a `uds:<path>`
 
 `gatho/room` is the runtime for a single multiplayer session: a game match, a lobby, a collaborative space. You supply lifecycle callbacks (auth, join, message, drop, reconnect, leave, shutdown) and get back a handle for sending messages to connected clients and broadcasting to all of them.
 
+`room.broadcast(message, options?)` fans a message out to every connected client. Pass `{ except }` (a `Client` or `Client[]`) to skip specific clients — the classic "echo to everyone but the sender" case. Excluded clients receive nothing, not even a buffered copy on reconnect. `room.clients` is an iterable collection (`for (const client of room.clients) { … }`) with stable handles: the same `Client` object is returned for a given client for its whole lifetime, so `Map<Client, T>` keys and `===` identity checks work. A handle is dead after `onLeave`; verbs on a dead handle are silent no-ops.
+
 ### Lifecycle
 
 ```ts
@@ -348,25 +367,34 @@ await room.start();
 
 ## Messages
 
-gatho is unopinionated about message format. `client.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` and `JSON.parse()` yourself. gatho stays out of the way.
-
-If you want good performance without sacrificing developer experience, [packcat](https://github.com/isaac-mason/packcat) plays well with gatho. Define schemas once, share them between client and server, and get compact binary encoding with full TypeScript types. No code generation, no IDL files.
+gatho is format-agnostic — it carries bytes and stays out of the way — but for anything beyond a toy you want one place that defines your whole message protocol and shares it between client and server. The recommended shape is a pair of discriminated unions: a **`ClientPacket`** (client → server) and a **`ServerPacket`** (server → client), each a union over the individual message variants. [packcat](https://github.com/isaac-mason/packcat) plays well with gatho for this: define the schemas once, import them on both ends, and get compact binary encoding with full TypeScript types and exhaustive `switch (packet.type)`. Adding a message is a one-line variant, and the compiler tells both ends what changed. No code generation, no IDL files. This is a convention you own, not a gatho abstraction.
 
 ```ts
 // shared/protocol.ts
-
-// define your message schemas once, use them on both client and server
+//
+// the recommended shape: define ONE ClientPacket union (client → server) and ONE
+// ServerPacket union (server → client), share this module between client and
+// server, and get compact binary encoding with full TypeScript types. adding a
+// message means adding a variant here, and both ends update in lockstep — the
+// compiler tells you what you missed. no code generation, no IDL files.
 
 import * as p from 'packcat';
 
-// client → server
-const PlayerInput = p.object({
+// --- client → server messages ---
+
+const Input = p.object({
     type: p.literal('input'),
-    movement: p.list(p.float32()),
+    movement: p.list(p.float32(), 2), // [x, y]
 });
 
-// server → client
-const GameState = p.object({
+const Chat = p.object({
+    type: p.literal('chat'),
+    text: p.string(),
+});
+
+// --- server → client messages ---
+
+const Snapshot = p.object({
     type: p.literal('snapshot'),
     tick: p.varuint(),
     players: p.list(
@@ -377,57 +405,109 @@ const GameState = p.object({
     ),
 });
 
-const ServerMessage = p.union('type', [GameState]);
-const ClientMessage = p.union('type', [PlayerInput]);
+const ChatBroadcast = p.object({
+    type: p.literal('chat'),
+    from: p.varuint(),
+    text: p.string(),
+});
 
-export type ServerMessage = p.SchemaType<typeof ServerMessage>;
-// { type: 'snapshot', tick: number, players: { id: number, position: [number, number] }[] }
+// one union per direction — the whole protocol surface, discriminated on `type`.
+const ClientPacket = p.union('type', [Input, Chat]);
+const ServerPacket = p.union('type', [Snapshot, ChatBroadcast]);
 
-export type ClientMessage = p.SchemaType<typeof ClientMessage>;
-// { type: 'input', movement: [number, number] }
+export type ClientPacket = p.SchemaType<typeof ClientPacket>;
+export type ServerPacket = p.SchemaType<typeof ServerPacket>;
 
-const ServerMessageSerDes = p.build(ServerMessage);
-const ClientMessageSerDes = p.build(ClientMessage);
+// build the (de)serializers once and reuse them.
+export const clientCodec = p.build(ClientPacket);
+export const serverCodec = p.build(ServerPacket);
 
-const exampleServerMessage: Uint8Array<ArrayBufferLike> = ServerMessageSerDes.pack({
+// --- client side ---
+
+// send a typed input, receive a typed snapshot. gatho carries the bytes; packcat
+// gives you exhaustive `switch (packet.type)` on both ends.
+const inputBytes: Uint8Array<ArrayBufferLike> = clientCodec.pack({ type: 'input', movement: [1, 0] });
+console.log('packed client packet:', inputBytes);
+
+function onServerMessage(bytes: ArrayBuffer) {
+    const packet: ServerPacket = serverCodec.unpack(new Uint8Array(bytes));
+    switch (packet.type) {
+        case 'snapshot':
+            console.log('tick', packet.tick, 'players', packet.players);
+            break;
+        case 'chat':
+            console.log(`${packet.from}: ${packet.text}`);
+            break;
+    }
+}
+
+// --- server side ---
+
+const snapshotBytes: Uint8Array<ArrayBufferLike> = serverCodec.pack({
     type: 'snapshot',
     tick: 123,
-    players: [
-        { id: 1, position: [10, 20] },
-        { id: 2, position: [30, 40] },
-    ],
+    players: [{ id: 1, position: [10, 20] }],
 });
+console.log('packed server packet:', snapshotBytes);
 
-console.log('packed server message:', exampleServerMessage);
+function onClientMessage(bytes: ArrayBuffer) {
+    const packet: ClientPacket = clientCodec.unpack(new Uint8Array(bytes));
+    switch (packet.type) {
+        case 'input':
+            console.log('movement', packet.movement);
+            break;
+        case 'chat':
+            console.log('chat', packet.text);
+            break;
+    }
+}
 
-const unpackedServerMessage: ServerMessage = ServerMessageSerDes.unpack(exampleServerMessage);
-console.log('unpacked server message:', unpackedServerMessage.tick, unpackedServerMessage.players);
-
-const exampleClientMessage: Uint8Array<ArrayBufferLike> = ClientMessageSerDes.pack({
-    type: 'input',
-    movement: [1, 0],
-});
-
-console.log('packed client message:', exampleClientMessage);
-
-const unpackedClientMessage: ClientMessage = ClientMessageSerDes.unpack(exampleClientMessage);
-console.log('unpacked client message:', unpackedClientMessage.movement);
+// keep the example's helpers referenced so tsc doesn't flag them as unused.
+onServerMessage(snapshotBytes.buffer as ArrayBuffer);
+onClientMessage(inputBytes.buffer as ArrayBuffer);
 ```
+
+If you want zero dependencies, the raw path still works: `client.send()` and `room.broadcast()` accept `string | ArrayBuffer | ArrayBufferView`, and `onMessage` receives `string | ArrayBuffer`. For JSON, call `JSON.stringify()` / `JSON.parse()` yourself.
+
+### Reliable and unreliable delivery
+
+By default a message is **reliable**: ordered, delivered, and buffered across a reconnection window (see [Client](#client) below). Pass `{ reliable: false }` to `client.send()` / `room.broadcast()` (and `send()` on the client) for **unreliable** delivery — best-effort, meant for high-frequency state that's obsolete the moment the next update ships (cursor positions, input samples). The contract is deliberately transport-agnostic:
+
+- an unreliable message **MAY be dropped** and **MAY be reordered**;
+- it is **never buffered or retransmitted** — if the peer is disconnected, it drops outright;
+- keep unreliable payloads **small** (aim for ~1KB);
+- there is **no ordering guarantee between** the reliable and unreliable channels.
+
+On today's WebSocket transport an unreliable message happens to arrive ordered and intact while the socket stays connected — but that is a property of WebSocket, **not a promise of the contract**, so don't rely on it. WebTransport datagrams will map onto this same unreliable contract later.
 
 ## Client
 
 `gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself. `connect(url, handlers)` takes a single-handler bag — one callback per event (`onOpen`, `onMessage`, `onDrop`, `onReconnect`, `onAuthError`, `onClose`, `onError`), all optional — and returns a connection with `send()`, `close()`, `state`, and `clientId`:
 
-- **Automatic reconnection.** On an unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter.
-- **Reliable messaging.** Messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. WebTransport support will build on this.
-- **Session continuity.** The server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off.
+- **Automatic reconnection.** On an unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter. After **10 consecutive failed attempts** it gives up and closes for good — `onClose` fires with cause `'reconnect-failed'`, the signal to re-matchmake. The counter resets on any successful reconnect.
+- **Reliable messaging.** Messages sent while `connecting` or `reconnecting` are buffered (up to 1MB by default) and flushed in order once the connection is (re)established. Mark a message `{ reliable: false }` to drop it instead — see [Reliable and unreliable delivery](#reliable-and-unreliable-delivery).
+- **Session continuity.** The server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off. `conn.clientId` is that id — `null` until the first `session` message arrives (i.e. until `onOpen`).
 - **Clean close.** `close()` sends a protocol-level leave message so the server knows the disconnect was intentional and skips the reconnection window.
 
-On the server side, opt in to reconnection by calling `client.allowReconnection(windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
+**Version handshake.** The client stamps its gatho protocol version onto the connect URL, and the room rejects a mismatch fast and loud: the connection closes with an `auth_error` reading `protocol version mismatch (client <x>, server <y>)` rather than a cryptic transport failure. Client and server gatho versions must match — there is no negotiation. Redeploy rooms and clients together.
 
-The client's `onOpen` handler and the room's `onJoin` fire at the same protocol instant — receipt of the session message — so "joined" means the same thing on both ends.
+**Close causes.** `onClose(info)` receives `info.cause` so you can react without decoding raw WebSocket codes:
 
-**Outbound backpressure.** Gatho exposes each socket's unflushed outbound buffer via `client.bufferedAmount` but ships no automatic eviction policy — bursty payloads (a voxel world sync) must not be killed by a threshold gatho guessed at, so the pacing and eviction decisions are yours. A full guide to pacing large sends and building your own stall policy is coming.
+| cause | meaning |
+| --- | --- |
+| `consented` | the app called `close()` — an intentional departure |
+| `auth` | the room rejected the initial connect (`auth_error`) |
+| `session` | the room rejected our session token on reconnect |
+| `reconnect-failed` | reconnection gave up after the 10-attempt cap |
+| `buffer-overflow` | the outbound reliable buffer exceeded its 1MB cap |
+| `initial-connect-failed` | the first WebSocket closed before a session arrived |
+| `server` | the server closed a live, authenticated connection |
+
+On the server side, opt in to reconnection by calling `client.allowReconnection(windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
+
+The client's `onOpen` handler and the room's `onJoin` fire at the same protocol instant — receipt of the session message — so "joined" means the same thing on both ends. The same holds for `onMessage`, `onDrop`, and `onReconnect`, which name the same events viewed from each end.
+
+**Outbound backpressure.** Gatho exposes each socket's unflushed outbound buffer via `client.bufferedAmount` but ships no automatic eviction policy — bursty payloads (a voxel world sync) must not be killed by a threshold gatho guessed at, so the pacing and eviction decisions are yours. See [Backpressure](#backpressure) below.
 
 ```ts
 import { auth, create } from 'gatho/room';
@@ -447,9 +527,103 @@ const room = create({
 await room.start();
 ```
 
+## Backpressure
+
+When you write to a socket faster than the peer can read, the unsent bytes pile up in the OS send buffer. Left unchecked that means unbounded memory growth on the server and rising latency for every other message to that peer. `client.bufferedAmount` exposes the depth of that buffer (in bytes, `0` when disconnected or when the transport can't report it). gatho ships this **signal only** — no automatic policy — because the right response depends entirely on your workload. A voxel world-sync that briefly parks megabytes in the buffer is perfectly healthy; a policy that evicted it on a raw byte threshold would be wrong.
+
+There are two things you typically do with the signal.
+
+**1. Pace large sends.** Rather than pushing a big snapshot in one call, stream it in chunks and check `client.bufferedAmount` between them, deferring more writes while the buffer is above a high-water mark. This is the voxel world-sync pattern — the send self-throttles to whatever the peer can actually absorb.
+
+**2. Build your own stall-eviction policy.** If you do want to drop peers that can't keep up, the key insight is that **buffered ≠ stalled**. An instantaneous threshold misfires on bursts: a healthy peer receiving that big snapshot briefly shows a huge buffer. The discriminator is **drain progress** — sweep `room.clients` periodically, remember each client's last buffered depth, and only `client.disconnect()` a peer whose buffer is both high *and* not shrinking across sweeps. A stalled peer's buffer stays high; a busy-but-healthy peer's falls as the OS flushes it.
+
+(For readers who'd rather adopt an automatic policy: uWebSockets caps the buffer with `maxBackpressure` and drops the socket past it; Bun's `ws.send()` returns a negative value under backpressure so you can stop feeding it. gatho exposes the raw signal and lets you choose.)
+
+```ts
+import { auth, create } from 'gatho/room';
+
+const room = create({
+    onAuth: () => auth.ok(),
+});
+
+// --- (a) pacing a large send ---
+//
+// a big world snapshot (voxel chunks, a full lobby state) can be tens of MB. push
+// it all at once and it piles up in the socket's outbound buffer faster than the
+// peer can drain it — memory balloons and latency for everything else spikes.
+// instead, stream it in chunks and check client.bufferedAmount between chunks,
+// yielding while the buffer is high so the socket can drain.
+
+const HIGH_WATER = 1 << 20; // 1MB — pause new chunks above this
+const CHUNK_BYTES = 64 * 1024;
+
+async function streamSnapshot(clientId: string, snapshot: Uint8Array): Promise<void> {
+    for (let offset = 0; offset < snapshot.byteLength; offset += CHUNK_BYTES) {
+        // re-fetch the handle each iteration — the client may have left mid-stream.
+        const client = room.clients.get(clientId);
+        if (!client) return;
+
+        // wait for the buffer to drain below the high-water mark before queueing
+        // more. a real impl would await an event/timer; a poll keeps the example
+        // dependency-free.
+        while (client.bufferedAmount > HIGH_WATER) {
+            await new Promise((r) => setTimeout(r, 16));
+            if (!room.clients.has(clientId)) return;
+        }
+
+        client.send(snapshot.subarray(offset, offset + CHUNK_BYTES));
+    }
+}
+
+// --- (b) your own stall-eviction policy ---
+//
+// gatho ships client.bufferedAmount and NO automatic eviction. a naive
+// "disconnect anyone above N bytes" misfires: a bursty payload (that world
+// snapshot) briefly parks megabytes in the buffer for a perfectly healthy peer.
+// buffered != stalled. the discriminator is DRAIN PROGRESS — a stalled peer's
+// buffer stays high WITHOUT shrinking across a sweep; a busy-but-healthy peer's
+// buffer falls as the OS flushes it.
+//
+// so: sweep periodically, remember each client's last buffered depth, and only
+// evict a peer whose buffer is both high AND not lower than last time. (prior
+// art for an automatic version: uWS's maxBackpressure caps the buffer and drops
+// the socket; Bun's ws.send() returns a negative value on backpressure so you can
+// stop feeding it. we expose the raw signal and let you pick the policy.)
+
+const STALL_LIMIT = 4 << 20; // 4MB — only consider eviction above this
+const lastBuffered = new Map<string, number>();
+
+function sweepForStalls() {
+    for (const client of room.clients) {
+        const buffered = client.bufferedAmount;
+        const previous = lastBuffered.get(client.id) ?? 0;
+
+        // high AND not draining (>= last sweep) → the peer isn't keeping up.
+        if (buffered > STALL_LIMIT && buffered >= previous) {
+            client.disconnect();
+            lastBuffered.delete(client.id);
+            continue;
+        }
+
+        lastBuffered.set(client.id, buffered);
+    }
+}
+
+setInterval(sweepForStalls, 1000);
+
+// keep the streaming helper referenced so tsc doesn't flag it as unused.
+void streamSnapshot;
+
+await room.start();
+```
+
 ## Drivers
 
 Drivers provide the shared state backend used by the server and SDK.
 
 - `createMemoryDriver()` (from `gatho/driver`): useful for local dev, tests, and onebox deployments
 - `createRedisDriver({ url })` (from `gatho/driver/redis`): requires Redis. `ioredis` is an optional peer dependency — install it (`npm i ioredis`) only when you use this driver; `gatho/driver` (memory driver, types, errors) never pulls it in.
+
+Both drivers accept `staleServerMs` (default `30000`) — how long a server may go without a heartbeat before its peers treat it as dead and prune it. Raise it if your servers legitimately pause longer than 30s (heavy GC, migration windows); lower it for faster failover.
+
+`createRoom()` rejects fast on failure. If the room's process fails to boot — a bad argv, a missing container image, a crash on startup — the driver publishes a room-failure signal and `createRoom()` rejects with a typed **`RoomFailedError`** carrying the real reason, rather than burning the full `timeoutMs`. The timeout remains only as a backstop for a room that goes silent without reporting.

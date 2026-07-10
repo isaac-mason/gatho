@@ -1,17 +1,28 @@
 // shared/protocol.ts
-
-// define your message schemas once, use them on both client and server
+//
+// the recommended shape: define ONE ClientPacket union (client → server) and ONE
+// ServerPacket union (server → client), share this module between client and
+// server, and get compact binary encoding with full TypeScript types. adding a
+// message means adding a variant here, and both ends update in lockstep — the
+// compiler tells you what you missed. no code generation, no IDL files.
 
 import * as p from 'packcat';
 
-// client → server
-const PlayerInput = p.object({
+// --- client → server messages ---
+
+const Input = p.object({
     type: p.literal('input'),
-    movement: p.list(p.float32()),
+    movement: p.list(p.float32(), 2), // [x, y]
 });
 
-// server → client
-const GameState = p.object({
+const Chat = p.object({
+    type: p.literal('chat'),
+    text: p.string(),
+});
+
+// --- server → client messages ---
+
+const Snapshot = p.object({
     type: p.literal('snapshot'),
     tick: p.varuint(),
     players: p.list(
@@ -22,38 +33,63 @@ const GameState = p.object({
     ),
 });
 
-const ServerMessage = p.union('type', [GameState]);
-const ClientMessage = p.union('type', [PlayerInput]);
+const ChatBroadcast = p.object({
+    type: p.literal('chat'),
+    from: p.varuint(),
+    text: p.string(),
+});
 
-export type ServerMessage = p.SchemaType<typeof ServerMessage>;
-// { type: 'snapshot', tick: number, players: { id: number, position: [number, number] }[] }
+// one union per direction — the whole protocol surface, discriminated on `type`.
+const ClientPacket = p.union('type', [Input, Chat]);
+const ServerPacket = p.union('type', [Snapshot, ChatBroadcast]);
 
-export type ClientMessage = p.SchemaType<typeof ClientMessage>;
-// { type: 'input', movement: [number, number] }
+export type ClientPacket = p.SchemaType<typeof ClientPacket>;
+export type ServerPacket = p.SchemaType<typeof ServerPacket>;
 
-const ServerMessageSerDes = p.build(ServerMessage);
-const ClientMessageSerDes = p.build(ClientMessage);
+// build the (de)serializers once and reuse them.
+export const clientCodec = p.build(ClientPacket);
+export const serverCodec = p.build(ServerPacket);
 
-const exampleServerMessage: Uint8Array<ArrayBufferLike> = ServerMessageSerDes.pack({
+// --- client side ---
+
+// send a typed input, receive a typed snapshot. gatho carries the bytes; packcat
+// gives you exhaustive `switch (packet.type)` on both ends.
+const inputBytes: Uint8Array<ArrayBufferLike> = clientCodec.pack({ type: 'input', movement: [1, 0] });
+console.log('packed client packet:', inputBytes);
+
+function onServerMessage(bytes: ArrayBuffer) {
+    const packet: ServerPacket = serverCodec.unpack(new Uint8Array(bytes));
+    switch (packet.type) {
+        case 'snapshot':
+            console.log('tick', packet.tick, 'players', packet.players);
+            break;
+        case 'chat':
+            console.log(`${packet.from}: ${packet.text}`);
+            break;
+    }
+}
+
+// --- server side ---
+
+const snapshotBytes: Uint8Array<ArrayBufferLike> = serverCodec.pack({
     type: 'snapshot',
     tick: 123,
-    players: [
-        { id: 1, position: [10, 20] },
-        { id: 2, position: [30, 40] },
-    ],
+    players: [{ id: 1, position: [10, 20] }],
 });
+console.log('packed server packet:', snapshotBytes);
 
-console.log('packed server message:', exampleServerMessage);
+function onClientMessage(bytes: ArrayBuffer) {
+    const packet: ClientPacket = clientCodec.unpack(new Uint8Array(bytes));
+    switch (packet.type) {
+        case 'input':
+            console.log('movement', packet.movement);
+            break;
+        case 'chat':
+            console.log('chat', packet.text);
+            break;
+    }
+}
 
-const unpackedServerMessage: ServerMessage = ServerMessageSerDes.unpack(exampleServerMessage);
-console.log('unpacked server message:', unpackedServerMessage.tick, unpackedServerMessage.players);
-
-const exampleClientMessage: Uint8Array<ArrayBufferLike> = ClientMessageSerDes.pack({
-    type: 'input',
-    movement: [1, 0],
-});
-
-console.log('packed client message:', exampleClientMessage);
-
-const unpackedClientMessage: ClientMessage = ClientMessageSerDes.unpack(exampleClientMessage);
-console.log('unpacked client message:', unpackedClientMessage.movement);
+// keep the example's helpers referenced so tsc doesn't flag them as unused.
+onServerMessage(snapshotBytes.buffer as ArrayBuffer);
+onClientMessage(inputBytes.buffer as ArrayBuffer);
