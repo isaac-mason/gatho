@@ -1,6 +1,6 @@
 /** room data - arbitrary key-value pairs passed from sdk to create() hook, persisted in registry
- *  and delivered to workers. keep small — the postgres driver uses pg_notify for push-based room
- *  spawning, which has a ~8000 byte payload limit on the serialized room assignment message. */
+ *  and delivered to workers. keep it small: it is replicated through the driver and pushed on
+ *  every room assignment. */
 export type RoomData = Record<string, string | number | boolean>;
 
 /** room status — 'requested' until the server confirms the worker is running, then 'running' */

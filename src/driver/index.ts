@@ -1,5 +1,4 @@
 export { createMemoryDriver } from './memory';
-export { type PostgresDriverOptions, createPostgresDriver } from './postgres';
 export { type RedisDriverOptions, createRedisDriver } from './redis';
 export type {
     ClientInfo,

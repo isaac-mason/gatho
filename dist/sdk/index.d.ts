@@ -10,7 +10,7 @@ export type CreateRoomOptions = {
     /** which server to place this room on */
     serverId: string;
     /** arbitrary data delivered to create() hook (immutable after creation).
-     *  keep small — the postgres driver's push notification channel has a ~8000 byte limit. */
+     *  keep it small: it is pushed to the room on every assignment. */
     data: RoomData;
     /** mutable string key/value tags for userland categorization */
     tags: Record<string, string>;

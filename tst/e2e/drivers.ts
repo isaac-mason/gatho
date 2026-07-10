@@ -1,6 +1,6 @@
 // driver setup definitions for e2e tests
 import Redis from 'ioredis';
-import { createMemoryDriver, createPostgresDriver, createRedisDriver } from 'gatho/driver';
+import { createMemoryDriver, createRedisDriver } from 'gatho/driver';
 import type { Driver } from 'gatho/driver';
 
 export type DriverSetup = {
@@ -39,20 +39,4 @@ export const redisDriverSetup: DriverSetup = {
     },
 };
 
-export const postgresDriverSetup: DriverSetup = {
-    name: 'postgres',
-    tags: ['any', 'ha'],
-    create: async () => {
-        const url = process.env.GATHO_TEST_POSTGRES_URL ?? 'postgresql://gatho:gatho@localhost:15432/gatho';
-        const d = await createPostgresDriver({ url });
-        return {
-            driver: d,
-            teardown: async () => {
-                // nothing to clean up — schema is dropped on next create if version changes,
-                // and flushdb equivalent isn't needed since each test gets fresh rooms/servers
-            },
-        };
-    },
-};
-
-export const allDrivers: DriverSetup[] = [memoryDriverSetup, redisDriverSetup, postgresDriverSetup];
+export const allDrivers: DriverSetup[] = [memoryDriverSetup, redisDriverSetup];

@@ -3,6 +3,11 @@
 ## v0.0.1 (Unreleased)
 
 - Initial release!
+- **driver:** the Postgres driver is removed (`createPostgresDriver` and
+  `PostgresDriverOptions` are gone, and the `postgres` dependency is dropped). Its push-based
+  room delivery relied on `LISTEN`/`NOTIFY`, whose payload limits and delivery semantics make
+  it a poor fit for the driver model. Memory and Redis remain; other backends (e.g. an SNS +
+  DynamoDB driver) may be revisited later.
 - **server:** per-room UDS sockets now live at `socketDir/<roomId>/sock` instead of the
   flat `socketDir/<roomId>.sock`. This lets a container runner mount each room only its
   own socket directory, isolating the (unauthenticated) server↔room IPC channel from

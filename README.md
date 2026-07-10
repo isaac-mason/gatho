@@ -50,7 +50,7 @@ A **server** (`gatho/server`) hosts rooms. You run one or more of them, and each
 
 Your backend uses the **SDK** (`gatho/sdk`) to manage rooms. You can create, query, and destroy them, tag them for filtering, and call `join()` to mint a short-lived token URL that you hand to your client. Tags and client data give you enough to build whatever matchmaking logic you need.
 
-The **driver** (`gatho/driver`) is the shared state store that lets multiple server instances coordinate. It can be Redis, Postgres, or in-memory.
+The **driver** (`gatho/driver`) is the shared state store that lets multiple server instances coordinate. It can be Redis or in-memory.
 
 ## Quick Start
 
@@ -159,7 +159,7 @@ room.send(JSON.stringify({ type: 'increment' }));
 
 ## Server
 
-`gatho/server` is the host process for your rooms. When starting a server you tell it how to run different types of rooms, and it takes care of placement, spawning, health tracking, and shutdown. Run multiple instances against the same driver (e.g. Redis, Postgres) for horizontal scale.
+`gatho/server` is the host process for your rooms. When starting a server you tell it how to run different types of rooms, and it takes care of placement, spawning, health tracking, and shutdown. Run multiple instances against the same driver (e.g. Redis) for horizontal scale.
 
 ### Runners
 
@@ -438,4 +438,3 @@ Drivers provide the shared state backend used by the server and SDK.
 
 - `createMemoryDriver()`: useful for local dev, tests, and onebox deployments
 - `createRedisDriver({ url })`: requires Redis
-- `createPostgresDriver({ connectionString })`: requires Postgres (experimental!)

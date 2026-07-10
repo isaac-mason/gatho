@@ -1,6 +1,6 @@
 // e2e tests for driver-level contracts that must hold uniformly across
-// memory/redis/postgres. consolidated into a single file because the
-// redis/postgres test setups share a single backing instance and call
+// memory/redis. consolidated into a single file because the redis test
+// setup shares a single backing instance and calls
 // `flushdb()` between sub-tests; vitest runs files in parallel by default,
 // so spreading these across files causes setup-vs-test races. tests within
 // one file run sequentially, which is what we want here.
@@ -365,8 +365,8 @@ describe.each(drivers)('connectClient upsert contract ($name)', (setup) => {
 
     it('self-heals after the reservation record was lost between reserve and connect', async () => {
         // simulates the eviction race: reservation gets stored, then is wiped
-        // (ttl fired in redis, dropped row in postgres, deleted entry in
-        // memory) before the room's `client-connected` ipc arrives. the room
+        // (ttl fired in redis, deleted entry in memory) before the room's
+        // `client-connected` ipc arrives. the room
         // re-asserts the client identity in the ipc payload — connectClient
         // must reconstitute the record.
         const { driver, teardown } = await setup.create();

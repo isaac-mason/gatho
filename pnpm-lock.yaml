@@ -14,9 +14,6 @@ importers:
       packcat:
         specifier: 0.3.0
         version: 0.3.0
-      postgres:
-        specifier: ^3.4.9
-        version: 3.4.9
       ws:
         specifier: ^8.20.0
         version: 8.20.0
@@ -3188,11 +3185,6 @@ packages:
       picocolors: 1.1.1
       source-map-js: 1.2.1
     dev: true
-
-  /postgres@3.4.9:
-    resolution: {integrity: sha512-GD3qdB0x1z9xgFI6cdRD6xu2Sp2WCOEoe3mtnyB5Ee0XrrL5Pe+e4CCnJrRMnL1zYtRDZmQQVbvOttLnKDLnaw==}
-    engines: {node: '>=12'}
-    dev: false
 
   /proc-log@3.0.0:
     resolution: {integrity: sha512-++Vn7NS4Xf9NacaU9Xq3URUuqZETPsf8L4j5/ckhaRYsfPeRyzGw+iDjFhV/Jr3uNmTvvddEJFWh5R1gRgUH8A==}

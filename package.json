@@ -63,7 +63,6 @@
     "dependencies": {
         "ioredis": "^5.10.1",
         "packcat": "0.3.0",
-        "postgres": "^3.4.9",
         "ws": "^8.20.0"
     },
     "peerDependenciesMeta": {},
