@@ -3,6 +3,20 @@ import { frameUserMessage, packProtocol, PROTOCOL_VERSION, unpackFrame } from '.
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
+// options for send().
+//
+// reliable (default true): ordered, delivered, and buffered while CONNECTING /
+// RECONNECTING — the message is flushed in order once the connection is
+// established.
+//
+// reliable: false — best-effort. the message MAY be dropped and MAY be
+// reordered; it is never buffered or retransmitted, and it drops outright unless
+// the socket is OPEN. keep unreliable payloads small (~1KB). on today's ws
+// transport an unreliable message happens to arrive ordered and intact while the
+// socket stays connected, but that is a property of ws, NOT a promise of this
+// contract — do not rely on it. there is no ordering guarantee BETWEEN the
+// reliable and unreliable channels. webtransport datagrams will map onto this
+// same unreliable contract later.
 export type SendOptions = { reliable?: boolean };
 
 // outbound message — mirrors WebSocket.send() accepted types
