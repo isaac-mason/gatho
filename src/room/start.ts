@@ -1,7 +1,7 @@
 import { jwtVerify } from '../common/jwt';
 import { createLogger, type Logger } from '../common/logger';
 import type { Notifier, ProcessMetricsMessage } from '../common/notify-protocol';
-import { frameUserMessage, packProtocol, unpackFrame } from '../common/protocol';
+import { frameUserMessage, packProtocol, PROTOCOL_VERSION, unpackFrame } from '../common/protocol';
 import type { AuthResult, Client, ClientCollection, Room, SendOptions } from './index';
 import { connectNotify, parseNotifyTarget } from './ipc';
 import type { ClientSocket, Transport, TransportHandlers, TransportServer } from './transport/types';
@@ -430,6 +430,23 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
         async upgrade(query: string) {
             const params = new URLSearchParams(query);
 
+            // protocol version handshake — client and server gatho versions
+            // must match exactly. missing or mismatched `gv` completes the
+            // upgrade anyway (so the client gets a readable auth_error frame
+            // rather than a raw 4xx, same rationale as the invalid-session
+            // path below) then closes 4000 in open()/reconnect().
+            const gvParam = params.get('gv');
+            const clientVersion = gvParam === null ? 'none' : gvParam;
+            if (clientVersion !== String(PROTOCOL_VERSION)) {
+                const versionMismatch = `protocol version mismatch (client ${clientVersion}, server ${PROTOCOL_VERSION})`;
+                // a reconnect carries a session param — thread the marker through
+                // whichever handler the transport will call so the message lands.
+                if (params.get('session')) {
+                    return { clientId: crypto.randomUUID(), reconnecting: true, versionMismatch };
+                }
+                return { clientId: crypto.randomUUID(), versionMismatch };
+            }
+
             // check for session token — reconnection attempt
             const sessionParam = params.get('session');
             if (sessionParam) {
@@ -474,7 +491,15 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             return { clientId: crypto.randomUUID(), joinData: {}, tags: {} };
         },
 
-        open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>) {
+        open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>, versionMismatch?: string) {
+            // reject a protocol-version-mismatched client with a readable error
+            // before doing any auth or state work.
+            if (versionMismatch) {
+                socket.send(packProtocol({ type: 'auth_error', error: versionMismatch }), true);
+                socket.close(4000, 'protocol version mismatch');
+                return;
+            }
+
             socket.subscribe(BROADCAST_TOPIC);
 
             (async () => {
@@ -558,7 +583,15 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             }
         },
 
-        reconnect(clientId: string, socket: ClientSocket) {
+        reconnect(clientId: string, socket: ClientSocket, versionMismatch?: string) {
+            // reject a protocol-version-mismatched client with a readable error
+            // before touching reconnection state.
+            if (versionMismatch) {
+                socket.send(packProtocol({ type: 'auth_error', error: versionMismatch }), true);
+                socket.close(4000, 'protocol version mismatch');
+                return;
+            }
+
             const tracked = state.clients.get(clientId);
             if (!tracked || tracked.socket !== null) {
                 // not a valid reconnection target — close

@@ -1,4 +1,5 @@
 import * as pack from 'packcat';
+export declare const PROTOCOL_VERSION = 1;
 export declare const FRAME_PROTOCOL = 0;
 export declare const FRAME_USER_TEXT = 1;
 export declare const FRAME_USER_BINARY = 2;

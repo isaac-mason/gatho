@@ -10,6 +10,11 @@
 
 import * as pack from 'packcat';
 
+// gatho wire protocol version. client and server versions must match exactly —
+// the room rejects any connect whose `gv` query param is missing or different.
+// bump this on any breaking change to the frame layout or protocol messages.
+export const PROTOCOL_VERSION = 1;
+
 // frame type constants
 export const FRAME_PROTOCOL = 0x00;
 export const FRAME_USER_TEXT = 0x01;

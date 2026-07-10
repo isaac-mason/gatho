@@ -1,4 +1,4 @@
-import { frameUserMessage, packProtocol, unpackFrame } from '../common/protocol';
+import { frameUserMessage, packProtocol, PROTOCOL_VERSION, unpackFrame } from '../common/protocol';
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
@@ -77,10 +77,22 @@ function computeDelay(retryCount: number): number {
     return Math.min(jittered, MAX_DELAY);
 }
 
-// build the reconnect url by appending ?session=<token> or &session=<token>
+// append a query param to a url, choosing ? or & based on what's already there.
+function appendParam(url: string, key: string, value: string): string {
+    const separator = url.includes('?') ? '&' : '?';
+    return `${url}${separator}${key}=${value}`;
+}
+
+// stamp the protocol version onto a connect url. the room rejects any connect
+// whose gv is missing or mismatched, so both initial connect and reconnect
+// carry it.
+function withProtocolVersion(url: string): string {
+    return appendParam(url, 'gv', String(PROTOCOL_VERSION));
+}
+
+// build the reconnect url by appending session + protocol version.
 function buildReconnectUrl(originalUrl: string, sessionToken: string): string {
-    const separator = originalUrl.includes('?') ? '&' : '?';
-    return `${originalUrl}${separator}session=${sessionToken}`;
+    return withProtocolVersion(appendParam(originalUrl, 'session', sessionToken));
 }
 
 // connect to a gatho room. url is the full websocket url with token
@@ -382,7 +394,7 @@ export function connect(url: string): RoomConnection {
 
     // --- create initial websocket ---
 
-    ws = new WebSocket(url);
+    ws = new WebSocket(withProtocolVersion(url));
     wireSocket(ws, false);
 
     // --- return the RoomConnection ---

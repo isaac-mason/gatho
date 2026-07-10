@@ -16,6 +16,11 @@ export type UpgradeResult = {
     // driver-internal tags, forwarded from the jwt so the room can echo them
     // back over ipc when reporting client-connected. opaque to room code.
     tags?: Record<string, string>;
+    // set when the client's protocol version (gv query param) is missing or
+    // doesn't match the server. the upgrade still completes so the client gets
+    // a readable auth_error frame instead of a raw 4xx (same rationale as the
+    // invalid-session path); open()/reconnect() send the message and close 4000.
+    versionMismatch?: string;
 };
 
 export type TransportHandlers = {
@@ -28,16 +33,21 @@ export type TransportHandlers = {
     // called when a new ws connection opens. socket is the opaque handle.
     // joinData is the arbitrary data from sdk.join({ data }), extracted from the jwt.
     // tags is the driver-internal tag bag from the jwt — opaque, forwarded over ipc.
+    // versionMismatch (when set) means the upgrade was completed only to deliver
+    // a readable protocol-version error before closing 4000.
     open(
         clientId: string,
         socket: ClientSocket,
         joinData: Record<string, unknown>,
         tags: Record<string, string>,
+        versionMismatch?: string,
     ): void;
 
     // called when a reconnecting client's ws connection opens.
     // the transport swaps internal maps and calls this instead of open().
-    reconnect(clientId: string, socket: ClientSocket): void;
+    // versionMismatch (when set) means the upgrade was completed only to deliver
+    // a readable protocol-version error before closing 4000.
+    reconnect(clientId: string, socket: ClientSocket, versionMismatch?: string): void;
 
     // called when a message is received from a client.
     message(clientId: string, data: ArrayBuffer, isBinary: boolean): void;

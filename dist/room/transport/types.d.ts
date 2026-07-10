@@ -8,11 +8,12 @@ export type UpgradeResult = {
     reconnecting?: boolean;
     joinData?: Record<string, unknown>;
     tags?: Record<string, string>;
+    versionMismatch?: string;
 };
 export type TransportHandlers = {
     upgrade(query: string): UpgradeResult | null | Promise<UpgradeResult | null>;
-    open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>): void;
-    reconnect(clientId: string, socket: ClientSocket): void;
+    open(clientId: string, socket: ClientSocket, joinData: Record<string, unknown>, tags: Record<string, string>, versionMismatch?: string): void;
+    reconnect(clientId: string, socket: ClientSocket, versionMismatch?: string): void;
     message(clientId: string, data: ArrayBuffer, isBinary: boolean): void;
     close(clientId: string, code: number): void;
 };

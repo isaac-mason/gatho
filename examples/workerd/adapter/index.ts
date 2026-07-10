@@ -261,9 +261,9 @@ class WorkerdRoom {
         };
 
         if (reconnecting) {
-            handlers.reconnect(clientId, socket);
+            handlers.reconnect(clientId, socket, result.versionMismatch);
         } else {
-            handlers.open(clientId, socket, result.joinData ?? {}, tags);
+            handlers.open(clientId, socket, result.joinData ?? {}, tags, result.versionMismatch);
         }
 
         conn.ws.addEventListener('message', (e) => {

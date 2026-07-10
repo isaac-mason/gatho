@@ -2063,6 +2063,10 @@ createLogger();
 //
 // protocol messages use packcat for the payload after the type byte.
 // user messages pass through with minimal overhead (1 byte prefix).
+// gatho wire protocol version. client and server versions must match exactly —
+// the room rejects any connect whose `gv` query param is missing or different.
+// bump this on any breaking change to the frame layout or protocol messages.
+const PROTOCOL_VERSION = 1;
 // frame type constants
 const FRAME_PROTOCOL = 0x00;
 const FRAME_USER_TEXT = 0x01;
@@ -2279,7 +2283,7 @@ function wsTransport(config) {
                     });
                 });
                 function completeUpgrade(req, socket, head, result) {
-                    const { clientId, reconnecting } = result;
+                    const { clientId, reconnecting, versionMismatch } = result;
                     const joinData = result.joinData ?? {};
                     const tags = result.tags ?? {};
                     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -2329,10 +2333,10 @@ function wsTransport(config) {
                             },
                         };
                         if (reconnecting) {
-                            handlers.reconnect(clientId, wsSocket);
+                            handlers.reconnect(clientId, wsSocket, versionMismatch);
                         }
                         else {
-                            handlers.open(clientId, wsSocket, joinData, tags);
+                            handlers.open(clientId, wsSocket, joinData, tags, versionMismatch);
                         }
                         ws.on('message', (data, isBinary) => {
                             // normalize to arraybuffer — consistent with transport interface.
@@ -2625,6 +2629,22 @@ function startRoom(state, transport, options) {
     const handlers = {
         async upgrade(query) {
             const params = new URLSearchParams(query);
+            // protocol version handshake — client and server gatho versions
+            // must match exactly. missing or mismatched `gv` completes the
+            // upgrade anyway (so the client gets a readable auth_error frame
+            // rather than a raw 4xx, same rationale as the invalid-session
+            // path below) then closes 4000 in open()/reconnect().
+            const gvParam = params.get('gv');
+            const clientVersion = gvParam === null ? 'none' : gvParam;
+            if (clientVersion !== String(PROTOCOL_VERSION)) {
+                const versionMismatch = `protocol version mismatch (client ${clientVersion}, server ${PROTOCOL_VERSION})`;
+                // a reconnect carries a session param — thread the marker through
+                // whichever handler the transport will call so the message lands.
+                if (params.get('session')) {
+                    return { clientId: crypto.randomUUID(), reconnecting: true, versionMismatch };
+                }
+                return { clientId: crypto.randomUUID(), versionMismatch };
+            }
             // check for session token — reconnection attempt
             const sessionParam = params.get('session');
             if (sessionParam) {
@@ -2665,7 +2685,14 @@ function startRoom(state, transport, options) {
             // dev mode — no jwt verification, generate identity
             return { clientId: crypto.randomUUID(), joinData: {}, tags: {} };
         },
-        open(clientId, socket, joinData, tags) {
+        open(clientId, socket, joinData, tags, versionMismatch) {
+            // reject a protocol-version-mismatched client with a readable error
+            // before doing any auth or state work.
+            if (versionMismatch) {
+                socket.send(packProtocol({ type: 'auth_error', error: versionMismatch }), true);
+                socket.close(4000, 'protocol version mismatch');
+                return;
+            }
             socket.subscribe(BROADCAST_TOPIC);
             (async () => {
                 let result;
@@ -2734,7 +2761,14 @@ function startRoom(state, transport, options) {
                 }
             }
         },
-        reconnect(clientId, socket) {
+        reconnect(clientId, socket, versionMismatch) {
+            // reject a protocol-version-mismatched client with a readable error
+            // before touching reconnection state.
+            if (versionMismatch) {
+                socket.send(packProtocol({ type: 'auth_error', error: versionMismatch }), true);
+                socket.close(4000, 'protocol version mismatch');
+                return;
+            }
             const tracked = state.clients.get(clientId);
             if (!tracked || tracked.socket !== null) {
                 // not a valid reconnection target — close

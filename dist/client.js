@@ -1767,6 +1767,10 @@ function writeString(ctx, value, offset = 'o') {
 //
 // protocol messages use packcat for the payload after the type byte.
 // user messages pass through with minimal overhead (1 byte prefix).
+// gatho wire protocol version. client and server versions must match exactly —
+// the room rejects any connect whose `gv` query param is missing or different.
+// bump this on any breaking change to the frame layout or protocol messages.
+const PROTOCOL_VERSION = 1;
 // frame type constants
 const FRAME_PROTOCOL = 0x00;
 const FRAME_USER_TEXT = 0x01;
@@ -1863,10 +1867,20 @@ function computeDelay(retryCount) {
     const jittered = base * (0.5 + Math.random());
     return Math.min(jittered, MAX_DELAY);
 }
-// build the reconnect url by appending ?session=<token> or &session=<token>
+// append a query param to a url, choosing ? or & based on what's already there.
+function appendParam(url, key, value) {
+    const separator = url.includes('?') ? '&' : '?';
+    return `${url}${separator}${key}=${value}`;
+}
+// stamp the protocol version onto a connect url. the room rejects any connect
+// whose gv is missing or mismatched, so both initial connect and reconnect
+// carry it.
+function withProtocolVersion(url) {
+    return appendParam(url, 'gv', String(PROTOCOL_VERSION));
+}
+// build the reconnect url by appending session + protocol version.
 function buildReconnectUrl(originalUrl, sessionToken) {
-    const separator = originalUrl.includes('?') ? '&' : '?';
-    return `${originalUrl}${separator}session=${sessionToken}`;
+    return withProtocolVersion(appendParam(originalUrl, 'session', sessionToken));
 }
 // connect to a gatho room. url is the full websocket url with token
 // baked in as a query param, e.g. "ws://localhost:9001?token=..."
@@ -2120,7 +2134,7 @@ function connect(url) {
         }, delay);
     }
     // --- create initial websocket ---
-    ws = new WebSocket(url);
+    ws = new WebSocket(withProtocolVersion(url));
     wireSocket(ws, false);
     // --- return the RoomConnection ---
     return {

@@ -85,7 +85,7 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                     head: Buffer,
                     result: UpgradeResultResolved,
                 ): void {
-                    const { clientId, reconnecting } = result;
+                    const { clientId, reconnecting, versionMismatch } = result;
                     const joinData = result.joinData ?? {};
                     const tags = result.tags ?? {};
 
@@ -139,9 +139,9 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                         };
 
                         if (reconnecting) {
-                            handlers.reconnect(clientId, wsSocket);
+                            handlers.reconnect(clientId, wsSocket, versionMismatch);
                         } else {
-                            handlers.open(clientId, wsSocket, joinData, tags);
+                            handlers.open(clientId, wsSocket, joinData, tags, versionMismatch);
                         }
 
                         ws.on('message', (data: Buffer | ArrayBuffer | Buffer[], isBinary: boolean) => {
