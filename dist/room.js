@@ -2075,6 +2075,9 @@ const FRAME_USER_BINARY = 0x02;
 const Session = object({
     type: literal('session'),
     token: string(),
+    // the client's own id, assigned by the room. lets the browser client learn
+    // its identity without the app plumbing it through by hand.
+    clientId: string(),
 });
 const AuthError = object({
     type: literal('auth_error'),
@@ -2727,7 +2730,7 @@ function startRoom(state, transport, options) {
                 };
                 state.clients.set(clientId, tracked);
                 // send session token to client
-                socket.send(packProtocol({ type: 'session', token: sessionToken }), true);
+                socket.send(packProtocol({ type: 'session', token: sessionToken, clientId }), true);
                 // notify server for driver bookkeeping (managed mode only).
                 // forward roomId + tags so driver.connectClient can perform a
                 // full upsert — covers the case where the driver's client
@@ -2797,7 +2800,7 @@ function startRoom(state, transport, options) {
             tracked.reliableBuffer.length = 0;
             tracked.reliableBufferBytes = 0;
             // send new session token — this is the "reconnection handshake complete" signal
-            socket.send(packProtocol({ type: 'session', token: newToken }), true);
+            socket.send(packProtocol({ type: 'session', token: newToken, clientId }), true);
             // fire onReconnect
             if (options.onReconnect) {
                 safeCall(state.log, 'onReconnect', () => options.onReconnect(room, createClient(tracked)));

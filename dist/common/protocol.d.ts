@@ -16,6 +16,9 @@ declare const ProtocolMessage: {
             token: {
                 type: "string";
             };
+            clientId: {
+                type: "string";
+            };
         };
     }, {
         type: "object";

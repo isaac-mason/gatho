@@ -540,7 +540,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                 state.clients.set(clientId, tracked);
 
                 // send session token to client
-                socket.send(packProtocol({ type: 'session', token: sessionToken }), true);
+                socket.send(packProtocol({ type: 'session', token: sessionToken, clientId }), true);
 
                 // notify server for driver bookkeeping (managed mode only).
                 // forward roomId + tags so driver.connectClient can perform a
@@ -626,7 +626,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
             tracked.reliableBufferBytes = 0;
 
             // send new session token — this is the "reconnection handshake complete" signal
-            socket.send(packProtocol({ type: 'session', token: newToken }), true);
+            socket.send(packProtocol({ type: 'session', token: newToken, clientId }), true);
 
             // fire onReconnect
             if (options.onReconnect) {

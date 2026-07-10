@@ -1779,6 +1779,9 @@ const FRAME_USER_BINARY = 0x02;
 const Session = object({
     type: literal('session'),
     token: string(),
+    // the client's own id, assigned by the room. lets the browser client learn
+    // its identity without the app plumbing it through by hand.
+    clientId: string(),
 });
 const AuthError = object({
     type: literal('auth_error'),
@@ -1890,6 +1893,8 @@ function connect(url) {
     let state = 'connecting';
     let ws = null;
     let sessionToken = null;
+    // this client's id, learned from the first `session` protocol message.
+    let clientId = null;
     let retryCount = 0;
     let uptimeTimer = null;
     let backoffTimer = null;
@@ -2029,6 +2034,7 @@ function connect(url) {
                 const msg = frame.message;
                 if (msg.type === 'session') {
                     sessionToken = msg.token;
+                    clientId = msg.clientId;
                     if (isReconnect && state === 'reconnecting') {
                         // reconnection confirmed — server accepted our session
                         state = 'open';
@@ -2140,6 +2146,9 @@ function connect(url) {
     return {
         get state() {
             return state;
+        },
+        get clientId() {
+            return clientId;
         },
         send(message, options) {
             const reliable = options?.reliable !== false;

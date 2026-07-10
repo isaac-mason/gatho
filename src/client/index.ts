@@ -19,6 +19,10 @@ export type RoomConnection = {
     // current connection state
     readonly state: ConnectionState;
 
+    // this client's id, assigned by the room. null until the first `session`
+    // protocol message arrives (i.e. until the connection is authenticated).
+    readonly clientId: string | null;
+
     // send a message to the server.
     // if message is Uint8Array or ArrayBuffer, sends as binary, otherwise JSON-serialized.
     // reliable (default true): buffers during RECONNECTING and flushes on reconnect.
@@ -103,6 +107,8 @@ export function connect(url: string): RoomConnection {
     let state: ConnectionState = 'connecting';
     let ws: WebSocket | null = null;
     let sessionToken: string | null = null;
+    // this client's id, learned from the first `session` protocol message.
+    let clientId: string | null = null;
     let retryCount = 0;
     let uptimeTimer: ReturnType<typeof setTimeout> | null = null;
     let backoffTimer: ReturnType<typeof setTimeout> | null = null;
@@ -265,6 +271,7 @@ export function connect(url: string): RoomConnection {
 
                 if (msg.type === 'session') {
                     sessionToken = msg.token;
+                    clientId = msg.clientId;
 
                     if (isReconnect && state === 'reconnecting') {
                         // reconnection confirmed — server accepted our session
@@ -402,6 +409,10 @@ export function connect(url: string): RoomConnection {
     return {
         get state(): ConnectionState {
             return state;
+        },
+
+        get clientId(): string | null {
+            return clientId;
         },
 
         send(message: SendMessage, options?: SendOptions): void {

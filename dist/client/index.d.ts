@@ -6,6 +6,7 @@ export type SendMessage = string | ArrayBuffer | ArrayBufferView | Blob;
 export type ReceiveMessage = string | ArrayBuffer;
 export type RoomConnection = {
     readonly state: ConnectionState;
+    readonly clientId: string | null;
     send(message: SendMessage, options?: SendOptions): void;
     on(event: 'open', callback: () => void): () => void;
     on(event: 'message', callback: (message: ReceiveMessage) => void): () => void;

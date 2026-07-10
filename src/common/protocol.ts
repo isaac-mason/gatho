@@ -24,6 +24,9 @@ export const FRAME_USER_BINARY = 0x02;
 const Session = pack.object({
     type: pack.literal('session'),
     token: pack.string(),
+    // the client's own id, assigned by the room. lets the browser client learn
+    // its identity without the app plumbing it through by hand.
+    clientId: pack.string(),
 });
 
 const AuthError = pack.object({
