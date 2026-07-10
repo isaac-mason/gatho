@@ -81,6 +81,10 @@ type RoomProcess = {
     roomId: string;
     roomType: string;
     roomSecret: string;
+    // the immutable creation-time data bag. retained (not dropped after spawn) so
+    // reap-recovery can re-register the room's driver record after the record was
+    // reaped out from under a still-alive server.
+    data: RoomData;
     endpoint: string | null;
     status(): 'starting' | 'ready' | 'stopped';
     kill(): void;
@@ -345,6 +349,7 @@ async function createRoom(s: ServerState, roomId: string, roomType: string, data
         roomId,
         roomType,
         roomSecret,
+        data,
         endpoint: null,
         status: () => status,
         kill: () => {},
@@ -519,20 +524,68 @@ async function heartbeatTick(s: ServerState, adminEndpoint: string, isCurrent: (
         return;
     }
 
-    if (result.registered && s.previouslyRegistered) {
-        log.warn('restored missing server entry — record was reaped while alive', {
-            serverId: s.serverId,
-            tags: s.serverTags,
-        });
-    }
     s.serverTags = result.tags;
     s.lastDriverHeartbeatAt = Date.now();
-    s.previouslyRegistered = true;
 
     checkHeartbeats(s);
 
     const desiredIds = new Set(result.desiredRooms.map((r) => r.roomId));
+
+    // reap-recovery: our server record was reaped (e.g. a driver blip stalled our
+    // heartbeats past the staleness threshold) while we were still alive and
+    // running rooms. this heartbeat re-created the record (registered: true) but
+    // it comes back with an EMPTY desired-set — reaping the server also deleted
+    // its room records. without intervention the destroy sweep below would kill
+    // every healthy, client-occupied room. instead, re-assert our still-running
+    // local rooms into the driver BEFORE the sweep so they survive.
+    const reasserted = new Set<string>();
+    if (result.registered && s.previouslyRegistered) {
+        const restoredRoomIds: string[] = [];
+        for (const proc of s.processes.values()) {
+            // only re-assert rooms that are actually ready and NOT already in the
+            // driver's desired set. a room still present in desiredRooms doesn't
+            // need re-asserting (its record survived). checking desiredRooms also
+            // guards against fighting a deliberate destroy: if an sdk destroyed a
+            // room during the outage, registerRoom would recreate it — but a
+            // destroyed room won't be in our processes-with-ready-status set for
+            // long, and more importantly we accept the tradeoff that a deliberate
+            // sdk destroy landing DURING the outage gets re-asserted here and then
+            // re-destroyed on the next reconcile after the sdk retries. that window
+            // is bounded by one heartbeat interval and never resurrects a room the
+            // sdk has finished tearing down before the reap.
+            if (proc.status() !== 'ready') continue;
+            if (desiredIds.has(proc.roomId)) continue;
+            if (!proc.endpoint) continue;
+
+            // note: room tags from the original sdk.createRoom are NOT persisted
+            // on the RoomProcess, so they cannot be restored here — re-register
+            // with empty tags. building tag persistence is out of scope; we warn.
+            try {
+                await s.driver.registerRoom(proc.roomId, proc.roomType, s.serverId, proc.data, {});
+                await s.driver.roomReady(proc.roomId, proc.endpoint, proc.roomSecret);
+                reasserted.add(proc.roomId);
+                restoredRoomIds.push(proc.roomId);
+            } catch (err) {
+                log.error('failed to re-assert room after server reap', { roomId: proc.roomId, err });
+            }
+        }
+
+        log.warn('restored missing server entry — record was reaped while alive', {
+            serverId: s.serverId,
+            tags: s.serverTags,
+            restoredRoomIds,
+            note: 'room tags from the original createRoom were NOT restored (not persisted on the server)',
+        });
+    }
+
+    s.previouslyRegistered = true;
+
+    // destroy sweep: kill any local room no longer wanted by the driver. skip the
+    // rooms we just re-asserted this tick — the heartbeat's desired-set predates
+    // our re-registration and would otherwise cause us to destroy exactly the
+    // rooms we just restored.
     for (const roomId of s.processes.keys()) {
+        if (reasserted.has(roomId)) continue;
         if (!desiredIds.has(roomId)) {
             destroyWorker(s, roomId);
         }
@@ -868,4 +921,79 @@ export async function start(options: CreateServerOptions): Promise<Server> {
         getRoomDetails: (roomId) => getRoomDetails(s, roomId),
         getAllRoomDetails: () => getAllRoomDetails(s),
     };
+}
+
+/* test-only surface */
+
+// a stripped-down local room used to drive heartbeatTick in isolation. the reap-
+// recovery test needs a room with a ready status, an endpoint, and a spy on kill()
+// without spinning up a real runner/subprocess.
+export type TestRoom = {
+    roomId: string;
+    roomType: string;
+    roomSecret: string;
+    data: RoomData;
+    endpoint: string | null;
+    status: 'starting' | 'ready' | 'stopped';
+};
+
+// run a single heartbeatTick against a driver with the given local rooms already
+// running. used by unit tests to assert the reap-recovery ordering (re-assert
+// before destroy) deterministically, without the interval-driven loop. returns
+// which rooms had kill() invoked so tests can assert nothing was destroyed.
+export async function __heartbeatTickForTest(args: {
+    driver: Driver['_internal'];
+    serverId: string;
+    endpoint: string;
+    rooms: TestRoom[];
+    previouslyRegistered: boolean;
+}): Promise<{ killed: string[] }> {
+    const killed: string[] = [];
+    const processes = new Map<string, RoomProcess>();
+    for (const r of args.rooms) {
+        processes.set(r.roomId, {
+            roomId: r.roomId,
+            roomType: r.roomType,
+            roomSecret: r.roomSecret,
+            data: r.data,
+            endpoint: r.endpoint,
+            status: () => r.status,
+            kill: () => killed.push(r.roomId),
+            exited: Promise.resolve(),
+            markExited: () => {},
+        });
+    }
+
+    const s: ServerState = {
+        options: {
+            rooms: {},
+            roomEndpoint: ({ port }) => `ws://localhost:${port}`,
+            driver: { _internal: args.driver },
+        },
+        driver: args.driver,
+        runners: new Map(),
+        port: 0,
+        host: '127.0.0.1',
+        serverId: args.serverId,
+        knownRoomTypes: new Set(),
+        processes,
+        lastHeartbeats: new Map(),
+        killedRoomIds: new Set(),
+        spawning: new Set(),
+        alive: true,
+        openSockets: new Set(),
+        unsubscribeRoomAssignments: null,
+        isLeader: false,
+        leaderPunctuator: null,
+        httpServer: null,
+        currentAddress: null,
+        heartbeatPunctuator: null,
+        serverTags: {},
+        lastDriverHeartbeatAt: Date.now(),
+        previouslyRegistered: args.previouslyRegistered,
+    };
+
+    await heartbeatTick(s, args.endpoint, () => true);
+
+    return { killed };
 }
