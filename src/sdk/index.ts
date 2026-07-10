@@ -25,11 +25,13 @@ export type CreateRoomOptions = {
     serverId: string;
 
     /** arbitrary data delivered to create() hook (immutable after creation).
-     *  keep it small: it is pushed to the room on every assignment. */
-    data: RoomData;
+     *  keep it small: it is pushed to the room on every assignment.
+     *  optional — defaults to `{}`. */
+    data?: RoomData;
 
-    /** mutable string key/value tags for userland categorization */
-    tags: Record<string, string>;
+    /** mutable string key/value tags for userland categorization.
+     *  optional — defaults to `{}`. */
+    tags?: Record<string, string>;
 
     /** how long to wait for the room to become running (ms, default 10000).
      *
@@ -50,8 +52,8 @@ export type JoinOptions = {
     /** id of the room to join */
     roomId: string;
 
-    /** how long until the reservation expires (ms) */
-    ttl: number;
+    /** how long until the reservation expires (ms). optional — defaults to 30000. */
+    ttl?: number;
 
     /** arbitrary data included in the jwt and delivered to onAuth as joinData.
      *  keep small — the jwt travels in a url query param (~2-3KB practical limit). */
@@ -122,7 +124,7 @@ export function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK {
         // the room even exists, so there's zero chance of missing the ready event
         const waitPromise = driver.waitForRoom(roomId, timeoutMs);
 
-        await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data, opts.tags);
+        await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data ?? {}, opts.tags ?? {});
 
         const info = await waitPromise.catch(async (err) => {
             await driver.unregisterRoom(roomId).catch(() => {});
@@ -136,8 +138,11 @@ export function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK {
         await driver.unregisterRoom(roomId);
     }
 
+    // default reservation ttl: 30s.
+    const DEFAULT_JOIN_TTL_MS = 30_000;
+
     async function join(opts: JoinOptions): Promise<ClientReservation> {
-        return driver.reserveClient(opts.roomId, opts.ttl, opts.data, opts.tags);
+        return driver.reserveClient(opts.roomId, opts.ttl ?? DEFAULT_JOIN_TTL_MS, opts.data, opts.tags);
     }
 
     async function getRoom(roomId: string): Promise<RoomInfo | null> {

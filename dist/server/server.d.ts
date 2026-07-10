@@ -40,7 +40,6 @@ export type CreateServerOptions = {
 export type RoomDetails = {
     roomId: string;
     roomType: string;
-    workerRunning: boolean;
     endpoint: string | null;
     /** the room's lifecycle as the server observes it */
     status: 'starting' | 'ready' | 'stopped';

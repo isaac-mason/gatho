@@ -11,7 +11,7 @@ function createGathoSDK(options) {
         // start waiting before registering — the listener is in place before
         // the room even exists, so there's zero chance of missing the ready event
         const waitPromise = driver.waitForRoom(roomId, timeoutMs);
-        await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data, opts.tags);
+        await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data ?? {}, opts.tags ?? {});
         const info = await waitPromise.catch(async (err) => {
             await driver.unregisterRoom(roomId).catch(() => { });
             throw err;
@@ -21,8 +21,10 @@ function createGathoSDK(options) {
     async function destroyRoom(roomId) {
         await driver.unregisterRoom(roomId);
     }
+    // default reservation ttl: 30s.
+    const DEFAULT_JOIN_TTL_MS = 30_000;
     async function join(opts) {
-        return driver.reserveClient(opts.roomId, opts.ttl, opts.data, opts.tags);
+        return driver.reserveClient(opts.roomId, opts.ttl ?? DEFAULT_JOIN_TTL_MS, opts.data, opts.tags);
     }
     async function getRoom(roomId) {
         return driver.getRoomInfo(roomId);

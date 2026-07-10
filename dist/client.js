@@ -1,3 +1,13 @@
+// --- close codes ---
+// websocket close codes that gatho uses to distinguish disconnect reasons.
+// lives in common/ so both the client and the room can share the constant
+// without the client importing gatho/room. gatho/room re-exports it unchanged.
+// 4000 (CONSENTED) = the client explicitly called close() — sent __leave first.
+// everything else fires onDrop, giving the room code a chance to call allowReconnection.
+const CloseCode = {
+    CONSENTED: 4000,
+};
+
 /* lightweight helpers that just return objects */
 /**
  * Boolean schema - stores true/false values using 1 byte.
@@ -1974,7 +1984,7 @@ function connect(url) {
     function sendLeaveAndClose(socket) {
         if (socket.readyState === WebSocket.OPEN) {
             socket.send(packProtocol({ type: 'leave' }));
-            socket.close(4000, 'consented leave');
+            socket.close(CloseCode.CONSENTED, 'consented leave');
         }
         else {
             socket.close();
@@ -2079,7 +2089,7 @@ function connect(url) {
                     if (isReconnect && state === 'reconnecting') {
                         // server rejected our session — give up permanently
                         socket.close();
-                        enterClosed(4000, 'session rejected', 'session');
+                        enterClosed(CloseCode.CONSENTED, 'session rejected', 'session');
                         return;
                     }
                     // initial connection auth error. open was never emitted
@@ -2129,7 +2139,7 @@ function connect(url) {
                 return;
             }
             // state === 'open'
-            if (event.code === 4000) {
+            if (event.code === CloseCode.CONSENTED) {
                 // a 4000 close on a live connection. if the app called close()
                 // this is a consented departure; otherwise the server closed us
                 // (e.g. eviction, kick) — those read as 'server'.
@@ -2248,7 +2258,7 @@ function connect(url) {
                     ws.onopen = null;
                     ws.close();
                 }
-                enterClosed(4000, 'client closed during reconnection', 'consented');
+                enterClosed(CloseCode.CONSENTED, 'client closed during reconnection', 'consented');
                 return;
             }
             if (state === 'connecting' && ws) {
@@ -2257,7 +2267,7 @@ function connect(url) {
                 ws.onmessage = null;
                 ws.onopen = null;
                 ws.close();
-                enterClosed(4000, 'client closed during connect', 'consented');
+                enterClosed(CloseCode.CONSENTED, 'client closed during connect', 'consented');
                 return;
             }
         },

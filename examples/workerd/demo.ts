@@ -81,8 +81,8 @@ async function main(): Promise<void> {
         // --- two room types, created concurrently => two isolates, one workerd ---
         log('creating an echo room AND a cursor room concurrently...');
         const [echoRoom, cursorRoom] = await Promise.all([
-            gatho.createRoom({ type: 'echo', serverId: server.serverId, data: {}, tags: {}, timeoutMs: CREATE_TIMEOUT_MS }),
-            gatho.createRoom({ type: 'cursor', serverId: server.serverId, data: {}, tags: {}, timeoutMs: CREATE_TIMEOUT_MS }),
+            gatho.createRoom({ type: 'echo', serverId: server.serverId, timeoutMs: CREATE_TIMEOUT_MS }),
+            gatho.createRoom({ type: 'cursor', serverId: server.serverId, timeoutMs: CREATE_TIMEOUT_MS }),
         ]);
         log(`  echo   room ready: ${echoRoom.roomId}`);
         log(`  cursor room ready: ${cursorRoom.roomId}`);

@@ -45,7 +45,7 @@ const gatho = createGathoSDK({ driver });
 const MAX_PER_ROOM = 32;
 
 const newRoom = () =>
-    gatho.createRoom({ type: 'landing', serverId: server.serverId, data: {}, tags: { name: 'landing' } });
+    gatho.createRoom({ type: 'landing', serverId: server.serverId, tags: { name: 'landing' } });
 
 const landingRooms = () => gatho.getRooms({ type: 'landing', status: 'running' });
 
@@ -55,7 +55,7 @@ async function doMatchmake(): Promise<{ url: string; roomId: string }> {
         .filter((r) => r.clients.length < MAX_PER_ROOM)
         .sort((a, b) => b.clients.length - a.clients.length)[0];
     const roomId = open ? open.roomId : (await newRoom()).roomId;
-    const reservation = await gatho.join({ roomId, ttl: 60_000, data: {} });
+    const reservation = await gatho.join({ roomId, ttl: 60_000 });
     return { url: reservation.url, roomId: reservation.roomId };
 }
 

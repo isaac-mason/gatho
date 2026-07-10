@@ -2993,7 +2993,6 @@ function getRoomDetails(s, roomId) {
     return {
         roomId,
         roomType: roomProcess.roomType,
-        workerRunning: true,
         endpoint: roomProcess.endpoint,
         status: roomProcess.status(),
         lastHeartbeatAt: s.lastHeartbeats.get(roomId) ?? null,
@@ -3005,7 +3004,6 @@ function getAllRoomDetails(s) {
         details.push({
             roomId: roomProcess.roomId,
             roomType: roomProcess.roomType,
-            workerRunning: true,
             endpoint: roomProcess.endpoint,
             status: roomProcess.status(),
             lastHeartbeatAt: s.lastHeartbeats.get(roomProcess.roomId) ?? null,

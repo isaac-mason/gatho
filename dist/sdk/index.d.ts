@@ -10,10 +10,12 @@ export type CreateRoomOptions = {
     /** which server to place this room on */
     serverId: string;
     /** arbitrary data delivered to create() hook (immutable after creation).
-     *  keep it small: it is pushed to the room on every assignment. */
-    data: RoomData;
-    /** mutable string key/value tags for userland categorization */
-    tags: Record<string, string>;
+     *  keep it small: it is pushed to the room on every assignment.
+     *  optional — defaults to `{}`. */
+    data?: RoomData;
+    /** mutable string key/value tags for userland categorization.
+     *  optional — defaults to `{}`. */
+    tags?: Record<string, string>;
     /** how long to wait for the room to become running (ms, default 10000).
      *
      *  this is a client-side backstop only. spawn failures (bad argv, missing
@@ -31,8 +33,8 @@ export type CreateRoomOptions = {
 export type JoinOptions = {
     /** id of the room to join */
     roomId: string;
-    /** how long until the reservation expires (ms) */
-    ttl: number;
+    /** how long until the reservation expires (ms). optional — defaults to 30000. */
+    ttl?: number;
     /** arbitrary data included in the jwt and delivered to onAuth as joinData.
      *  keep small — the jwt travels in a url query param (~2-3KB practical limit). */
     data?: Record<string, unknown>;

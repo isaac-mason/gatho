@@ -66,7 +66,6 @@ const apiServer = Bun.serve({
                 const room = await gatho.createRoom({
                     type: 'chat',
                     serverId: server.serverId,
-                    data: {},
                     tags: { name },
                 });
 

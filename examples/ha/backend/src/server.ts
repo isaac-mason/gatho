@@ -65,8 +65,6 @@ const server = Bun.serve({
                 const room = await gatho.createRoom({
                     type: 'ping',
                     serverId: target.serverId,
-                    data: {},
-                    tags: {},
                 });
 
                 // join the room as the creator

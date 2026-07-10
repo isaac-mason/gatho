@@ -121,15 +121,12 @@ if (servers.length === 0) {
 const room = await gatho.createRoom({
     type: 'counter',
     serverId: servers[0].serverId,
-    data: {
-        /* any custom data you want to start the room with */
-    },
-    tags: {
-        /* any tags you want to give the room */
-    },
+    // data and tags are optional (default {}) — pass them to seed the room's
+    // create() data or to categorize the room for later filtering.
 });
 
-const seat = await gatho.join({ roomId: room.roomId, ttl: 30_000 });
+// ttl is optional too (default 30000ms) — how long the reservation stays valid.
+const seat = await gatho.join({ roomId: room.roomId });
 
 console.log(seat.url);
 ```
@@ -418,7 +415,7 @@ console.log('unpacked client message:', unpackedClientMessage.movement);
 
 On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
 
-**Outbound backpressure.** A connected but stalled consumer — one that can't drain broadcasts and sends as fast as the room produces them — would otherwise accumulate unbounded outbound buffer in the room process, a memory DoS a single bad peer can trigger. The room caps each live socket's unflushed outbound buffer at `maxOutboundBufferBytes` (default 4MB). A socket past the cap is treated as a stalled consumer and evicted (closed 4000, `onLeave` fires); the terminal close means it won't auto-reconnect straight back into the same pressure. The cap is enforced on every `room.send` and swept every heartbeat interval (~3s), so a peer that only receives broadcasts is caught too. Transports that can't observe their outbound buffer report 0 and are never evicted for pressure.
+**Outbound backpressure.** Gatho exposes each socket's unflushed outbound buffer at the transport layer but ships no automatic eviction policy — bursty payloads (a voxel world sync) must not be killed by a threshold gatho guessed at, so the pacing and eviction decisions are yours. A full guide to pacing large sends and building your own stall policy is coming.
 
 ```ts
 import { auth, start } from 'gatho/room';
