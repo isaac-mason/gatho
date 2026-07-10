@@ -8,7 +8,7 @@
 // Proves: two room types => two isolates in ONE workerd process; ws round-trip
 // (echo to sender + broadcast to all); notify channel (ready/heartbeat over tcp).
 
-import { connect, type RoomConnection } from 'gatho/client';
+import { connect, type ConnectHandlers, type RoomConnection } from 'gatho/client';
 import { createMemoryDriver } from 'gatho/driver';
 import { createGathoSDK } from 'gatho/sdk';
 import { start } from 'gatho/server';
@@ -25,36 +25,52 @@ function log(msg: string): void {
     process.stdout.write(`  ${msg}\n`);
 }
 
+// the single-handler client owns one message/open slot; this test harness needs
+// to swap what listens as it walks through phases. wrap each connection in a
+// mutable handler bag the helpers below retarget.
+type DemoClient = {
+    conn: RoomConnection;
+    handlers: ConnectHandlers;
+};
+
+function openClient(url: string): DemoClient {
+    const handlers: ConnectHandlers = {};
+    const conn = connect(url, {
+        onOpen: () => handlers.onOpen?.(),
+        onMessage: (m) => handlers.onMessage?.(m),
+        onAuthError: (e) => handlers.onAuthError?.(e),
+    });
+    return { conn, handlers };
+}
+
 // resolve when `predicate` has seen the messages it wants, or reject on timeout.
-function collect(conn: RoomConnection, predicate: (msgs: string[]) => boolean, label: string, timeoutMs = 10_000): Promise<string[]> {
+function collect(client: DemoClient, predicate: (msgs: string[]) => boolean, label: string, timeoutMs = 10_000): Promise<string[]> {
     return new Promise((res, rej) => {
         const msgs: string[] = [];
         const timer = setTimeout(() => {
-            off();
+            client.handlers.onMessage = undefined;
             rej(new Error(`timeout waiting for: ${label} (got ${JSON.stringify(msgs)})`));
         }, timeoutMs);
-        const onMsg = (m: string | ArrayBuffer) => {
+        client.handlers.onMessage = (m: string | ArrayBuffer) => {
             if (typeof m !== 'string') return;
             msgs.push(m);
             if (predicate(msgs)) {
                 clearTimeout(timer);
-                off();
+                client.handlers.onMessage = undefined;
                 res(msgs);
             }
         };
-        const off = () => conn.off('message', onMsg);
-        conn.on('message', onMsg);
     });
 }
 
-function opened(conn: RoomConnection, timeoutMs = 10_000): Promise<void> {
+function opened(client: DemoClient, timeoutMs = 10_000): Promise<void> {
     return new Promise((res, rej) => {
-        if (conn.state === 'open') return res();
+        if (client.conn.state === 'open') return res();
         const timer = setTimeout(() => rej(new Error('timeout waiting for ws open')), timeoutMs);
-        conn.on('open', () => {
+        client.handlers.onOpen = () => {
             clearTimeout(timer);
             res();
-        });
+        };
     });
 }
 
@@ -93,8 +109,8 @@ async function main(): Promise<void> {
         const bobSeat = await gatho.join({ roomId: echoRoom.roomId, ttl: 60_000, data: { name: 'bob' } });
         log(`  alice url: ${aliceSeat.url}`);
 
-        const alice = connect(aliceSeat.url);
-        const bob = connect(bobSeat.url);
+        const alice = openClient(aliceSeat.url);
+        const bob = openClient(bobSeat.url);
         await Promise.all([opened(alice), opened(bob)]);
         log('  both clients connected');
 
@@ -103,7 +119,7 @@ async function main(): Promise<void> {
         const bobGot = collect(bob, (m) => m.some((x) => x.includes('"broadcast"') && x.includes('hello-workerd')), 'bob: broadcast');
 
         log('  alice sends "hello-workerd"');
-        alice.send('hello-workerd');
+        alice.conn.send('hello-workerd');
 
         const aliceMsgs = await aliceGot;
         const bobMsgs = await bobGot;
@@ -114,18 +130,18 @@ async function main(): Promise<void> {
         // --- cursor room: prove the second isolate is live and independent ---
         log('joining cursor room and moving a cursor...');
         const carolSeat = await gatho.join({ roomId: cursorRoom.roomId, ttl: 60_000, data: { name: 'carol' } });
-        const carol = connect(carolSeat.url);
+        const carol = openClient(carolSeat.url);
         await opened(carol);
         const carolGot = collect(carol, (m) => m.some((x) => x.includes('"cursor"') && x.includes('"x":42')), 'carol: cursor broadcast');
-        carol.send(JSON.stringify({ x: 42, y: 7 }));
+        carol.conn.send(JSON.stringify({ x: 42, y: 7 }));
         const carolMsgs = await carolGot;
         assert(carolMsgs.some((m) => m.includes('"cursor"') && m.includes('"x":42')), 'carol received her cursor update');
         log('  PASS: second isolate (cursor room) works');
 
         // clean up clients
-        alice.close();
-        bob.close();
-        carol.close();
+        alice.conn.close();
+        bob.conn.close();
+        carol.conn.close();
 
         log('');
         log('\x1b[32m========================================\x1b[0m');

@@ -72,12 +72,12 @@ describe('client connecting buffer + open semantics', () => {
 
     it('buffers reliable sends during connecting and flushes them in order before open fires', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-        const sock = MockWebSocket.instances[0];
-
         // events observed, so we can assert flush-before-open ordering.
         const events: string[] = [];
-        room.on('open', () => events.push('open'));
+        const room = connect('ws://localhost:9001', {
+            onOpen: () => events.push('open'),
+        });
+        const sock = MockWebSocket.instances[0];
 
         // ws is connected but no session yet — still connecting.
         sock.fireOpen();
@@ -100,17 +100,17 @@ describe('client connecting buffer + open semantics', () => {
 
     it('flushes the connecting buffer before emitting open', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
+        // at the moment open fires, the buffered message must already be sent.
+        let sentAtOpen = 0;
+        const room = connect('ws://localhost:9001', {
+            onOpen: () => {
+                sentAtOpen = sock.sent.length;
+            },
+        });
         const sock = MockWebSocket.instances[0];
 
         sock.fireOpen();
         room.send('queued');
-
-        // at the moment open fires, the buffered message must already be sent.
-        let sentAtOpen = 0;
-        room.on('open', () => {
-            sentAtOpen = sock.sent.length;
-        });
 
         sock.deliverProtocol({ type: 'session', token: 'tok', clientId: 'c1' });
         expect(sentAtOpen).toBe(1);
@@ -132,13 +132,13 @@ describe('client connecting buffer + open semantics', () => {
 
     it('does not fire open on raw ws open — only on session receipt', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-        const sock = MockWebSocket.instances[0];
-
         let opened = false;
-        room.on('open', () => {
-            opened = true;
+        const room = connect('ws://localhost:9001', {
+            onOpen: () => {
+                opened = true;
+            },
         });
+        const sock = MockWebSocket.instances[0];
 
         sock.fireOpen();
         expect(opened).toBe(false);
@@ -151,21 +151,21 @@ describe('client connecting buffer + open semantics', () => {
 
     it('auth_error on initial connect emits authError then closes with cause auth, never opening', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-        const sock = MockWebSocket.instances[0];
-
         let opened = false;
         let authError: unknown = null;
         let closeInfo: { code: number; reason: string; cause: CloseCause } | null = null;
-        room.on('open', () => {
-            opened = true;
+        const room = connect('ws://localhost:9001', {
+            onOpen: () => {
+                opened = true;
+            },
+            onAuthError: (err) => {
+                authError = err;
+            },
+            onClose: (info) => {
+                closeInfo = info;
+            },
         });
-        room.on('authError', (err) => {
-            authError = err;
-        });
-        room.on('close', (info) => {
-            closeInfo = info;
-        });
+        const sock = MockWebSocket.instances[0];
 
         sock.fireOpen();
         // buffer a reliable message during connecting — it must be discarded on close.
@@ -185,13 +185,13 @@ describe('client connecting buffer + open semantics', () => {
 
     it('initial ws closing before session yields cause initial-connect-failed', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-        const sock = MockWebSocket.instances[0];
-
         let closeInfo: { cause: CloseCause } | null = null;
-        room.on('close', (info) => {
-            closeInfo = info;
+        connect('ws://localhost:9001', {
+            onClose: (info) => {
+                closeInfo = info;
+            },
         });
+        const sock = MockWebSocket.instances[0];
 
         sock.fireOpen();
         sock.fireClose(1006, 'gone');
@@ -200,13 +200,13 @@ describe('client connecting buffer + open semantics', () => {
 
     it('user close() during open yields cause consented', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-        const sock = MockWebSocket.instances[0];
-
         let closeInfo: { code: number; cause: CloseCause } | null = null;
-        room.on('close', (info) => {
-            closeInfo = info;
+        const room = connect('ws://localhost:9001', {
+            onClose: (info) => {
+                closeInfo = info;
+            },
         });
+        const sock = MockWebSocket.instances[0];
 
         sock.fireOpen();
         sock.deliverProtocol({ type: 'session', token: 'tok', clientId: 'c1' });
@@ -221,13 +221,13 @@ describe('client connecting buffer + open semantics', () => {
 
     it('server-initiated 4000 on an open connection yields cause server', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-        const sock = MockWebSocket.instances[0];
-
         let closeInfo: { cause: CloseCause } | null = null;
-        room.on('close', (info) => {
-            closeInfo = info;
+        connect('ws://localhost:9001', {
+            onClose: (info) => {
+                closeInfo = info;
+            },
         });
+        const sock = MockWebSocket.instances[0];
 
         sock.fireOpen();
         sock.deliverProtocol({ type: 'session', token: 'tok', clientId: 'c1' });
@@ -239,13 +239,13 @@ describe('client connecting buffer + open semantics', () => {
 
     it('outbound buffer overflow during connecting yields cause buffer-overflow', async () => {
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-        const sock = MockWebSocket.instances[0];
-
         let closeInfo: { cause: CloseCause } | null = null;
-        room.on('close', (info) => {
-            closeInfo = info;
+        const room = connect('ws://localhost:9001', {
+            onClose: (info) => {
+                closeInfo = info;
+            },
         });
+        const sock = MockWebSocket.instances[0];
 
         sock.fireOpen();
         // byte size for a string is length*2. push > 1mb while connecting.
@@ -258,11 +258,11 @@ describe('client connecting buffer + open semantics', () => {
     it('reconnect attempt cap exhaustion yields cause reconnect-failed', async () => {
         vi.useFakeTimers();
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-
         let closeInfo: { cause: CloseCause; code: number } | null = null;
-        room.on('close', (info) => {
-            closeInfo = info;
+        const room = connect('ws://localhost:9001', {
+            onClose: (info) => {
+                closeInfo = info;
+            },
         });
 
         // establish an authenticated connection so we have a session token.
@@ -332,11 +332,11 @@ describe('client connecting buffer + open semantics', () => {
     it('rejected session on reconnect yields cause session', async () => {
         vi.useFakeTimers();
         const { connect } = await import('../../src/client/index');
-        const room = connect('ws://localhost:9001');
-
         let closeInfo: { cause: CloseCause } | null = null;
-        room.on('close', (info) => {
-            closeInfo = info;
+        const room = connect('ws://localhost:9001', {
+            onClose: (info) => {
+                closeInfo = info;
+            },
         });
 
         const first = MockWebSocket.instances[0];

@@ -1,4 +1,4 @@
-import { connect, type RoomConnection } from 'gatho/client';
+import { type CloseInfo, connect, type ConnectHandlers, type RoomConnection } from 'gatho/client';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { createRoom, fetchRooms, joinRoom, type RoomListItem } from './api';
 import './styles.css';
@@ -10,6 +10,27 @@ interface ChatMessage {
     timestamp: number;
 }
 
+// the connection is created in the lobby (so buffering starts immediately), but
+// the ui that reacts to events lives in <Chat>, which mounts later. we bridge
+// the two with a mutable handler bag: connect() forwards each event to whatever
+// the bag currently points at, and <Chat> installs its handlers into the bag on
+// mount. the single-handler client contract means one owner per event — the bag
+// is that owner, and it fans out to react state.
+type LiveConnection = {
+    conn: RoomConnection;
+    handlers: ConnectHandlers;
+};
+
+function openConnection(url: string): LiveConnection {
+    const handlers: ConnectHandlers = {};
+    const conn = connect(url, {
+        onMessage: (msg) => handlers.onMessage?.(msg),
+        onClose: (info) => handlers.onClose?.(info),
+        onError: (e) => handlers.onError?.(e),
+    });
+    return { conn, handlers };
+}
+
 // --- lobby ---
 
 function Lobby({
@@ -17,7 +38,7 @@ function Lobby({
     onJoined,
 }: {
     username: string;
-    onJoined: (roomId: string, roomName: string, room: RoomConnection) => void;
+    onJoined: (roomId: string, roomName: string, live: LiveConnection) => void;
 }) {
     const [rooms, setRooms] = useState<RoomListItem[]>([]);
     const [newRoomName, setNewRoomName] = useState('');
@@ -47,8 +68,8 @@ function Lobby({
             setNewRoomName('');
 
             // connect immediately — creator joins their own room
-            const room = connect(result.seat.url);
-            onJoined(result.roomId, result.name, room);
+            const live = openConnection(result.seat.url);
+            onJoined(result.roomId, result.name, live);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'failed to create room');
             setCreating(false);
@@ -62,9 +83,9 @@ function Lobby({
 
         try {
             const seat = await joinRoom(roomId, username);
-            const room = connect(seat.url);
+            const live = openConnection(seat.url);
             const name = rooms.find((r) => r.roomId === roomId)?.name ?? roomId;
-            onJoined(roomId, name, room);
+            onJoined(roomId, name, live);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'failed to join');
             setJoining(null);
@@ -117,14 +138,16 @@ function Lobby({
 
 // --- chat ---
 
-function Chat({ roomName, room, onLeave }: { roomName: string; room: RoomConnection; onLeave: () => void }) {
+function Chat({ roomName, live, onLeave }: { roomName: string; live: LiveConnection; onLeave: () => void }) {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [input, setInput] = useState('');
     const [connected, setConnected] = useState(true);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        const onMessage = (msg: string | ArrayBuffer) => {
+        // install this component's handlers into the connection's bag. the bag is
+        // the single owner of each event; here we point it at react state setters.
+        live.handlers.onMessage = (msg: string | ArrayBuffer) => {
             if (typeof msg !== 'string') return;
             setMessages((prev) => [...prev, JSON.parse(msg) as ChatMessage]);
             requestAnimationFrame(() => {
@@ -132,7 +155,7 @@ function Chat({ roomName, room, onLeave }: { roomName: string; room: RoomConnect
             });
         };
 
-        const onClose = ({ code, reason, cause }: { code: number; reason: string; cause: string }) => {
+        live.handlers.onClose = ({ code, reason, cause }: CloseInfo) => {
             setConnected(false);
             setMessages((prev) => [
                 ...prev,
@@ -140,30 +163,26 @@ function Chat({ roomName, room, onLeave }: { roomName: string; room: RoomConnect
             ]);
         };
 
-        const onError = () => {
+        live.handlers.onError = () => {
             setConnected(false);
         };
 
-        room.on('message', onMessage);
-        room.on('close', onClose);
-        room.on('error', onError);
-
         return () => {
-            room.off('message', onMessage);
-            room.off('close', onClose);
-            room.off('error', onError);
+            live.handlers.onMessage = undefined;
+            live.handlers.onClose = undefined;
+            live.handlers.onError = undefined;
         };
-    }, [room]);
+    }, [live]);
 
     const send = () => {
         const text = input.trim();
         if (!text || !connected) return;
-        room.send(JSON.stringify({ text }));
+        live.conn.send(JSON.stringify({ text }));
         setInput('');
     };
 
     const leave = () => {
-        room.close();
+        live.conn.close();
         onLeave();
     };
 
@@ -220,7 +239,7 @@ function Chat({ roomName, room, onLeave }: { roomName: string; room: RoomConnect
 type View =
     | { kind: 'login' }
     | { kind: 'lobby'; username: string }
-    | { kind: 'chat'; username: string; roomId: string; roomName: string; room: RoomConnection };
+    | { kind: 'chat'; username: string; roomId: string; roomName: string; live: LiveConnection };
 
 export function App() {
     const [view, setView] = useState<View>({ kind: 'login' });
@@ -268,8 +287,8 @@ export function App() {
                 </header>
                 <Lobby
                     username={view.username}
-                    onJoined={(roomId, roomName, room) =>
-                        setView({ kind: 'chat', username: view.username, roomId, roomName, room })
+                    onJoined={(roomId, roomName, live) =>
+                        setView({ kind: 'chat', username: view.username, roomId, roomName, live })
                     }
                 />
             </div>
@@ -283,7 +302,7 @@ export function App() {
                     gatho <span>chat</span>
                 </h1>
             </header>
-            <Chat roomName={view.roomName} room={view.room} onLeave={() => setView({ kind: 'lobby', username: view.username })} />
+            <Chat roomName={view.roomName} live={view.live} onLeave={() => setView({ kind: 'lobby', username: view.username })} />
         </div>
     );
 }

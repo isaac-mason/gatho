@@ -1,7 +1,7 @@
 // ha example frontend — demonstrates multi-server deployment
 // lobby (server list + room list) → ping room
 
-import { connect, type RoomConnection } from 'gatho/client';
+import { connect, type ConnectHandlers, type RoomConnection } from 'gatho/client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createRoom, fetchRooms, fetchServers, joinRoom, type RoomListItem, type ServerListItem } from './api';
 import './styles.css';
@@ -28,6 +28,25 @@ interface LeaveMessage {
 }
 
 type RoomMessage = PongMessage | JoinMessage | LeaveMessage;
+
+// the connection opens in the lobby but the ui that reacts to events lives in
+// <PingRoom>, which mounts later. bridge them with a mutable handler bag: the
+// single-handler client forwards each event to whatever the bag points at, and
+// <PingRoom> installs its handlers on mount.
+type LiveConnection = {
+    conn: RoomConnection;
+    handlers: ConnectHandlers;
+};
+
+function openConnection(url: string): LiveConnection {
+    const handlers: ConnectHandlers = {};
+    const conn = connect(url, {
+        onMessage: (msg) => handlers.onMessage?.(msg),
+        onClose: (info) => handlers.onClose?.(info),
+        onError: (e) => handlers.onError?.(e),
+    });
+    return { conn, handlers };
+}
 
 // --- server list ---
 
@@ -56,7 +75,7 @@ function ServerList({ servers }: { servers: ServerListItem[] }) {
 
 // --- lobby ---
 
-function Lobby({ onJoined }: { onJoined: (roomId: string, conn: RoomConnection) => void }) {
+function Lobby({ onJoined }: { onJoined: (roomId: string, live: LiveConnection) => void }) {
     const [rooms, setRooms] = useState<RoomListItem[]>([]);
     const [servers, setServers] = useState<ServerListItem[]>([]);
     const [joining, setJoining] = useState<string | null>(null);
@@ -83,8 +102,8 @@ function Lobby({ onJoined }: { onJoined: (roomId: string, conn: RoomConnection) 
 
         try {
             const result = await createRoom();
-            const conn = connect(result.seat.url);
-            onJoined(result.roomId, conn);
+            const live = openConnection(result.seat.url);
+            onJoined(result.roomId, live);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'failed to create room');
             setCreating(false);
@@ -98,8 +117,8 @@ function Lobby({ onJoined }: { onJoined: (roomId: string, conn: RoomConnection) 
 
         try {
             const seat = await joinRoom(roomId);
-            const conn = connect(seat.url);
-            onJoined(roomId, conn);
+            const live = openConnection(seat.url);
+            onJoined(roomId, live);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'failed to join');
             setJoining(null);
@@ -144,39 +163,46 @@ function Lobby({ onJoined }: { onJoined: (roomId: string, conn: RoomConnection) 
 
 // --- ping room ---
 
-function PingRoom({ roomId, conn, onLeave }: { roomId: string; conn: RoomConnection; onLeave: () => void }) {
+function PingRoom({ roomId, live, onLeave }: { roomId: string; live: LiveConnection; onLeave: () => void }) {
     const [messages, setMessages] = useState<RoomMessage[]>([]);
     const [connected, setConnected] = useState(true);
     const [pingSent, setPingSent] = useState(0);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        conn.on('message', (msg) => {
+        // point the connection's handler bag at this component's state setters.
+        live.handlers.onMessage = (msg) => {
             if (typeof msg !== 'string') return;
             setMessages((prev) => [...prev, JSON.parse(msg) as RoomMessage]);
             requestAnimationFrame(() => {
                 messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
             });
-        });
+        };
 
-        conn.on('close', () => {
+        live.handlers.onClose = () => {
             setConnected(false);
             setMessages((prev) => [...prev, { type: 'leave', user: 'system', ts: Date.now() }]);
-        });
+        };
 
-        conn.on('error', () => {
+        live.handlers.onError = () => {
             setConnected(false);
-        });
-    }, [conn]);
+        };
+
+        return () => {
+            live.handlers.onMessage = undefined;
+            live.handlers.onClose = undefined;
+            live.handlers.onError = undefined;
+        };
+    }, [live]);
 
     const sendPing = () => {
         if (!connected) return;
-        conn.send(JSON.stringify({ type: 'ping' }));
+        live.conn.send(JSON.stringify({ type: 'ping' }));
         setPingSent((n) => n + 1);
     };
 
     const leave = () => {
-        conn.close();
+        live.conn.close();
         onLeave();
     };
 
@@ -235,7 +261,7 @@ function PingRoom({ roomId, conn, onLeave }: { roomId: string; conn: RoomConnect
 
 // --- app ---
 
-type View = { kind: 'lobby' } | { kind: 'ping'; roomId: string; conn: RoomConnection };
+type View = { kind: 'lobby' } | { kind: 'ping'; roomId: string; live: LiveConnection };
 
 export function App() {
     const [view, setView] = useState<View>({ kind: 'lobby' });
@@ -249,7 +275,7 @@ export function App() {
                     </h1>
                     <p className="subtitle">multi-server ping demo</p>
                 </header>
-                <Lobby onJoined={(roomId, conn) => setView({ kind: 'ping', roomId, conn })} />
+                <Lobby onJoined={(roomId, live) => setView({ kind: 'ping', roomId, live })} />
             </div>
         );
     }
@@ -261,7 +287,7 @@ export function App() {
                     gatho <span>ha</span>
                 </h1>
             </header>
-            <PingRoom roomId={view.roomId} conn={view.conn} onLeave={() => setView({ kind: 'lobby' })} />
+            <PingRoom roomId={view.roomId} live={view.live} onLeave={() => setView({ kind: 'lobby' })} />
         </div>
     );
 }

@@ -77,7 +77,6 @@ export function connectAndCollect(url: string): {
     waitForMessages: (n: number, timeoutMs?: number) => Promise<unknown[]>;
     authError: Promise<unknown>;
 } {
-    const conn = connect(url);
     const messages: unknown[] = [];
     let authResolve: (err: unknown) => void;
 
@@ -88,8 +87,10 @@ export function connectAndCollect(url: string): {
     // prevent unhandled rejection — if nothing awaits authError, that's fine
     authError.catch(() => {});
 
-    conn.on('message', (msg) => messages.push(msg));
-    conn.on('authError', (err) => authResolve(err));
+    const conn = connect(url, {
+        onMessage: (msg) => messages.push(msg),
+        onAuthError: (err) => authResolve(err),
+    });
 
     async function waitForMessages(n: number, timeoutMs = 5_000): Promise<unknown[]> {
         const start = Date.now();

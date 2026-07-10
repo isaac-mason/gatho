@@ -15,20 +15,42 @@ console.log('same room:', a.roomId === b.roomId, a.roomId.slice(0, 8));
 
 const msgsA: ServerMessage[] = [];
 const msgsB: ServerMessage[] = [];
-function wire(conn: RoomConnection, sink: ServerMessage[]) {
-    conn.on('message', (m) => { if (typeof m !== 'string') sink.push(serverCodec.unpack(new Uint8Array(m))); });
-}
-function open(conn: RoomConnection) { return new Promise<void>((res, rej) => { conn.on('open', () => res()); conn.on('authError', (e) => rej(new Error(String(e)))); setTimeout(() => rej(new Error('open timeout')), 8000); }); }
 
-const ca = connect(a.url); wire(ca, msgsA);
-const cb = connect(b.url); wire(cb, msgsB);
-await Promise.all([open(ca), open(cb)]);
+// connect with a single-handler bag: the message handler feeds the sink and the
+// open/authError pair resolves the returned promise. all declared up front.
+function openClient(url: string, sink: ServerMessage[]): { conn: RoomConnection; ready: Promise<void> } {
+    let resolveReady!: () => void;
+    let rejectReady!: (err: Error) => void;
+    const ready = new Promise<void>((res, rej) => {
+        resolveReady = res;
+        rejectReady = rej;
+    });
+    const timer = setTimeout(() => rejectReady(new Error('open timeout')), 8000);
+    const conn = connect(url, {
+        onMessage: (m) => {
+            if (typeof m !== 'string') sink.push(serverCodec.unpack(new Uint8Array(m)));
+        },
+        onOpen: () => {
+            clearTimeout(timer);
+            resolveReady();
+        },
+        onAuthError: (e) => {
+            clearTimeout(timer);
+            rejectReady(new Error(String(e)));
+        },
+    });
+    return { conn, ready };
+}
+
+const ca = openClient(a.url, msgsA);
+const cb = openClient(b.url, msgsB);
+await Promise.all([ca.ready, cb.ready]);
 console.log('both connected');
 
 // both move a few times at ~20Hz
 for (let i = 0; i < 8; i++) {
-    ca.send(clientCodec.pack({ x: encodeCoord(0.1 + i * 0.05), y: encodeCoord(0.2) }), { reliable: false });
-    cb.send(clientCodec.pack({ x: encodeCoord(0.9 - i * 0.05), y: encodeCoord(0.8) }), { reliable: false });
+    ca.conn.send(clientCodec.pack({ x: encodeCoord(0.1 + i * 0.05), y: encodeCoord(0.2) }), { reliable: false });
+    cb.conn.send(clientCodec.pack({ x: encodeCoord(0.9 - i * 0.05), y: encodeCoord(0.8) }), { reliable: false });
     await new Promise((r) => setTimeout(r, 50));
 }
 await new Promise((r) => setTimeout(r, 500));
@@ -42,7 +64,7 @@ const bSawAMove = bFrames.some((f) => f.moves.length > 0);
 const presence = msgsA.filter((m) => m.type === 'presence').map((m) => (m as { count: number }).count);
 console.log('A snapshot ok:', !!aSnapshot, '| B saw frames with moves:', bSawAMove, '| presence counts seen by A:', presence);
 
-ca.close(); cb.close();
+ca.conn.close(); cb.conn.close();
 await new Promise((r) => setTimeout(r, 200));
 
 if (aSnapshot && bSawAMove && presence.includes(2)) { console.log('SPA DATA PATH: PASS'); process.exit(0); }

@@ -111,9 +111,10 @@ describe('tcp notify channel (real subprocess room)', () => {
 
         // a client can join and round-trip a message through the echo room
         const reservation = await sdk.join({ roomId: room.roomId, ttl: 30_000 });
-        const conn = connect(reservation.url);
         const messages: unknown[] = [];
-        conn.on('message', (msg) => messages.push(msg));
+        const conn = connect(reservation.url, {
+            onMessage: (msg) => messages.push(msg),
+        });
 
         expect(await waitUntil(() => conn.state === 'open')).toBe(true);
 

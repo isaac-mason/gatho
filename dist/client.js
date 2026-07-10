@@ -1901,8 +1901,9 @@ function buildReconnectUrl(originalUrl, sessionToken) {
 }
 // connect to a gatho room. url is the full websocket url with token
 // baked in as a query param, e.g. "ws://localhost:9001?token=..."
-// returned by sdk.join().url
-function connect(url) {
+// returned by sdk.join().url. handlers is a single-handler bag — one handler
+// per event, all optional.
+function connect(url, handlers = {}) {
     // --- mutable state ---
     let state = 'connecting';
     let ws = null;
@@ -1926,15 +1927,6 @@ function connect(url) {
     // RECONNECTING, flushed in order once the connection is established.
     const reliableBuffer = [];
     let reliableBufferBytes = 0;
-    const listeners = {
-        open: new Set(),
-        message: new Set(),
-        drop: new Set(),
-        reconnect: new Set(),
-        authError: new Set(),
-        close: new Set(),
-        error: new Set(),
-    };
     // --- helpers ---
     // estimate byte size of a message for buffer accounting
     function estimateByteSize(message) {
@@ -1963,11 +1955,6 @@ function connect(url) {
         }
         reliableBuffer.length = 0;
         reliableBufferBytes = 0;
-    }
-    function emit(event, ...args) {
-        const set = listeners[event];
-        for (const cb of set)
-            cb(...args);
     }
     function clearTimers() {
         if (uptimeTimer) {
@@ -2021,7 +2008,7 @@ function connect(url) {
         // clear outbound buffer
         reliableBuffer.length = 0;
         reliableBufferBytes = 0;
-        emit('close', { code, reason, cause });
+        handlers.onClose?.({ code, reason, cause });
     }
     // --- websocket wiring ---
     // wire up event handlers on a websocket instance.
@@ -2064,7 +2051,7 @@ function connect(url) {
                         }, MIN_UPTIME);
                         // flush outbound reliable buffer before notifying user code
                         flushReliableBuffer(socket);
-                        emit('reconnect');
+                        handlers.onReconnect?.();
                         return;
                     }
                     if (!isReconnect && state === 'connecting') {
@@ -2080,7 +2067,7 @@ function connect(url) {
                         // flush anything buffered while connecting, in order,
                         // BEFORE emitting open (mirrors the reconnect path).
                         flushReliableBuffer(socket);
-                        emit('open');
+                        handlers.onOpen?.();
                         return;
                     }
                     return;
@@ -2097,18 +2084,18 @@ function connect(url) {
                     // the error and mark the auth failure so the follow-up 4000
                     // close maps to cause 'auth'.
                     initialAuthFailed = true;
-                    emit('authError', msg.error);
+                    handlers.onAuthError?.(msg.error);
                     return;
                 }
                 // unknown protocol message — ignore
                 return;
             }
             if (frame.frame === 'user_text') {
-                emit('message', frame.text);
+                handlers.onMessage?.(frame.text);
                 return;
             }
             if (frame.frame === 'user_binary') {
-                emit('message', frame.data);
+                handlers.onMessage?.(frame.data);
             }
         };
         socket.onclose = (event) => {
@@ -2156,7 +2143,7 @@ function connect(url) {
                 if (openedAt && Date.now() - openedAt >= MIN_UPTIME) {
                     retryCount = 0;
                 }
-                emit('drop');
+                handlers.onDrop?.();
                 startReconnect();
             }
             else {
@@ -2166,7 +2153,7 @@ function connect(url) {
             }
         };
         socket.onerror = (event) => {
-            emit('error', event);
+            handlers.onError?.(event);
         };
     }
     // --- reconnection loop ---
@@ -2220,21 +2207,6 @@ function connect(url) {
                 return;
             }
             // CLOSED, or unreliable during CONNECTING/RECONNECTING — silently drop
-        },
-        on(event, callback) {
-            const set = listeners[event];
-            if (!set)
-                return () => { };
-            set.add(callback);
-            return () => {
-                set.delete(callback);
-            };
-        },
-        off(event, callback) {
-            const set = listeners[event];
-            if (!set)
-                return;
-            set.delete(callback);
         },
         close() {
             if (state === 'closed')

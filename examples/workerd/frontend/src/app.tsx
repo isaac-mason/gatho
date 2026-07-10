@@ -63,52 +63,51 @@ export function App() {
             if (cancelled) return;
             setRoomId(seat.roomId);
 
-            room = connect(seat.url);
-            roomRef.current = room;
+            room = connect(seat.url, {
+                onOpen: () => setStatus('connected'),
+                onDrop: () => setStatus('reconnecting'),
+                onReconnect: () => setStatus('connected'),
+                onClose: () => setStatus('closed'),
+                onMessage: (msg) => {
+                    if (typeof msg === 'string') return; // binary only
+                    const data = serverCodec.unpack(new Uint8Array(msg));
 
-            room.on('open', () => setStatus('connected'));
-            room.on('drop', () => setStatus('reconnecting'));
-            room.on('reconnect', () => setStatus('connected'));
-            room.on('close', () => setStatus('closed'));
-
-            room.on('message', (msg) => {
-                if (typeof msg === 'string') return; // binary only
-                const data = serverCodec.unpack(new Uint8Array(msg));
-
-                if (data.type === 'snapshot') {
-                    meCidRef.current = data.you;
-                    setMe({ cid: data.you, color: data.color, name: data.name });
-                    const map: Record<number, Cursor> = {};
-                    for (const c of data.cursors) {
-                        map[c.cid] = { color: c.color, name: c.name, x: decodeCoord(c.x), y: decodeCoord(c.y) };
-                    }
-                    setCursors(map);
-                } else if (data.type === 'join') {
-                    if (data.cid === meCidRef.current) return;
-                    setCursors((prev) => ({
-                        ...prev,
-                        [data.cid]: { color: data.color, name: data.name, x: decodeCoord(data.x), y: decodeCoord(data.y) },
-                    }));
-                } else if (data.type === 'frame') {
-                    setCursors((prev) => {
-                        const next = { ...prev };
-                        for (const mv of data.moves) {
-                            if (mv.cid === meCidRef.current) continue;
-                            const c = next[mv.cid];
-                            if (c) next[mv.cid] = { ...c, x: decodeCoord(mv.x), y: decodeCoord(mv.y) };
+                    if (data.type === 'snapshot') {
+                        meCidRef.current = data.you;
+                        setMe({ cid: data.you, color: data.color, name: data.name });
+                        const map: Record<number, Cursor> = {};
+                        for (const c of data.cursors) {
+                            map[c.cid] = { color: c.color, name: c.name, x: decodeCoord(c.x), y: decodeCoord(c.y) };
                         }
-                        return next;
-                    });
-                } else if (data.type === 'leave') {
-                    setCursors((prev) => {
-                        const next = { ...prev };
-                        delete next[data.cid];
-                        return next;
-                    });
-                } else if (data.type === 'presence') {
-                    setCount(data.count);
-                }
+                        setCursors(map);
+                    } else if (data.type === 'join') {
+                        if (data.cid === meCidRef.current) return;
+                        setCursors((prev) => ({
+                            ...prev,
+                            [data.cid]: { color: data.color, name: data.name, x: decodeCoord(data.x), y: decodeCoord(data.y) },
+                        }));
+                    } else if (data.type === 'frame') {
+                        setCursors((prev) => {
+                            const next = { ...prev };
+                            for (const mv of data.moves) {
+                                if (mv.cid === meCidRef.current) continue;
+                                const c = next[mv.cid];
+                                if (c) next[mv.cid] = { ...c, x: decodeCoord(mv.x), y: decodeCoord(mv.y) };
+                            }
+                            return next;
+                        });
+                    } else if (data.type === 'leave') {
+                        setCursors((prev) => {
+                            const next = { ...prev };
+                            delete next[data.cid];
+                            return next;
+                        });
+                    } else if (data.type === 'presence') {
+                        setCount(data.count);
+                    }
+                },
             });
+            roomRef.current = room;
         })();
 
         return () => {

@@ -37,6 +37,27 @@ type BufferedMessage = {
     byteSize: number;
 };
 
+// single-handler bag declared at connect(). one handler per event, all optional.
+// the socket is not an app-wide event bus — app code fans out from these.
+export type ConnectHandlers = {
+    // fires when the connection is authenticated and joined — on receipt of the
+    // first `session` protocol message. this is the client-side view of the same
+    // protocol instant as the room's `onJoin`.
+    onOpen?: () => void;
+    // a message frame arrived from the room.
+    onMessage?: (message: ReceiveMessage) => void;
+    // the live connection dropped (non-consented). reconnection begins automatically.
+    onDrop?: () => void;
+    // a dropped connection was re-established (session resumed).
+    onReconnect?: () => void;
+    // the room rejected the initial connect with an auth error.
+    onAuthError?: (error: unknown) => void;
+    // the connection reached its terminal CLOSED state. see CloseInfo.cause.
+    onClose?: (info: CloseInfo) => void;
+    // a low-level websocket error event.
+    onError?: (error: Event) => void;
+};
+
 export type RoomConnection = {
     // current connection state
     readonly state: ConnectionState;
@@ -51,39 +72,10 @@ export type RoomConnection = {
     // order once the connection is established (open). unreliable: drops unless OPEN.
     send(message: SendMessage, options?: SendOptions): void;
 
-    // register a listener for an event. returns an unsubscribe function.
-    // multiple listeners can be registered for the same event.
-    on(event: 'open', callback: () => void): () => void;
-    on(event: 'message', callback: (message: ReceiveMessage) => void): () => void;
-    on(event: 'drop', callback: () => void): () => void;
-    on(event: 'reconnect', callback: () => void): () => void;
-    on(event: 'authError', callback: (error: unknown) => void): () => void;
-    on(event: 'close', callback: (info: CloseInfo) => void): () => void;
-    on(event: 'error', callback: (error: Event) => void): () => void;
-
-    // remove a previously registered listener by reference
-    off(event: 'open', callback: () => void): void;
-    off(event: 'message', callback: (message: ReceiveMessage) => void): void;
-    off(event: 'drop', callback: () => void): void;
-    off(event: 'reconnect', callback: () => void): void;
-    off(event: 'authError', callback: (error: unknown) => void): void;
-    off(event: 'close', callback: (info: CloseInfo) => void): void;
-    off(event: 'error', callback: (error: Event) => void): void;
-
     // close the connection. sends __leave protocol message before closing
     // with code 4000 (consented), telling the server this is intentional.
     // if RECONNECTING, stops the backoff loop and enters CLOSED.
     close(): void;
-};
-
-type ListenerMap = {
-    open: Set<() => void>;
-    message: Set<(message: ReceiveMessage) => void>;
-    drop: Set<() => void>;
-    reconnect: Set<() => void>;
-    authError: Set<(error: unknown) => void>;
-    close: Set<(info: CloseInfo) => void>;
-    error: Set<(error: Event) => void>;
 };
 
 // backoff constants — hardcoded, always right
@@ -128,8 +120,9 @@ function buildReconnectUrl(originalUrl: string, sessionToken: string): string {
 
 // connect to a gatho room. url is the full websocket url with token
 // baked in as a query param, e.g. "ws://localhost:9001?token=..."
-// returned by sdk.join().url
-export function connect(url: string): RoomConnection {
+// returned by sdk.join().url. handlers is a single-handler bag — one handler
+// per event, all optional.
+export function connect(url: string, handlers: ConnectHandlers = {}): RoomConnection {
     // --- mutable state ---
     let state: ConnectionState = 'connecting';
     let ws: WebSocket | null = null;
@@ -154,16 +147,6 @@ export function connect(url: string): RoomConnection {
     // RECONNECTING, flushed in order once the connection is established.
     const reliableBuffer: BufferedMessage[] = [];
     let reliableBufferBytes = 0;
-
-    const listeners: ListenerMap = {
-        open: new Set(),
-        message: new Set(),
-        drop: new Set(),
-        reconnect: new Set(),
-        authError: new Set(),
-        close: new Set(),
-        error: new Set(),
-    };
 
     // --- helpers ---
 
@@ -193,16 +176,6 @@ export function connect(url: string): RoomConnection {
         }
         reliableBuffer.length = 0;
         reliableBufferBytes = 0;
-    }
-
-    function emit<K extends keyof ListenerMap>(
-        event: K,
-        ...args: Parameters<
-            ListenerMap[K] extends Set<infer F> ? (F extends (...a: infer A) => void ? (...a: A) => void : never) : never
-        >
-    ): void {
-        const set = listeners[event] as Set<(...a: unknown[]) => void>;
-        for (const cb of set) cb(...args);
     }
 
     function clearTimers(): void {
@@ -261,7 +234,7 @@ export function connect(url: string): RoomConnection {
         // clear outbound buffer
         reliableBuffer.length = 0;
         reliableBufferBytes = 0;
-        emit('close', { code, reason, cause });
+        handlers.onClose?.({ code, reason, cause });
     }
 
     // --- websocket wiring ---
@@ -315,7 +288,7 @@ export function connect(url: string): RoomConnection {
                         // flush outbound reliable buffer before notifying user code
                         flushReliableBuffer(socket);
 
-                        emit('reconnect');
+                        handlers.onReconnect?.();
                         return;
                     }
 
@@ -335,7 +308,7 @@ export function connect(url: string): RoomConnection {
                         // BEFORE emitting open (mirrors the reconnect path).
                         flushReliableBuffer(socket);
 
-                        emit('open');
+                        handlers.onOpen?.();
                         return;
                     }
                     return;
@@ -354,7 +327,7 @@ export function connect(url: string): RoomConnection {
                     // the error and mark the auth failure so the follow-up 4000
                     // close maps to cause 'auth'.
                     initialAuthFailed = true;
-                    emit('authError', msg.error);
+                    handlers.onAuthError?.(msg.error);
                     return;
                 }
 
@@ -363,12 +336,12 @@ export function connect(url: string): RoomConnection {
             }
 
             if (frame.frame === 'user_text') {
-                emit('message', frame.text);
+                handlers.onMessage?.(frame.text);
                 return;
             }
 
             if (frame.frame === 'user_binary') {
-                emit('message', frame.data);
+                handlers.onMessage?.(frame.data);
             }
         };
 
@@ -423,7 +396,7 @@ export function connect(url: string): RoomConnection {
                     retryCount = 0;
                 }
 
-                emit('drop');
+                handlers.onDrop?.();
                 startReconnect();
             } else {
                 // no session token — can't reconnect. the server closed a live
@@ -433,7 +406,7 @@ export function connect(url: string): RoomConnection {
         };
 
         socket.onerror = (event: Event) => {
-            emit('error', event);
+            handlers.onError?.(event);
         };
     }
 
@@ -502,21 +475,6 @@ export function connect(url: string): RoomConnection {
             }
 
             // CLOSED, or unreliable during CONNECTING/RECONNECTING — silently drop
-        },
-
-        on(event: string, callback: (...args: never[]) => void): () => void {
-            const set = listeners[event as keyof ListenerMap];
-            if (!set) return () => {};
-            set.add(callback);
-            return () => {
-                set.delete(callback);
-            };
-        },
-
-        off(event: string, callback: (...args: never[]) => void): void {
-            const set = listeners[event as keyof ListenerMap];
-            if (!set) return;
-            set.delete(callback);
         },
 
         close(): void {
