@@ -48,6 +48,9 @@ function recordingSocket() {
             closed = { code, reason };
         },
         subscribe() {},
+        bufferedAmount() {
+            return 0;
+        },
     };
 
     return {

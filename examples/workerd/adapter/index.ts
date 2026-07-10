@@ -258,6 +258,11 @@ class WorkerdRoom {
                 }
                 subs.add(clientId);
             },
+            // workerd's WebSocket doesn't expose bufferedAmount portably, and sends
+            // here go through the per-connection outbox rather than straight to the
+            // socket. report 0 — the room's backpressure policy tolerates a transport
+            // that always reports 0 (such a client is never evicted for pressure).
+            bufferedAmount: () => 0,
         };
 
         if (reconnecting) {

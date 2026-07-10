@@ -71,6 +71,9 @@ function recordingSocket(subscribers: Set<RecordingSocket>): RecordingSocket {
             subscribed = true;
             subscribers.add(rec);
         },
+        bufferedAmount() {
+            return 0;
+        },
     };
 
     const rec: RecordingSocket = {

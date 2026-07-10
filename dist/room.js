@@ -2334,6 +2334,10 @@ function wsTransport(config) {
                                 }
                                 subs.add(ws);
                             },
+                            bufferedAmount() {
+                                // ws exposes the outbound buffer directly (kernel + userland).
+                                return ws.bufferedAmount;
+                            },
                         };
                         if (reconnecting) {
                             handlers.reconnect(clientId, wsSocket, versionMismatch);
@@ -2489,6 +2493,10 @@ function createClientCollection(clients) {
 }
 // default per-client reliable message buffer cap: 1mb
 const DEFAULT_MAX_BUFFER_BYTES = 1_048_576;
+// default per-client outbound backpressure cap: 4mb. larger than the reliable
+// buffer cap because it bounds a live socket's transient send backlog (bursts of
+// broadcasts drain quickly on a healthy peer), not messages held for an absent one.
+const DEFAULT_MAX_OUTBOUND_BUFFER_BYTES = 4_194_304;
 // permanently remove a client — cancel timers, invalidate session token,
 // fire onLeave, notify driver. used on reconnect window expiry, buffer overflow,
 // consented close, and disconnect without allowReconnection.
@@ -2513,7 +2521,37 @@ function evictClient(state, tracked, room, onLeave) {
     // notify driver
     state.ipc?.send({ type: 'client-disconnected', clientId: tracked.id });
 }
-function createRoom(state, maxBufferBytes, callbacks) {
+// outbound backpressure check for a single connected client. if the live socket's
+// unflushed buffer exceeds the cap, the client is a stalled consumer — evict it
+// (close 4000: a terminal 'server' close client-side, so a stalled peer does not
+// auto-reconnect straight back into the same pressure) and return true. below the
+// cap, warn once when it crosses 50% so operators see pressure building before the
+// eviction. sockets with no live socket, or transports that always report 0, are
+// never evicted here.
+function checkOutboundPressure(state, tracked, maxOutboundBufferBytes, room, onLeave) {
+    if (!tracked.socket)
+        return false;
+    const buffered = tracked.socket.bufferedAmount();
+    if (buffered > maxOutboundBufferBytes) {
+        state.log.warn('evicting stalled consumer over outbound buffer cap', {
+            clientId: tracked.id,
+            bufferedAmount: buffered,
+            maxOutboundBufferBytes,
+        });
+        evictClient(state, tracked, room, onLeave);
+        return true;
+    }
+    if (!tracked.outboundWarned && buffered > maxOutboundBufferBytes / 2) {
+        tracked.outboundWarned = true;
+        state.log.warn('client outbound buffer over 50% of cap', {
+            clientId: tracked.id,
+            bufferedAmount: buffered,
+            maxOutboundBufferBytes,
+        });
+    }
+    return false;
+}
+function createRoom(state, maxBufferBytes, maxOutboundBufferBytes, callbacks) {
     let room;
     // buffer a reliable message for a disconnected client.
     // if byte cap exceeded, evict the client.
@@ -2544,7 +2582,13 @@ function createRoom(state, maxBufferBytes, callbacks) {
             const framed = frameUserMessage(message);
             const reliable = options?.reliable !== false;
             if (tracked.socket) {
+                // outbound backpressure: if the socket is already past the cap, evict
+                // before enqueueing more onto a stalled consumer.
+                if (checkOutboundPressure(state, tracked, maxOutboundBufferBytes, room, callbacks.onLeave))
+                    return;
                 tracked.socket.send(framed, true);
+                // re-check after the write — this send may have pushed a slow peer over.
+                checkOutboundPressure(state, tracked, maxOutboundBufferBytes, room, callbacks.onLeave);
             }
             else if (reliable) {
                 bufferForClient(tracked, framed);
@@ -2639,11 +2683,28 @@ function startHeartbeat(state) {
         });
     }, HEARTBEAT_INTERVAL_MS);
 }
+// --- outbound backpressure sweep ---
+// broadcasts fan out through the transport's pub/sub (server.publish), which
+// bypasses the room's per-socket send path entirely — so room.send's check can't
+// see a peer that only receives broadcasts. sweep every tracked live socket on the
+// heartbeat cadence and evict any over the cap. this is the mechanism that catches
+// broadcast-only pressure; room.send's inline check catches directed-send pressure
+// sooner. runs in both managed and standalone mode.
+function startBackpressureSweep(state, maxOutboundBufferBytes, room, onLeave) {
+    state.backpressureInterval = setInterval(() => {
+        if (!state.alive)
+            return;
+        // snapshot: checkOutboundPressure evicts (mutates state.clients) on a hit.
+        for (const tracked of Array.from(state.clients.values())) {
+            checkOutboundPressure(state, tracked, maxOutboundBufferBytes, room, onLeave);
+        }
+    }, HEARTBEAT_INTERVAL_MS);
+}
 // --- ws server ---
 function startRoom(state, transport, options) {
     // the room handle is created once and shared — same object passed to callbacks
     // and returned from start()
-    const room = createRoom(state, options.maxBufferBytes, {
+    const room = createRoom(state, options.maxBufferBytes, options.maxOutboundBufferBytes, {
         onLeave: options.onLeave,
         onShutdown: options.onShutdown,
     });
@@ -2758,6 +2819,7 @@ function startRoom(state, transport, options) {
                     reliableBuffer: [],
                     reliableBufferBytes: 0,
                     disconnectTimer: null,
+                    outboundWarned: false,
                     tags,
                 };
                 state.clients.set(clientId, tracked);
@@ -2822,6 +2884,8 @@ function startRoom(state, transport, options) {
             }
             // swap socket
             tracked.socket = socket;
+            // fresh socket, fresh outbound buffer — re-arm the 50% warn latch.
+            tracked.outboundWarned = false;
             // subscribe new socket to broadcast topic
             socket.subscribe(BROADCAST_TOPIC);
             // invalidate old session token, generate new one
@@ -2877,6 +2941,7 @@ function startRoom(state, transport, options) {
     };
     return transport.listen(handlers, { port: options.port }).then((server) => {
         state.server = server;
+        startBackpressureSweep(state, options.maxOutboundBufferBytes, room, options.onLeave);
         return { port: server.port, room };
     });
 }
@@ -2892,6 +2957,10 @@ async function stopRoom(state, selfInitiated, room, onShutdown, onLeave) {
     if (state.heartbeatInterval) {
         clearInterval(state.heartbeatInterval);
         state.heartbeatInterval = null;
+    }
+    if (state.backpressureInterval) {
+        clearInterval(state.backpressureInterval);
+        state.backpressureInterval = null;
     }
     if (onShutdown) {
         await Promise.resolve(onShutdown());
@@ -3007,6 +3076,7 @@ async function start(options) {
         sessionTokens: new Map(),
         ipc,
         heartbeatInterval: null,
+        backpressureInterval: null,
         alive: true,
         server: null,
         sigtermHandler: null,
@@ -3016,6 +3086,7 @@ async function start(options) {
     const { port, room } = await startRoom(state, transport, {
         port: options.port,
         maxBufferBytes: options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES,
+        maxOutboundBufferBytes: options.maxOutboundBufferBytes ?? DEFAULT_MAX_OUTBOUND_BUFFER_BYTES,
         onAuth: options.onAuth,
         onJoin: options.onJoin,
         onMessage: options.onMessage,

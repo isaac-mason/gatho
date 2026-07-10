@@ -7,6 +7,12 @@ export type ClientSocket = {
     send(data: string | ArrayBuffer | Uint8Array, isBinary: boolean): void;
     close(code: number, reason: string): void;
     subscribe(topic: string): void;
+    // bytes queued to send but not yet flushed to the os (the kernel/userland
+    // outbound buffer). the room watches this to detect stalled consumers and
+    // evict them before the buffer grows unbounded — see maxOutboundBufferBytes.
+    // transports that cannot observe this portably return 0; the room-side policy
+    // tolerates that (a socket that always reports 0 is never evicted for pressure).
+    bufferedAmount(): number;
 };
 
 export type UpgradeResult = {

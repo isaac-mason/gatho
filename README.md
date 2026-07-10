@@ -412,11 +412,13 @@ console.log('unpacked client message:', unpackedClientMessage.movement);
 `gatho/client` is a thin WebSocket wrapper that handles the things you'd otherwise build yourself:
 
 - **Automatic reconnection.** On an unexpected disconnect the client enters a `reconnecting` state and retries with exponential backoff and jitter.
-- **Reliable messaging.** Messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. Future work on backpressure handling and WebTransport will build on this.
+- **Reliable messaging.** Messages sent while reconnecting are buffered (up to 1MB by default) and flushed in order once the connection is restored. Mark a message as `{ reliable: false }` to drop it instead. WebTransport support will build on this.
 - **Session continuity.** The server issues a session token on first connect. On reconnect the client presents it automatically, so the server sees the same `clientId` and can resume where it left off.
 - **Clean close.** `close()` sends a protocol-level leave message so the server knows the disconnect was intentional and skips the reconnection window.
 
 On the server side, opt in to reconnection by calling `room.allowReconnection(client, windowMs)` inside `onDrop`. Reliable messages sent to a disconnected client are buffered (up to `maxBufferBytes`, default 1MB) and flushed automatically on reconnect. If the buffer overflows or the window expires, the client is evicted and `onLeave` fires.
+
+**Outbound backpressure.** A connected but stalled consumer — one that can't drain broadcasts and sends as fast as the room produces them — would otherwise accumulate unbounded outbound buffer in the room process, a memory DoS a single bad peer can trigger. The room caps each live socket's unflushed outbound buffer at `maxOutboundBufferBytes` (default 4MB). A socket past the cap is treated as a stalled consumer and evicted (closed 4000, `onLeave` fires); the terminal close means it won't auto-reconnect straight back into the same pressure. The cap is enforced on every `room.send` and swept every heartbeat interval (~3s), so a peer that only receives broadcasts is caught too. Transports that can't observe their outbound buffer report 0 and are never evicted for pressure.
 
 ```ts
 import { auth, start } from 'gatho/room';

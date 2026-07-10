@@ -2,6 +2,7 @@ export type ClientSocket = {
     send(data: string | ArrayBuffer | Uint8Array, isBinary: boolean): void;
     close(code: number, reason: string): void;
     subscribe(topic: string): void;
+    bufferedAmount(): number;
 };
 export type UpgradeResult = {
     clientId: string;

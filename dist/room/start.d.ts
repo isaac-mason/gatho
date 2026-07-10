@@ -66,6 +66,24 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
     /** per-client reliable message buffer cap in bytes. when a disconnected client's
      *  buffer exceeds this, the client is evicted. default: 1MB (1_048_576). */
     maxBufferBytes?: number;
+    /** per-client outbound backpressure cap in bytes. this bounds the *live* socket's
+     *  unflushed send buffer (the kernel/userland ws `bufferedAmount`), whereas
+     *  `maxBufferBytes` bounds the reliable buffer held for a *disconnected* client.
+     *
+     *  a connected client whose outbound buffer exceeds this cap is treated as a
+     *  stalled consumer — it can't drain broadcasts/sends as fast as the room
+     *  produces them — and is evicted (closed 4000, `onLeave` fires). without this
+     *  a single slow tcp peer would accumulate unbounded memory in the room process
+     *  at broadcast rates: a memory DoS one bad client can trigger.
+     *
+     *  enforced on every `room.send` (checked before the enqueue and again after)
+     *  and swept every heartbeat interval (~3s) so a peer that only receives
+     *  broadcasts — which fan out via the transport's pub/sub and never touch the
+     *  room's per-socket path — is still caught. transports that can't observe
+     *  `bufferedAmount` report 0 and are never evicted for pressure.
+     *
+     *  default: 4MB (4_194_304). */
+    maxOutboundBufferBytes?: number;
     /** auth handler — called for every new connection.
      *  return `auth.ok(data)` to accept (data becomes `client.data`),
      *  or `auth.fail(reason)` to reject.

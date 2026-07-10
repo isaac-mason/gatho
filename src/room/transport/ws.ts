@@ -136,6 +136,10 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                                 }
                                 subs.add(ws);
                             },
+                            bufferedAmount() {
+                                // ws exposes the outbound buffer directly (kernel + userland).
+                                return ws.bufferedAmount;
+                            },
                         };
 
                         if (reconnecting) {
