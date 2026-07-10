@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { frameUserMessage, unpackFrame } from '../../src/common/protocol';
-import { type AuthResult, auth, create } from '../../src/room/index';
+import { type AuthResult, create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -126,7 +126,7 @@ describe('room auth + socket identity', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onMessage: (_c, msg) => {
                 if (typeof msg === 'string') messages.push(msg);
             },
@@ -169,7 +169,7 @@ describe('room auth + socket identity', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onDrop: (client) => {
                 client.allowReconnection(60_000);
             },
@@ -202,7 +202,7 @@ describe('room auth + socket identity', () => {
             transport: stubTransport(sink),
             onAuth: () =>
                 new Promise<AuthResult<Record<string, never>>>((resolve) => {
-                    releaseAuth = () => resolve(auth.ok({}));
+                    releaseAuth = () => resolve({ ok: true, data: {} });
                 }),
         });
         await room.start();
@@ -231,7 +231,7 @@ describe('room auth + socket identity', () => {
             transport: stubTransport(sink),
             onAuth: () =>
                 new Promise<AuthResult<Record<string, never>>>((resolve) => {
-                    releaseAuth = () => resolve(auth.fail('nope'));
+                    releaseAuth = () => resolve({ ok: false, error: 'nope' });
                 }),
         });
         await room.start();
@@ -257,7 +257,7 @@ describe('room auth + socket identity', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onDrop: () =>
                 new Promise((resolve) => {
                     releaseDrop = () => resolve();
@@ -298,7 +298,7 @@ describe('room auth + socket identity', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onDrop: () =>
                 new Promise((resolve) => {
                     releaseDrop = () => resolve();

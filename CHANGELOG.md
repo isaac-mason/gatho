@@ -149,6 +149,10 @@ breaking changes below ship without compat shims.
     array per step.
   - `broadcast`/`client.*` before `start()` throw (programming error); post-`stop()` they stay
     silent no-ops. A created-but-unstarted room warns once after ~5s (dev insurance).
+  - `onAuth` now returns the `AuthResult` discriminated union directly as a plain object literal —
+    `{ ok: true, data }` to accept, `{ ok: false, error }` to reject. **Breaking:** the `auth`
+    helper (`auth.ok()` / `auth.fail()`) is removed. `AuthResult<ClientData>` stays exported and
+    unchanged; plain literals were the only mini-DSL left in the api and are the gatho way.
 - **room (auth/transport hardening):** clients subscribe to the broadcast topic only **after**
   `onAuth` resolves ok (no broadcast leakage during the auth window); a duplicate connection for a
   clientId that already holds a live socket is rejected (`seat already in use`); the ws transport's

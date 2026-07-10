@@ -43,7 +43,7 @@ export type ServerConfig = {
  *  `room` handle returned by `create()`, which is in scope in the same block.
  *
  *  generic parameters:
- *  - `ClientData` — the data shape returned by `onAuth` via `auth.ok(data)`.
+ *  - `ClientData` — the data shape returned by `onAuth` via `{ ok: true, data }`.
  *    inferred from the return type of `onAuth`.
  *  - `JoinData` — the data shape passed to `onAuth`. matches the `data` bag
  *    from `sdk.join({ data })`. annotate the `onAuth` parameter to opt in. */
@@ -70,8 +70,9 @@ export type CreateOptions<ClientData, JoinData extends Record<string, unknown> =
      *  buffer exceeds this, the client is evicted. default: 1MB (1_048_576). */
     maxBufferBytes?: number;
     /** auth handler — called for every new connection.
-     *  return `auth.ok(data)` to accept (data becomes `client.data`),
-     *  or `auth.fail(reason)` to reject.
+     *  return the `AuthResult` union directly as a plain object literal:
+     *  `{ ok: true, data }` to accept (data becomes `client.data`),
+     *  or `{ ok: false, error }` to reject.
      *  if omitted, all connections are accepted with empty client data.
      *
      *  `joinData` is the arbitrary data bag from `sdk.join({ data })`, or `{}` if omitted.
@@ -79,8 +80,22 @@ export type CreateOptions<ClientData, JoinData extends Record<string, unknown> =
      *  annotate the joinData parameter to get type inference:
      *  ```ts
      *  onAuth: (joinData: { displayName?: string }) =>
-     *    auth.ok({ username: joinData.displayName ?? 'anon' })
-     *  ``` */
+     *    ({ ok: true, data: { username: joinData.displayName ?? 'anon' } })
+     *  ```
+     *
+     *  two typescript footguns (both trip ClientData inference):
+     *  1. return the literal directly (or annotate the return) — hoisting it
+     *     through an untyped local widens `ok` to `boolean` and breaks the union.
+     *  2. when referencing the `room` handle, keep it in a STATEMENT (an if-guard
+     *     in a block body), not inside the returned expression — an arrow whose
+     *     expression body is `room.x ? {ok:false,...} : {ok:true,...}` makes the
+     *     return type circular (TS7022). use:
+     *     ```ts
+     *     onAuth: (join) => {
+     *       if (room.clients.count() >= max) return { ok: false, error: 'full' };
+     *       return { ok: true, data: { name: join.name } };
+     *     }
+     *     ``` */
     onAuth?: (joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
     /** fires after a client is authenticated and added to the room.
      *  this is the room-side view of the same protocol instant as the client's

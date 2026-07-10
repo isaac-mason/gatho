@@ -5,7 +5,7 @@ import { readFileSync } from 'fs';
 import { createServer as createHttpServer } from 'http';
 import { resolve } from 'path';
 import type { Room } from 'gatho/room';
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 import type { CreateOptions } from 'gatho/room';
 
 const CLIENT_BUNDLE_PATH = resolve(import.meta.dirname, '../../dist/client.js');
@@ -76,7 +76,7 @@ export async function startRoom<ClientData = Record<string, unknown>>(
     const room = create<ClientData>({
         standalone: true,
         port: opts.port,
-        onAuth: opts.onAuth ?? (() => auth.ok({} as ClientData)),
+        onAuth: opts.onAuth ?? (() => ({ ok: true, data: {} as ClientData })),
         onJoin: opts.onJoin,
         onMessage: opts.onMessage,
         onLeave: opts.onLeave,

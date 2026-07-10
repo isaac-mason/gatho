@@ -6,7 +6,7 @@
 
 import { connect } from 'gatho/client';
 import type { Client, Room } from 'gatho/room';
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 import { afterEach, describe, expect, it } from 'vitest';
 
 function sleep(ms: number): Promise<void> {
@@ -41,7 +41,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19901,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onDrop: () => {
                 dropCalled = true;
             },
@@ -78,7 +78,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19903,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             // no onDrop — backward compatible behavior
             onLeave: () => {
                 leaveCalled = true;
@@ -106,7 +106,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19904,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onJoin: (client) => {
                 joinedClient = client;
             },
@@ -148,7 +148,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19906,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onJoin: (client) => {
                 joinedIds.push(client.id);
             },
@@ -187,7 +187,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19907,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onDrop: () => {
                 dropCalled = true;
             },
@@ -212,7 +212,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19912,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -241,7 +241,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19913,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -278,7 +278,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19915,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onJoin: (client) => {
                 joinedIds.push(client.id);
             },
@@ -314,7 +314,7 @@ describe('reconnection lifecycle', () => {
         room = create({
             standalone: true,
             port: 19916,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -339,7 +339,7 @@ describe('reconnection lifecycle', () => {
         room = create<TestData>({
             standalone: true,
             port: 19917,
-            onAuth: () => auth.ok({ role: 'admin' }),
+            onAuth: () => ({ ok: true, data: { role: 'admin' } }),
             onJoin: (client) => {
                 joinData = client.data;
             },

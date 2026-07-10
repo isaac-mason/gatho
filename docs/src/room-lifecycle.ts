@@ -1,11 +1,12 @@
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 const room = create({
-    // return auth.ok(data) to accept, auth.fail(reason) to reject.
-    // callbacks close over `room` — no room parameter is passed.
+    // return { ok: true, data } to accept, { ok: false, error } to reject.
+    // callbacks close over `room` — no room parameter is passed. keep the `room`
+    // read in a statement (the if-guard below), not in the returned expression.
     onAuth: (joinData: { displayName: string }) => {
-        if (room.clients.count() >= 10) return auth.fail('room is full');
-        return auth.ok({ displayName: joinData.displayName });
+        if (room.clients.count() >= 10) return { ok: false, error: 'room is full' };
+        return { ok: true, data: { displayName: joinData.displayName } };
     },
 
     // client is authenticated and in the room

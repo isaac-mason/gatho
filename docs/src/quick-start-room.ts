@@ -1,10 +1,10 @@
 // counter-room.ts
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 let count = 0;
 
 const room = create({
-    onAuth: () => auth.ok(),
+    onAuth: () => ({ ok: true, data: {} }),
 
     onJoin: (client) => {
         client.send(JSON.stringify({ type: 'count', count }));

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { unpackFrame } from '../../src/common/protocol';
-import { auth, create } from '../../src/room/index';
+import { create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -108,7 +108,7 @@ describe('room broadcast except', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -129,7 +129,7 @@ describe('room broadcast except', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -150,7 +150,7 @@ describe('room broadcast except', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -175,7 +175,7 @@ describe('room broadcast except', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             // hold the seat so the client stays tracked while disconnected.
             onDrop: (client) => client.allowReconnection(60_000),
         });
@@ -215,7 +215,7 @@ describe('room broadcast except', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onDrop: (client) => client.allowReconnection(60_000),
         });
         await room.start();

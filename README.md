@@ -59,12 +59,12 @@ First, write a simple room that counts connections and messages:
 
 ```ts
 // counter-room.ts
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 let count = 0;
 
 const room = create({
-    onAuth: () => auth.ok(),
+    onAuth: () => ({ ok: true, data: {} }),
 
     onJoin: (client) => {
         client.send(JSON.stringify({ type: 'count', count }));
@@ -235,28 +235,37 @@ const dockerRunner = runner(async (ctx) => {
     // chan.socketDir is this room's own socket dir to bind-mount.
     const chan = await notify.uds(ctx, { socketDir: SOCKET_DIR });
 
-    const child = spawn('docker', [
-        'run',
-        // remove the container when it exits
-        '--rm',
-        // use host networking (simpler setup, you could also do port mapping)
-        '--network=host',
-        // give the container a name for easier debugging
-        '--name', `room-${ctx.roomId}`,
-        // limit memory
-        '--memory', '512m',
-        // limit CPU
-        '--cpus', '1',
-        // mount only THIS room's socket dir so the room can reach its own socket
-        // but not sibling rooms' sockets.
-        '-v', `${chan.socketDir}:${chan.socketDir}`,
-        // forward gatho env + the notify channel env to the container
-        ...Object.entries({ ...ctx.env, ...chan.env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
-        // set a game mode env var for the container based on ctx.data
-        '-e', `GAME_MODE=${gameMode}`,
-        // our docker image, runs gatho/room's create() + room.start() within
-        'my-game-image:latest',
-    ], { stdio: ['ignore', 'inherit', 'inherit'] });
+    const child = spawn(
+        'docker',
+        [
+            'run',
+            // remove the container when it exits
+            '--rm',
+            // use host networking (simpler setup, you could also do port mapping)
+            '--network=host',
+            // give the container a name for easier debugging
+            '--name',
+            `room-${ctx.roomId}`,
+            // limit memory
+            '--memory',
+            '512m',
+            // limit CPU
+            '--cpus',
+            '1',
+            // mount only THIS room's socket dir so the room can reach its own socket
+            // but not sibling rooms' sockets.
+            '-v',
+            `${chan.socketDir}:${chan.socketDir}`,
+            // forward gatho env + the notify channel env to the container
+            ...Object.entries({ ...ctx.env, ...chan.env }).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+            // set a game mode env var for the container based on ctx.data
+            '-e',
+            `GAME_MODE=${gameMode}`,
+            // our docker image, runs gatho/room's create() + room.start() within
+            'my-game-image:latest',
+        ],
+        { stdio: ['ignore', 'inherit', 'inherit'] },
+    );
 
     // when the child exits, tear down the channel and tell the server the room stopped
     child.on('exit', (code) => {
@@ -297,14 +306,15 @@ The helper returns `chan.env`, which holds `GATHO_NOTIFY_SOCKET` (a `uds:<path>`
 ### Lifecycle
 
 ```ts
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 const room = create({
-    // return auth.ok(data) to accept, auth.fail(reason) to reject.
-    // callbacks close over `room` — no room parameter is passed.
+    // return { ok: true, data } to accept, { ok: false, error } to reject.
+    // callbacks close over `room` — no room parameter is passed. keep the `room`
+    // read in a statement (the if-guard below), not in the returned expression.
     onAuth: (joinData: { displayName: string }) => {
-        if (room.clients.count() >= 10) return auth.fail('room is full');
-        return auth.ok({ displayName: joinData.displayName });
+        if (room.clients.count() >= 10) return { ok: false, error: 'room is full' };
+        return { ok: true, data: { displayName: joinData.displayName } };
     },
 
     // client is authenticated and in the room
@@ -351,14 +361,14 @@ A room is two-phase: `create(options)` builds the room synchronously (resolving 
 For local dev or tests where you want to `bun run room.ts` and connect a client directly, pass `standalone: true`. The room picks a random `roomId`, skips the UDS, and accepts any connection.
 
 ```ts
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 // opt in to standalone mode, which skips jwt auth and ipc.
 // create() throws if `standalone` is omitted and no GATHO_* env vars are set.
 const room = create({
     standalone: true,
     port: 8080,
-    onAuth: () => auth.ok(),
+    onAuth: () => ({ ok: true, data: {} }),
     onMessage: (client, message) => client.send(message),
 });
 
@@ -510,10 +520,10 @@ The client's `onOpen` handler and the room's `onJoin` fire at the same protocol 
 **Outbound backpressure.** Gatho exposes each socket's unflushed outbound buffer via `client.bufferedAmount` but ships no automatic eviction policy — bursty payloads (a voxel world sync) must not be killed by a threshold gatho guessed at, so the pacing and eviction decisions are yours. See [Backpressure](#backpressure) below.
 
 ```ts
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 const room = create({
-    onAuth: () => auth.ok(),
+    onAuth: () => ({ ok: true, data: {} }),
 
     onDrop: (client) => {
         client.allowReconnection(30_000); // hold seat for 30s
@@ -540,10 +550,10 @@ There are two things you typically do with the signal.
 (For readers who'd rather adopt an automatic policy: uWebSockets caps the buffer with `maxBackpressure` and drops the socket past it; Bun's `ws.send()` returns a negative value under backpressure so you can stop feeding it. gatho exposes the raw signal and lets you choose.)
 
 ```ts
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 const room = create({
-    onAuth: () => auth.ok(),
+    onAuth: () => ({ ok: true, data: {} }),
 });
 
 // --- (a) pacing a large send ---

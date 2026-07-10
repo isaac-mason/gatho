@@ -9,7 +9,6 @@
 // api drops the `room` param from callbacks, so the factory threads the handle in.
 // See README.
 
-import { auth } from 'gatho/room';
 import type { RoomModule } from '../adapter/index';
 
 type ClientData = { name: string };
@@ -17,7 +16,7 @@ type ClientData = { name: string };
 let messageCount = 0;
 
 const echo: RoomModule<ClientData> = (room) => ({
-    onAuth: (joinData: { name?: string }) => auth.ok({ name: joinData.name ?? 'anon' }),
+    onAuth: (joinData: { name?: string }) => ({ ok: true, data: { name: joinData.name ?? 'anon' } }),
 
     onJoin: (client) => {
         room.broadcast(JSON.stringify({ type: 'join', name: client.data.name, count: room.clients.count() }));

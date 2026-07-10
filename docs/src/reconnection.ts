@@ -1,7 +1,7 @@
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 const room = create({
-    onAuth: () => auth.ok(),
+    onAuth: () => ({ ok: true, data: {} }),
 
     onDrop: (client) => {
         client.allowReconnection(30_000); // hold seat for 30s

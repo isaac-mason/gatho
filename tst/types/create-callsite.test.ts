@@ -9,7 +9,7 @@
 // a real room. the shim's return type is the real Room<ClientData>, so the
 // self-reference exercises the exact inference path the real api uses.
 
-import { auth, create as realCreate, type Room } from 'gatho/room';
+import { type AuthResult, create as realCreate, type Room } from 'gatho/room';
 import { describe, expectTypeOf, test } from 'vitest';
 
 const create: typeof realCreate = realCreate;
@@ -19,10 +19,17 @@ describe('create() generic inference', () => {
         // the locked contract: onAuth closes over `room` (capacity check) while
         // its return type drives ClientData inference, and the whole thing
         // compiles clean with client.data typed in every callback.
+        //
+        // the `room` reference lives in a STATEMENT (if-guard in a block body),
+        // NOT inside the returned expression — an arrow whose expression body is
+        // `room.x ? {ok:false,...} : {ok:true,...}` makes the inferred return type
+        // circular and fails with TS7022. keep the room read in a statement.
         const room: Room<{ name: string }> = create({
             standalone: true,
-            onAuth: (join: { name: string }) =>
-                room.clients.count() < 8 ? auth.ok({ name: join.name }) : auth.fail('full'),
+            onAuth: (join: { name: string }) => {
+                if (room.clients.count() >= 8) return { ok: false, error: 'full' };
+                return { ok: true, data: { name: join.name } };
+            },
             onJoin: (client) => {
                 expectTypeOf(client.data).toEqualTypeOf<{ name: string }>();
                 // per-client verbs live on the handle now.
@@ -73,12 +80,85 @@ describe('create() generic inference', () => {
     test('only joinData annotated', () => {
         const room = create({
             standalone: true,
-            onAuth: (joinData: { token: string }) => auth.ok({ verified: true, token: joinData.token }),
+            onAuth: (joinData: { token: string }) => ({ ok: true, data: { verified: true, token: joinData.token } }),
             onJoin: (client) => {
                 expectTypeOf(client.data).toEqualTypeOf<{ verified: boolean; token: string }>();
             },
         });
         expectTypeOf(room).toMatchObjectType<Room<{ verified: boolean; token: string }>>();
+    });
+
+    test('plain-literal early returns in a block body infer ClientData', () => {
+        // a block body with an early-return reject arm and an accept arm — both
+        // plain literals — infers ClientData from the accept arm.
+        const room = create({
+            standalone: true,
+            onAuth: (join: { name: string }) => {
+                if (!join.name) return { ok: false, error: 'no name' };
+                return { ok: true, data: { name: join.name } };
+            },
+            onJoin: (client) => {
+                expectTypeOf(client.data).toEqualTypeOf<{ name: string }>();
+            },
+        });
+        expectTypeOf(room).toMatchObjectType<Room<{ name: string }>>();
+    });
+
+    test('async onAuth returning plain literals infers ClientData', () => {
+        const room = create({
+            standalone: true,
+            onAuth: async (join: { token: string }) => {
+                if (!join.token) return { ok: false, error: 'unauthorized' };
+                return { ok: true, data: { token: join.token } };
+            },
+            onJoin: (client) => {
+                expectTypeOf(client.data).toEqualTypeOf<{ token: string }>();
+            },
+        });
+        expectTypeOf(room).toMatchObjectType<Room<{ token: string }>>();
+    });
+
+    test('accept-all with empty data literal', () => {
+        // the plain-literal replacement for the old auth.ok() with no argument.
+        // `data: {}` infers the empty object type for ClientData.
+        const room = create({
+            standalone: true,
+            onAuth: () => ({ ok: true, data: {} }),
+            onJoin: (client) => {
+                // biome-ignore lint/complexity/noBannedTypes: {} is the literal inferred type
+                expectTypeOf(client.data).toEqualTypeOf<{}>();
+            },
+        });
+        // biome-ignore lint/complexity/noBannedTypes: {} is the literal inferred type
+        expectTypeOf(room).toMatchObjectType<Room<{}>>();
+    });
+
+    test('widening footgun: hoisting to an untyped local breaks the union', () => {
+        // FOOTGUN (verified): hoisting the result through an untyped local widens
+        // `ok` from `true` to `boolean`, so the value no longer matches the
+        // `{ ok: true; data }` arm and fails assignability to AuthResult. return
+        // the literal directly, or annotate the local, to keep `ok` narrow.
+        create({
+            standalone: true,
+            // @ts-expect-error — `res.ok` widens to boolean; not assignable to AuthResult
+            onAuth: (join: { name: string }) => {
+                const res = { ok: true, data: { name: join.name } };
+                return res;
+            },
+        });
+
+        // the fix: annotating the local pins `ok: true` and it assigns cleanly.
+        const room = create({
+            standalone: true,
+            onAuth: (join: { name: string }) => {
+                const res: AuthResult<{ name: string }> = { ok: true, data: { name: join.name } };
+                return res;
+            },
+            onJoin: (client) => {
+                expectTypeOf(client.data).toEqualTypeOf<{ name: string }>();
+            },
+        });
+        expectTypeOf(room).toMatchObjectType<Room<{ name: string }>>();
     });
 
     test('client connect handler bag typing', () => {

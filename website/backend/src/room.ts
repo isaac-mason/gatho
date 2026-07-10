@@ -1,4 +1,4 @@
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 import { clientCodec, serverCodec } from '../../shared/protocol';
 
 // each visitor is a live cursor. binary protocol (see ../../shared/protocol):
@@ -38,7 +38,7 @@ const room = create({
         const color = COLORS[seq % COLORS.length];
         const name = `${NAMES[seq % NAMES.length]}-${seq}`;
         seq++;
-        return auth.ok({ color, name });
+        return { ok: true, data: { color, name } };
     },
 
     onJoin: (client) => {

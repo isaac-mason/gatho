@@ -1,6 +1,6 @@
 import { connect } from 'gatho/client';
 import type { Room } from 'gatho/room';
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 import { afterEach, describe, expect, it } from 'vitest';
 
 function sleep(ms: number): Promise<void> {
@@ -41,7 +41,7 @@ describe('standalone room', () => {
     it('starts with auto-generated roomId and default roomType', async () => {
         room = create({
             standalone: true,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -57,7 +57,7 @@ describe('standalone room', () => {
         room = create({
             standalone: true,
             port: 19876,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onMessage: (client, msg) => client.send(msg),
         });
         await room.start();
@@ -76,7 +76,7 @@ describe('standalone room', () => {
         room = create({
             standalone: true,
             port: 19877,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onMessage: (client, msg) => client.send(msg),
         });
         await room.start();
@@ -98,7 +98,7 @@ describe('standalone room', () => {
         room = create({
             standalone: true,
             port: 19878,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onMessage: (_client, msg) => room!.broadcast(msg),
         });
         await room.start();
@@ -127,7 +127,7 @@ describe('standalone room', () => {
         room = create({
             standalone: true,
             port: 19879,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onJoin: () => {
                 joinedCount++;
                 // send current client count to all
@@ -173,7 +173,7 @@ describe('standalone room', () => {
         room = create({
             standalone: true,
             port: 19880,
-            onAuth: () => auth.fail('not allowed'),
+            onAuth: () => ({ ok: false, error: 'not allowed' }),
         });
         await room.start();
 
@@ -201,7 +201,7 @@ describe('standalone room', () => {
         room = create({
             standalone: true,
             port: 19881,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -242,7 +242,7 @@ describe('standalone room', () => {
                 serverId: 'srv-1',
                 roomSecret: 'test',
             },
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -255,7 +255,7 @@ describe('standalone room', () => {
         room = create({
             standalone: true,
             port: 19882,
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
             onMessage: (client, msg) => client.send(msg),
         });
         await room.start();

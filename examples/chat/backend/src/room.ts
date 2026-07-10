@@ -1,11 +1,11 @@
-import { auth, create } from 'gatho/room';
+import { create } from 'gatho/room';
 
 const messages: Array<{ user: string; text: string; timestamp: number }> = [];
 
 const room = create({
     onAuth: (joinData: { displayName?: string }) => {
         const username = joinData.displayName || 'anonymous';
-        return auth.ok({ username });
+        return { ok: true, data: { username } };
     },
 
     onJoin: (client) => {

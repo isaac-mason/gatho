@@ -3172,24 +3172,5 @@ function create(options) {
     return room;
 }
 
-// gatho/room — room-side api
-// rooms are scripts. user calls create() to build a Room handle (sync), then
-// awaits room.start() to bring it online. no defineRoom, no hook bags, no
-// RoomContext. the module IS the room: state closes over module scope, and
-// instancing happens by evaluating the module in a fresh process / worker /
-// isolate.
-// protocol helpers for non-node runtimes that need to speak the notify wire
-// protocol themselves (e.g. a workerd harness relaying room notifications over tcp)
-// helpers for returning auth results with correct literal types
-// avoids the user needing `as const` on every return
-const auth = {
-    ok(data = {}) {
-        return { ok: true, data };
-    },
-    fail(error) {
-        return { ok: false, error };
-    },
-};
-
-export { CloseCode, auth, create, createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec, wsTransport };
+export { CloseCode, create, createFrameParser, encodeNotifyFrame, encodeRawFrame, notifyCodec, wsTransport };
 //# sourceMappingURL=room.js.map

@@ -5,7 +5,6 @@
 // Exports a `(room) => options` factory (this example's adapter convention, not a
 // gatho API — see README and rooms/echo.ts).
 
-import { auth } from 'gatho/room';
 import type { RoomModule } from '../adapter/index';
 
 type ClientData = { name: string };
@@ -14,7 +13,7 @@ type Pos = { x: number; y: number };
 const positions = new Map<string, Pos>();
 
 const cursor: RoomModule<ClientData> = (room) => ({
-    onAuth: (joinData: { name?: string }) => auth.ok({ name: joinData.name ?? 'anon' }),
+    onAuth: (joinData: { name?: string }) => ({ ok: true, data: { name: joinData.name ?? 'anon' } }),
 
     onJoin: (client) => {
         positions.set(client.id, { x: 0, y: 0 });

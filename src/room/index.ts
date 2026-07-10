@@ -32,21 +32,32 @@ export { CloseCode } from '../common/close-code';
 
 // --- auth result ---
 
-// discriminated union for onAuth return
-// ok: true — client accepted, data becomes client.data
-// ok: false — client rejected, error is sent to client before close
+// discriminated union for onAuth return.
+// ok: true — client accepted, data becomes client.data.
+// ok: false — client rejected, error is sent to client before close.
+//
+// onAuth returns this union directly as a plain object literal — there is no
+// helper to build it. accept with `{ ok: true, data }`, reject with
+// `{ ok: false, error }`. accept-all with empty data is `{ ok: true, data: {} }`.
+//
+// two typescript footguns to avoid (both trip ClientData inference):
+//
+//   1. return the literal DIRECTLY (or annotate onAuth's return) — do not hoist
+//      it through an untyped local. `const res = { ok: true, data }; return res;`
+//      widens `res.ok` to `boolean`, which no longer matches the `ok: true` arm
+//      of the union and fails assignability. keep the literal in the return.
+//
+//   2. when onAuth references the `room` const (e.g. a capacity check), keep that
+//      reference in a STATEMENT — an if-guard in a block body — not inside the
+//      returned expression. an arrow whose expression body is
+//      `room.x ? { ok: false, error } : { ok: true, data }` makes the inferred
+//      return type circular and fails with TS7022 ('room' referenced directly or
+//      indirectly in its own initializer). instead:
+//        onAuth: (join) => {
+//            if (room.clients.count() >= max) return { ok: false, error: 'full' };
+//            return { ok: true, data: { name: join.name } };
+//        }
 export type AuthResult<ClientData> = { ok: true; data: ClientData } | { ok: false; error: unknown };
-
-// helpers for returning auth results with correct literal types
-// avoids the user needing `as const` on every return
-export const auth = {
-    ok<T = Record<string, never>>(data: T = {} as T): AuthResult<T> {
-        return { ok: true, data };
-    },
-    fail(error: unknown): { ok: false; error: unknown } {
-        return { ok: false, error };
-    },
-};
 
 // --- client ---
 

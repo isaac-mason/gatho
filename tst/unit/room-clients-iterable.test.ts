@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { unpackFrame } from '../../src/common/protocol';
-import { auth, create } from '../../src/room/index';
+import { create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -60,7 +60,7 @@ describe('room.clients iterable', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: (joinData: { name: string }) => auth.ok({ name: joinData.name }),
+            onAuth: (joinData: { name: string }) => ({ ok: true, data: { name: joinData.name } }),
         });
         await room.start();
 
@@ -83,7 +83,7 @@ describe('room.clients iterable', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 
@@ -100,7 +100,7 @@ describe('room.clients iterable', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(sink),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
 

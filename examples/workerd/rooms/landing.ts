@@ -13,7 +13,7 @@
 // cursors stream (~20Hz per client) the isolate is active and the timeout fires
 // on schedule; when everyone is idle there's nothing to flush anyway.
 
-import { auth, type Room } from 'gatho/room';
+import type { Room } from 'gatho/room';
 import type { RoomModule } from '../adapter/index';
 import { clientCodec, serverCodec } from '../shared/protocol';
 
@@ -72,7 +72,7 @@ const landing: RoomModule<ClientData> = (room) => ({
         const color = COLORS[seq % COLORS.length];
         const name = `${NAMES[seq % NAMES.length]}-${seq}`;
         seq++;
-        return auth.ok({ color, name });
+        return { ok: true, data: { color, name } };
     },
 
     onJoin: (client) => {

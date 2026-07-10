@@ -13,13 +13,6 @@ export type AuthResult<ClientData> = {
     ok: false;
     error: unknown;
 };
-export declare const auth: {
-    ok<T = Record<string, never>>(data?: T): AuthResult<T>;
-    fail(error: unknown): {
-        ok: false;
-        error: unknown;
-    };
-};
 export type SendOptions = {
     reliable?: boolean;
 };

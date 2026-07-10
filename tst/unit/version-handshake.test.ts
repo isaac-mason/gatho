@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION, unpackFrame } from '../../src/common/protocol';
-import { auth, create } from '../../src/room/index';
+import { create } from '../../src/room/index';
 import type {
     ClientSocket,
     Transport,
@@ -72,7 +72,7 @@ describe('protocol version handshake', () => {
         const room = create({
             standalone: true,
             transport: stubTransport(captured),
-            onAuth: () => auth.ok({}),
+            onAuth: () => ({ ok: true, data: {} }),
         });
         await room.start();
     });
