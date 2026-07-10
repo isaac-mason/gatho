@@ -43,10 +43,6 @@ type TrackedClient = {
     reliableBuffer: BufferedMessage[];
     reliableBufferBytes: number;
     disconnectTimer: ReturnType<typeof setTimeout> | null;
-    // outbound backpressure: latch so the "crossed 50% of the cap" warn fires at
-    // most once per client (per socket lifetime) instead of every send/sweep.
-    // reset to false on reconnect (fresh socket, fresh buffer).
-    outboundWarned: boolean;
     // driver-internal tags forwarded from the reservation jwt. opaque to
     // user code — echoed back over ipc on client-connected/heartbeat so
     // the server can pass them to driver.connectClient. enables self-heal
@@ -68,10 +64,6 @@ type RoomState = {
     sessionTokens: Map<string, string>; // token -> clientId
     ipc: Notifier | null;
     heartbeatInterval: ReturnType<typeof setInterval> | null;
-    // periodic outbound-backpressure sweep. runs in managed and standalone mode
-    // alike (a stalled consumer is a memory risk regardless of ipc), on the same
-    // cadence as the heartbeat.
-    backpressureInterval: ReturnType<typeof setInterval> | null;
     alive: boolean;
     server: TransportServer | null;
     sigtermHandler: (() => void) | null;
@@ -158,25 +150,6 @@ export type StartOptions<ClientData, JoinData extends Record<string, unknown> = 
      *  buffer exceeds this, the client is evicted. default: 1MB (1_048_576). */
     maxBufferBytes?: number;
 
-    /** per-client outbound backpressure cap in bytes. this bounds the *live* socket's
-     *  unflushed send buffer (the kernel/userland ws `bufferedAmount`), whereas
-     *  `maxBufferBytes` bounds the reliable buffer held for a *disconnected* client.
-     *
-     *  a connected client whose outbound buffer exceeds this cap is treated as a
-     *  stalled consumer — it can't drain broadcasts/sends as fast as the room
-     *  produces them — and is evicted (closed 4000, `onLeave` fires). without this
-     *  a single slow tcp peer would accumulate unbounded memory in the room process
-     *  at broadcast rates: a memory DoS one bad client can trigger.
-     *
-     *  enforced on every `room.send` (checked before the enqueue and again after)
-     *  and swept every heartbeat interval (~3s) so a peer that only receives
-     *  broadcasts — which fan out via the transport's pub/sub and never touch the
-     *  room's per-socket path — is still caught. transports that can't observe
-     *  `bufferedAmount` report 0 and are never evicted for pressure.
-     *
-     *  default: 4MB (4_194_304). */
-    maxOutboundBufferBytes?: number;
-
     /** auth handler — called for every new connection.
      *  return `auth.ok(data)` to accept (data becomes `client.data`),
      *  or `auth.fail(reason)` to reject.
@@ -256,11 +229,6 @@ function createClientCollection<ClientData>(clients: Map<string, TrackedClient>)
 // default per-client reliable message buffer cap: 1mb
 const DEFAULT_MAX_BUFFER_BYTES = 1_048_576;
 
-// default per-client outbound backpressure cap: 4mb. larger than the reliable
-// buffer cap because it bounds a live socket's transient send backlog (bursts of
-// broadcasts drain quickly on a healthy peer), not messages held for an absent one.
-const DEFAULT_MAX_OUTBOUND_BUFFER_BYTES = 4_194_304;
-
 // permanently remove a client — cancel timers, invalidate session token,
 // fire onLeave, notify driver. used on reconnect window expiry, buffer overflow,
 // consented close, and disconnect without allowReconnection.
@@ -297,49 +265,9 @@ function evictClient<ClientData>(
     state.ipc?.send({ type: 'client-disconnected', clientId: tracked.id });
 }
 
-// outbound backpressure check for a single connected client. if the live socket's
-// unflushed buffer exceeds the cap, the client is a stalled consumer — evict it
-// (close 4000: a terminal 'server' close client-side, so a stalled peer does not
-// auto-reconnect straight back into the same pressure) and return true. below the
-// cap, warn once when it crosses 50% so operators see pressure building before the
-// eviction. sockets with no live socket, or transports that always report 0, are
-// never evicted here.
-function checkOutboundPressure<ClientData>(
-    state: RoomState,
-    tracked: TrackedClient,
-    maxOutboundBufferBytes: number,
-    room: Room<ClientData>,
-    onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>,
-): boolean {
-    if (!tracked.socket) return false;
-    const buffered = tracked.socket.bufferedAmount();
-
-    if (buffered > maxOutboundBufferBytes) {
-        state.log.warn('evicting stalled consumer over outbound buffer cap', {
-            clientId: tracked.id,
-            bufferedAmount: buffered,
-            maxOutboundBufferBytes,
-        });
-        evictClient(state, tracked, room, onLeave);
-        return true;
-    }
-
-    if (!tracked.outboundWarned && buffered > maxOutboundBufferBytes / 2) {
-        tracked.outboundWarned = true;
-        state.log.warn('client outbound buffer over 50% of cap', {
-            clientId: tracked.id,
-            bufferedAmount: buffered,
-            maxOutboundBufferBytes,
-        });
-    }
-
-    return false;
-}
-
 function createRoom<ClientData>(
     state: RoomState,
     maxBufferBytes: number,
-    maxOutboundBufferBytes: number,
     callbacks: {
         onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
         onShutdown?: () => void | Promise<void>;
@@ -377,12 +305,7 @@ function createRoom<ClientData>(
             const reliable = options?.reliable !== false;
 
             if (tracked.socket) {
-                // outbound backpressure: if the socket is already past the cap, evict
-                // before enqueueing more onto a stalled consumer.
-                if (checkOutboundPressure(state, tracked, maxOutboundBufferBytes, room, callbacks.onLeave)) return;
                 tracked.socket.send(framed, true);
-                // re-check after the write — this send may have pushed a slow peer over.
-                checkOutboundPressure(state, tracked, maxOutboundBufferBytes, room, callbacks.onLeave);
             } else if (reliable) {
                 bufferForClient(tracked, framed);
             }
@@ -484,29 +407,6 @@ function startHeartbeat(state: RoomState): void {
     }, HEARTBEAT_INTERVAL_MS);
 }
 
-// --- outbound backpressure sweep ---
-
-// broadcasts fan out through the transport's pub/sub (server.publish), which
-// bypasses the room's per-socket send path entirely — so room.send's check can't
-// see a peer that only receives broadcasts. sweep every tracked live socket on the
-// heartbeat cadence and evict any over the cap. this is the mechanism that catches
-// broadcast-only pressure; room.send's inline check catches directed-send pressure
-// sooner. runs in both managed and standalone mode.
-function startBackpressureSweep<ClientData>(
-    state: RoomState,
-    maxOutboundBufferBytes: number,
-    room: Room<ClientData>,
-    onLeave?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>,
-): void {
-    state.backpressureInterval = setInterval(() => {
-        if (!state.alive) return;
-        // snapshot: checkOutboundPressure evicts (mutates state.clients) on a hit.
-        for (const tracked of Array.from(state.clients.values())) {
-            checkOutboundPressure(state, tracked, maxOutboundBufferBytes, room, onLeave);
-        }
-    }, HEARTBEAT_INTERVAL_MS);
-}
-
 // --- ws server ---
 
 function startRoom<ClientData, JoinData extends Record<string, unknown>>(
@@ -515,7 +415,6 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
     options: {
         port?: number;
         maxBufferBytes: number;
-        maxOutboundBufferBytes: number;
         onAuth?: (room: Room<unknown>, joinData: JoinData) => AuthResult<ClientData> | Promise<AuthResult<ClientData>>;
         onJoin?: (room: Room<ClientData>, client: Client<ClientData>) => void | Promise<void>;
         onMessage?: (room: Room<ClientData>, client: Client<ClientData>, message: string | ArrayBuffer) => void | Promise<void>;
@@ -527,7 +426,7 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
 ): Promise<{ port: number; room: Room<ClientData> }> {
     // the room handle is created once and shared — same object passed to callbacks
     // and returned from start()
-    const room = createRoom<ClientData>(state, options.maxBufferBytes, options.maxOutboundBufferBytes, {
+    const room = createRoom<ClientData>(state, options.maxBufferBytes, {
         onLeave: options.onLeave,
         onShutdown: options.onShutdown,
     });
@@ -661,7 +560,6 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
                     reliableBuffer: [],
                     reliableBufferBytes: 0,
                     disconnectTimer: null,
-                    outboundWarned: false,
                     tags,
                 };
                 state.clients.set(clientId, tracked);
@@ -740,8 +638,6 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
 
             // swap socket
             tracked.socket = socket;
-            // fresh socket, fresh outbound buffer — re-arm the 50% warn latch.
-            tracked.outboundWarned = false;
 
             // subscribe new socket to broadcast topic
             socket.subscribe(BROADCAST_TOPIC);
@@ -808,7 +704,6 @@ function startRoom<ClientData, JoinData extends Record<string, unknown>>(
 
     return transport.listen(handlers, { port: options.port }).then((server) => {
         state.server = server;
-        startBackpressureSweep(state, options.maxOutboundBufferBytes, room, options.onLeave);
         return { port: server.port, room };
     });
 }
@@ -833,11 +728,6 @@ async function stopRoom<ClientData>(
     if (state.heartbeatInterval) {
         clearInterval(state.heartbeatInterval);
         state.heartbeatInterval = null;
-    }
-
-    if (state.backpressureInterval) {
-        clearInterval(state.backpressureInterval);
-        state.backpressureInterval = null;
     }
 
     if (onShutdown) {
@@ -976,7 +866,6 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
         sessionTokens: new Map(),
         ipc,
         heartbeatInterval: null,
-        backpressureInterval: null,
         alive: true,
         server: null,
         sigtermHandler: null,
@@ -988,7 +877,6 @@ export async function start<ClientData, JoinData extends Record<string, unknown>
     const { port, room } = await startRoom<ClientData, JoinData>(state, transport, {
         port: options.port,
         maxBufferBytes: options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES,
-        maxOutboundBufferBytes: options.maxOutboundBufferBytes ?? DEFAULT_MAX_OUTBOUND_BUFFER_BYTES,
         onAuth: options.onAuth,
         onJoin: options.onJoin,
         onMessage: options.onMessage,
