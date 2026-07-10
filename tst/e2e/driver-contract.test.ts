@@ -628,3 +628,99 @@ describe.each(drivers)('room-failed signal ($name)', (setup) => {
         expect(info.status).toBe('running');
     });
 });
+
+// --- 6. pipelined multi-room / multi-client listings match per-room reads ------
+//
+// R10: the redis driver batches its read paths into pipelines (one smembers + one
+// pipeline of hgetalls) instead of N sequential round-trips. the batched results
+// must be byte-identical to what individual getRoomInfo calls produce. this test
+// stands up ~10 rooms × ~5 clients on one server and asserts listRooms /
+// listServers agree with the per-room getRoomInfo reads across every field. runs
+// against both drivers so the contract holds uniformly.
+
+describe.each(drivers)('pipelined listings match per-room reads ($name)', (setup) => {
+    let teardownCurrent: (() => Promise<void>) | null = null;
+
+    afterEach(async () => {
+        if (teardownCurrent) await teardownCurrent();
+        teardownCurrent = null;
+    });
+
+    it('listRooms and listServers agree with getRoomInfo across 10 rooms × 5 clients', async () => {
+        const { driver, teardown } = await setup.create();
+        teardownCurrent = teardown;
+        const d = driver._internal;
+
+        const id = Math.random().toString(36).slice(2, 8);
+        const serverId = `srv-${id}`;
+        await d.heartbeat({ serverId, endpoint: 'http://127.0.0.1:0', tags: { region: 'us' }, roomTypes: ['echo'] });
+
+        const roomIds: string[] = [];
+        for (let r = 0; r < 10; r++) {
+            const roomId = `room-${id}-${r}`;
+            roomIds.push(roomId);
+            await d.registerRoom(roomId, 'echo', serverId, { idx: r }, { shard: `s${r}` });
+            await d.roomReady(roomId, `ws://127.0.0.1:${9000 + r}`, `secret-${r}`);
+            for (let c = 0; c < 5; c++) {
+                const reservation = await d.reserveClient(roomId, 60_000, {}, { seat: `c${c}` });
+                // connect half of them so we exercise both reserved and connected states
+                if (c % 2 === 0) {
+                    await d.connectClient(reservation.clientId, roomId, { seat: `c${c}` });
+                }
+            }
+        }
+
+        // authoritative per-room reads
+        const perRoom = new Map<string, RoomInfoLike>();
+        for (const roomId of roomIds) {
+            const info = await d.getRoomInfo(roomId);
+            expect(info).not.toBeNull();
+            perRoom.set(roomId, normalizeRoom(info!));
+        }
+
+        // batched listing must reproduce every per-room read exactly
+        const listed = await d.listRooms({ serverId });
+        expect(listed).toHaveLength(10);
+        for (const room of listed) {
+            const expected = perRoom.get(room.roomId);
+            expect(expected).toBeDefined();
+            expect(normalizeRoom(room)).toEqual(expected);
+        }
+
+        // and listServers must carry the same rooms, again matching per-room reads
+        const servers = await d.listServers();
+        const server = servers.find((s) => s.serverId === serverId);
+        expect(server).toBeDefined();
+        expect(server!.rooms).toHaveLength(10);
+        for (const room of server!.rooms) {
+            expect(normalizeRoom(room)).toEqual(perRoom.get(room.roomId));
+        }
+    });
+});
+
+// normalize a RoomInfo for order-insensitive comparison: client arrays come back
+// in whatever order the driver's index iteration yields, so sort by clientId.
+type RoomInfoLike = ReturnType<typeof normalizeRoom>;
+function normalizeRoom(info: {
+    roomId: string;
+    roomType: string;
+    serverId: string;
+    status: string;
+    endpoint: string | null;
+    data: Record<string, unknown>;
+    tags: Record<string, string>;
+    clients: { clientId: string; status: string; tags: Record<string, string> }[];
+}) {
+    return {
+        roomId: info.roomId,
+        roomType: info.roomType,
+        serverId: info.serverId,
+        status: info.status,
+        endpoint: info.endpoint,
+        data: info.data,
+        tags: info.tags,
+        clients: [...info.clients]
+            .sort((a, b) => a.clientId.localeCompare(b.clientId))
+            .map((c) => ({ clientId: c.clientId, status: c.status, tags: c.tags })),
+    };
+}

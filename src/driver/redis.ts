@@ -1,7 +1,24 @@
 import Redis, { type Cluster } from 'ioredis';
 import { jwtSign } from '../common/jwt';
 import { log } from '../common/logger';
-import { RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from './errors';
+// import runtime values (error classes AND validators) from the `gatho/driver`
+// entry (external in the redis bundle) rather than relatively. this keeps ONE
+// class identity across the driver/redis split: the error classes these throw
+// (RoomFailedError, PayloadTooLargeError, InvalidTagError, ...) are the same
+// objects the sdk re-exports from `gatho/driver`, so `err instanceof X` holds
+// when a redis rejection propagates through the sdk. type-only imports stay
+// relative since they are erased at build time.
+import {
+    RoomFailedError,
+    RoomNotFoundError,
+    RoomNotRunningError,
+    RoomStartError,
+    RoomTimeoutError,
+    ServerNotFoundError,
+    validateTags,
+    validateReserveData,
+    validateReserveTagsSize,
+} from 'gatho/driver';
 import type {
     ClientInfo,
     ClientReservation,
@@ -16,7 +33,6 @@ import type {
     RoomStatus,
     ServerInfo,
 } from './types';
-import { validateTags, validateReserveData, validateReserveTagsSize } from './types';
 
 function attachLifecycleLogging(c: Redis | Cluster, name: 'main' | 'subscriber'): void {
     c.on('error', (err: Error) => log.error('redis connection error', { connection: name, err }));
@@ -34,6 +50,10 @@ function attachLifecycleLogging(c: Redis | Cluster, name: 'main' | 'subscriber')
 export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
     const prefix = options.prefix ?? 'gatho:{gatho}:';
     const keys = createKeys(prefix);
+
+    // staleness threshold — servers whose last heartbeat is older than this are
+    // considered dead (dropped from listServers, reaped by listStaleServers).
+    const staleServerMs = options.staleServerMs ?? DEFAULT_STALE_SERVER_MS;
 
     const client = options.client ?? new Redis(options.url ?? process.env.GATHO_REDIS_URL ?? 'redis://localhost:6379');
 
@@ -118,12 +138,26 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         await client.set(keys.schemaVersion, String(SCHEMA_VERSION));
     }
 
-    // helper: get client info for all clients in a room
+    // helper: get client info for all clients in a room.
+    // one smembers to read the index, then a single pipeline of hgetalls — one
+    // round-trip for the whole fan-out instead of N sequential reads. stale index
+    // entries (client key expired/deleted between the smembers and the read) are
+    // collected from the pipeline results and srem'd afterwards, preserving the
+    // self-cleanup the sequential version did inline.
     async function getClientsForRoom(roomId: string): Promise<ClientInfo[]> {
         const clientIds = await client.smembers(keys.clientsByRoom(roomId));
-        const result: ClientInfo[] = [];
+        if (clientIds.length === 0) return [];
+
+        const pipeline = client.pipeline();
         for (const clientId of clientIds) {
-            const clientData = await client.hgetall(keys.client(clientId));
+            pipeline.hgetall(keys.client(clientId));
+        }
+        const results = await pipeline.exec();
+
+        const result: ClientInfo[] = [];
+        const stale: string[] = [];
+        for (let i = 0; i < clientIds.length; i++) {
+            const clientData = (results?.[i]?.[1] ?? {}) as Record<string, string>;
             if (clientData.clientId) {
                 result.push({
                     clientId: clientData.clientId,
@@ -133,8 +167,11 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
                 });
             } else {
                 // stale index entry — client key expired/deleted
-                await client.srem(keys.clientsByRoom(roomId), clientId);
+                stale.push(clientIds[i]);
             }
+        }
+        if (stale.length > 0) {
+            await client.srem(keys.clientsByRoom(roomId), ...stale);
         }
         return result;
     }
@@ -156,22 +193,41 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         };
     }
 
-    // helper: get all rooms for a server
+    // batch-read room hashes for a set of ids in a single pipeline. returns the
+    // live room hashes (in the same order) and collects stale index ids so the
+    // caller can srem them from whatever index they came from.
+    async function readRoomHashes(roomIds: string[]): Promise<{ hashes: Record<string, string>[]; stale: string[] }> {
+        const pipeline = client.pipeline();
+        for (const roomId of roomIds) {
+            pipeline.hgetall(keys.room(roomId));
+        }
+        const results = await pipeline.exec();
+
+        const hashes: Record<string, string>[] = [];
+        const stale: string[] = [];
+        for (let i = 0; i < roomIds.length; i++) {
+            const data = (results?.[i]?.[1] ?? {}) as Record<string, string>;
+            if (data.roomId) {
+                hashes.push(data);
+            } else {
+                stale.push(roomIds[i]);
+            }
+        }
+        return { hashes, stale };
+    }
+
+    // helper: get all rooms for a server. one smembers + one pipeline of room
+    // hgetalls, then hashToRoomInfo fans out per-room client reads.
     async function getRoomsForServer(serverId: string): Promise<RoomInfo[]> {
         const roomIds = await client.smembers(keys.roomsByServerId(serverId));
         if (roomIds.length === 0) return [];
 
-        const rooms = await Promise.all(
-            roomIds.map(async (roomId) => {
-                const data = await client.hgetall(keys.room(roomId));
-                if (!data || !data.roomId) {
-                    // stale index entry
-                    await client.srem(keys.roomsByServerId(serverId), roomId);
-                    return null;
-                }
-                return hashToRoomInfo(data);
-            }),
-        );
+        const { hashes, stale } = await readRoomHashes(roomIds);
+        if (stale.length > 0) {
+            await client.srem(keys.roomsByServerId(serverId), ...stale);
+        }
+
+        const rooms = await Promise.all(hashes.map((data) => hashToRoomInfo(data)));
         return rooms.filter((r): r is RoomInfo => r !== null);
     }
 
@@ -348,7 +404,12 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         const roomIds = await client.smembers(keys.rooms);
         if (roomIds.length === 0) return [];
 
-        const rooms = await Promise.all(roomIds.map((roomId) => getRoomInfo(roomId)));
+        const { hashes, stale } = await readRoomHashes(roomIds);
+        if (stale.length > 0) {
+            await client.srem(keys.rooms, ...stale);
+        }
+
+        const rooms = await Promise.all(hashes.map((data) => hashToRoomInfo(data)));
         let result = rooms.filter((r): r is RoomInfo => r !== null);
 
         if (filter?.type) {
@@ -548,22 +609,17 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         const roomIds = await client.smembers(keys.roomsByServerId(options.serverId));
         const desiredRooms: DesiredRoom[] = [];
         if (roomIds.length > 0) {
-            const rooms = await Promise.all(
-                roomIds.map(async (roomId) => {
-                    const data = await client.hgetall(keys.room(roomId));
-                    if (!data || !data.roomId) {
-                        // stale index entry
-                        await client.srem(keys.roomsByServerId(options.serverId), roomId);
-                        return null;
-                    }
-                    return {
-                        roomId: data.roomId,
-                        roomType: data.roomType,
-                        data: JSON.parse(data.data || '{}') as RoomData,
-                    };
-                }),
-            );
-            for (const r of rooms) if (r) desiredRooms.push(r);
+            const { hashes, stale } = await readRoomHashes(roomIds);
+            if (stale.length > 0) {
+                await client.srem(keys.roomsByServerId(options.serverId), ...stale);
+            }
+            for (const data of hashes) {
+                desiredRooms.push({
+                    roomId: data.roomId,
+                    roomType: data.roomType,
+                    data: JSON.parse(data.data || '{}') as RoomData,
+                });
+            }
         }
 
         return { tags, desiredRooms, registered };
@@ -600,22 +656,42 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         await client.hset(keys.server(serverId), { tags: JSON.stringify(existing) });
     }
 
+    // batch-read server hashes in a single pipeline. returns the live hashes and
+    // collects stale index ids for cleanup.
+    async function readServerHashes(serverIds: string[]): Promise<{ hashes: Record<string, string>[]; stale: string[] }> {
+        const pipeline = client.pipeline();
+        for (const serverId of serverIds) {
+            pipeline.hgetall(keys.server(serverId));
+        }
+        const results = await pipeline.exec();
+
+        const hashes: Record<string, string>[] = [];
+        const stale: string[] = [];
+        for (let i = 0; i < serverIds.length; i++) {
+            const data = (results?.[i]?.[1] ?? {}) as Record<string, string>;
+            if (data.serverId) {
+                hashes.push(data);
+            } else {
+                stale.push(serverIds[i]);
+            }
+        }
+        return { hashes, stale };
+    }
+
     async function listServers(filter?: ListServersFilter): Promise<ServerInfo[]> {
-        const cutoff = Date.now() - STALE_MS;
+        const cutoff = Date.now() - staleServerMs;
         const serverIds = await client.smembers(keys.servers);
         if (serverIds.length === 0) return [];
 
-        const servers = await Promise.all(
-            serverIds.map(async (serverId) => {
-                const data = await client.hgetall(keys.server(serverId));
-                if (!data || !data.serverId) {
-                    await client.srem(keys.servers, serverId);
-                    return null;
-                }
+        const { hashes, stale } = await readServerHashes(serverIds);
+        if (stale.length > 0) {
+            await client.srem(keys.servers, ...stale);
+        }
 
+        const servers = await Promise.all(
+            hashes.map(async (data) => {
                 const lastHeartbeat = Number(data.lastHeartbeat);
                 if (lastHeartbeat < cutoff) return null;
-
                 return hashToServerInfo(data);
             }),
         );
@@ -641,22 +717,20 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
     }
 
     async function listStaleServers(): Promise<ServerInfo[]> {
-        const cutoff = Date.now() - STALE_MS;
+        const cutoff = Date.now() - staleServerMs;
         const serverIds = await client.smembers(keys.servers);
         if (serverIds.length === 0) return [];
 
-        const servers = await Promise.all(
-            serverIds.map(async (serverId) => {
-                const data = await client.hgetall(keys.server(serverId));
-                if (!data || !data.serverId) {
-                    await client.srem(keys.servers, serverId);
-                    return null;
-                }
+        const { hashes, stale } = await readServerHashes(serverIds);
+        if (stale.length > 0) {
+            await client.srem(keys.servers, ...stale);
+        }
 
+        const servers = await Promise.all(
+            hashes.map(async (data) => {
                 const lastHeartbeat = Number(data.lastHeartbeat);
                 // only include servers whose heartbeat IS older than cutoff
                 if (lastHeartbeat >= cutoff) return null;
-
                 return hashToServerInfo(data);
             }),
         );
@@ -759,10 +833,23 @@ export type RedisDriverOptions = {
      * e.g. "myapp:{myapp}:".
      */
     prefix?: string;
+    /**
+     * how long (ms) a server may go without a heartbeat before it is treated as
+     * dead — dropped from listServers and reaped (with its rooms) by the leader.
+     * defaults to 30_000.
+     *
+     * tradeoff: a lower value fails a dead server over faster, but is less
+     * tolerant of transient driver blips (a brief redis hiccup that delays a
+     * heartbeat can trip a too-low threshold and reap a healthy server, killing
+     * its rooms). a higher value tolerates blips at the cost of slower failover.
+     * this must comfortably exceed the server's heartbeatIntervalMs (default
+     * 5_000) — allow room for several missed beats plus round-trip jitter.
+     */
+    staleServerMs?: number;
 };
 
-// hardcoded staleness threshold — servers older than this are considered dead
-const STALE_MS = 30_000;
+// default staleness threshold — servers older than this are considered dead
+const DEFAULT_STALE_SERVER_MS = 30_000;
 
 // how long a 'requested' room hash lives before redis auto-expires it
 const REQUESTED_ROOM_TTL_MS = 30_000;
