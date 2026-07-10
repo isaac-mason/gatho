@@ -1,7 +1,7 @@
 import Redis, { type Cluster } from 'ioredis';
 import { jwtSign } from '../common/jwt';
 import { log } from '../common/logger';
-import { RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from './errors';
+import { RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError } from './errors';
 import type {
     ClientInfo,
     ClientReservation,
@@ -255,7 +255,10 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         await client.publish(keys.roomReady(roomId), roomId);
     }
 
-    async function roomFailure(roomId: string, _reason: string): Promise<void> {
+    async function roomFailure(roomId: string, reason: string): Promise<void> {
+        // publish the failure BEFORE deleting the records so a waitForRoom waiter
+        // rejects with the real cause rather than eventually timing out.
+        await client.publish(keys.roomFailed(roomId), reason);
         await unregisterRoom(roomId);
     }
 
@@ -264,17 +267,18 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         const existing = await getRoomInfo(roomId);
         if (existing && existing.status === 'running') return existing;
 
-        const channel = keys.roomReady(roomId);
+        const readyChannel = keys.roomReady(roomId);
+        const failedChannel = keys.roomFailed(roomId);
 
         return new Promise<RoomInfo>((resolve, reject) => {
             let settled = false;
-            let unsub: (() => void) | null = null;
+            const unsubs: (() => void)[] = [];
 
             const cleanup = () => {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
-                if (unsub) unsub();
+                for (const u of unsubs) u();
             };
 
             const timer = setTimeout(() => {
@@ -282,7 +286,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
                 reject(new RoomTimeoutError(roomId, timeoutMs));
             }, timeoutMs);
 
-            const listener = (_ch: string, _msg: string) => {
+            const readyListener = (_ch: string, _msg: string) => {
                 cleanup();
                 // fetch full room info
                 getRoomInfo(roomId)
@@ -296,13 +300,24 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
                     .catch(reject);
             };
 
-            subscribeChannel(channel, listener)
-                .then((unsubFn) => {
-                    unsub = unsubFn;
+            const failedListener = (_ch: string, msg: string) => {
+                cleanup();
+                reject(new RoomFailedError(roomId, msg));
+            };
+
+            // subscribe to both the ready and failed channels. either one settles
+            // the promise; whichever fires first wins.
+            Promise.all([
+                subscribeChannel(readyChannel, readyListener),
+                subscribeChannel(failedChannel, failedListener),
+            ])
+                .then(([unsubReady, unsubFailed]) => {
+                    unsubs.push(unsubReady, unsubFailed);
 
                     // if we settled while awaiting subscribe (timeout fired), clean up
                     if (settled) {
-                        unsubFn();
+                        unsubReady();
+                        unsubFailed();
                         return;
                     }
 
@@ -699,6 +714,7 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
 
     return {
         _internal: {
+            local: false,
             registerRoom,
             unregisterRoom,
             roomReady,
@@ -779,6 +795,8 @@ function createKeys(prefix: string) {
         leader: `${prefix}leader`,
         // pub/sub channel for room-ready notifications
         roomReady: (roomId: string) => `${prefix}room-ready:${roomId}`,
+        // pub/sub channel for room-failed notifications
+        roomFailed: (roomId: string) => `${prefix}room-failed:${roomId}`,
         // pub/sub channel for room assignment notifications (per-server)
         roomAssigned: (serverId: string) => `${prefix}room-assigned:${serverId}`,
         // schema version — checked on server registration

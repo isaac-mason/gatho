@@ -18,7 +18,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { allDrivers, type DriverSetup } from './drivers';
 import { buildContext, connectAndCollect, sleep, type TestContext } from './helpers';
 import type { Driver } from 'gatho/driver';
-import { PayloadTooLargeError, RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES } from 'gatho/driver';
+import {
+    PayloadTooLargeError,
+    RESERVE_DATA_MAX_BYTES,
+    RESERVE_TAGS_MAX_BYTES,
+    RoomFailedError,
+    RoomTimeoutError,
+} from 'gatho/driver';
 
 // minimum scaffolding for tests that drive the driver directly: register a
 // server, room, and mark it running so reserveClient is callable without
@@ -540,5 +546,85 @@ describe.each(drivers)('reserveClient payload size limits ($name)', (setup) => {
         expect(Buffer.byteLength(JSON.stringify(atLimit))).toBe(RESERVE_DATA_MAX_BYTES);
 
         await expect(driver._internal.reserveClient(roomId, 30_000, atLimit, {})).resolves.toBeDefined();
+    });
+});
+
+// --- 5. room-failed signal rejects waitForRoom fast --------------------------
+//
+// R7: before this, roomFailure just deleted the room and waitForRoom only
+// listened for room-ready, so a spawn failure burned the full timeout before
+// rejecting with a generic RoomTimeoutError. now roomFailure publishes the
+// reason first (redis: a `room-failed:<roomId>` pub/sub channel; memory: an
+// event), and waitForRoom subscribes to both ready and failed — rejecting
+// immediately with a RoomFailedError carrying the reason. this contract must
+// hold uniformly across drivers, so we run it against both.
+
+async function setupRequestedRoom(driver: Driver) {
+    const id = Math.random().toString(36).slice(2, 10);
+    const serverId = `srv-${id}`;
+    const roomId = `room-${id}`;
+    await driver._internal.heartbeat({
+        serverId,
+        endpoint: 'http://127.0.0.1:0',
+        tags: {},
+        roomTypes: ['echo'],
+    });
+    await driver._internal.registerRoom(roomId, 'echo', serverId, {}, {});
+    return { roomId };
+}
+
+describe.each(drivers)('room-failed signal ($name)', (setup) => {
+    let teardownCurrent: (() => Promise<void>) | null = null;
+
+    afterEach(async () => {
+        if (teardownCurrent) await teardownCurrent();
+        teardownCurrent = null;
+    });
+
+    it('waitForRoom rejects with RoomFailedError carrying the reason', async () => {
+        const { driver, teardown } = await setup.create();
+        teardownCurrent = teardown;
+        const { roomId } = await setupRequestedRoom(driver);
+
+        // long timeout so the rejection is proven to come from the failed
+        // signal, not the timeout backstop. capture the rejection eagerly so
+        // there's no window where the promise is settled-but-unobserved (the
+        // redis message can dispatch synchronously the moment we publish).
+        const settled = driver._internal.waitForRoom(roomId, 60_000).then(
+            () => null,
+            (e: unknown) => e,
+        );
+        // give the subscribe a beat to land before publishing (redis pub/sub
+        // has no retained messages — a publish before subscribe is lost).
+        await sleep(100);
+        await driver._internal.roomFailure(roomId, 'missing image');
+
+        const err = await settled;
+        expect(err).toBeInstanceOf(RoomFailedError);
+        const e = err as RoomFailedError;
+        expect(e.code).toBe('room-failed');
+        expect(e.roomId).toBe(roomId);
+        expect(e.reason).toBe('missing image');
+    });
+
+    it('still times out with RoomTimeoutError when neither ready nor failed fires', async () => {
+        const { driver, teardown } = await setup.create();
+        teardownCurrent = teardown;
+        const { roomId } = await setupRequestedRoom(driver);
+
+        await expect(driver._internal.waitForRoom(roomId, 100)).rejects.toBeInstanceOf(RoomTimeoutError);
+    });
+
+    it('resolves normally when the room becomes ready', async () => {
+        const { driver, teardown } = await setup.create();
+        teardownCurrent = teardown;
+        const { roomId } = await setupRequestedRoom(driver);
+
+        const wait = driver._internal.waitForRoom(roomId, 60_000);
+        await sleep(100);
+        await driver._internal.roomReady(roomId, 'ws://127.0.0.1:0', 'test-secret');
+
+        const info = await wait;
+        expect(info.status).toBe('running');
     });
 });

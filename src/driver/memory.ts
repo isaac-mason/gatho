@@ -4,7 +4,7 @@
 
 import { EventEmitter } from 'node:events';
 import { jwtSign } from '../common/jwt';
-import { RoomNotFoundError, RoomNotRunningError, RoomTimeoutError, ServerNotFoundError } from './errors';
+import { RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomTimeoutError, ServerNotFoundError } from './errors';
 import type {
     ClientInfo,
     ClientReservation,
@@ -196,7 +196,10 @@ export function createMemoryDriver(): Driver {
         }
     }
 
-    async function roomFailure(roomId: string, _reason: string): Promise<void> {
+    async function roomFailure(roomId: string, reason: string): Promise<void> {
+        // publish the failure BEFORE deleting so a waitForRoom waiter rejects
+        // with the real cause rather than eventually timing out.
+        events.emit(`room-failed:${roomId}`, reason);
         deleteClientsForRoom(roomId);
         rooms.delete(roomId);
     }
@@ -209,15 +212,24 @@ export function createMemoryDriver(): Driver {
         return new Promise<RoomInfo>((resolve, reject) => {
             const timer = setTimeout(() => {
                 events.removeListener(`room-ready:${roomId}`, onReady);
+                events.removeListener(`room-failed:${roomId}`, onFailed);
                 reject(new RoomTimeoutError(roomId, timeoutMs));
             }, timeoutMs);
 
             function onReady(info: RoomInfo) {
                 clearTimeout(timer);
+                events.removeListener(`room-failed:${roomId}`, onFailed);
                 resolve(info);
             }
 
+            function onFailed(reason: string) {
+                clearTimeout(timer);
+                events.removeListener(`room-ready:${roomId}`, onReady);
+                reject(new RoomFailedError(roomId, reason));
+            }
+
             events.once(`room-ready:${roomId}`, onReady);
+            events.once(`room-failed:${roomId}`, onFailed);
         });
     }
 
@@ -461,6 +473,7 @@ export function createMemoryDriver(): Driver {
             clearInterval(pruneTimer);
         },
         _internal: {
+            local: true,
             registerRoom,
             unregisterRoom,
             roomReady,

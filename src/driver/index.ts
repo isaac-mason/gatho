@@ -20,6 +20,7 @@ export {
     GathoError,
     InvalidTagError,
     PayloadTooLargeError,
+    RoomFailedError,
     RoomNotFoundError,
     RoomNotRunningError,
     RoomStartError,
