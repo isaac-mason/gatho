@@ -25,8 +25,8 @@ export type RoomConnection = {
 
     // send a message to the server.
     // if message is Uint8Array or ArrayBuffer, sends as binary, otherwise JSON-serialized.
-    // reliable (default true): buffers during RECONNECTING and flushes on reconnect.
-    // unreliable: drops if not OPEN.
+    // reliable (default true): buffered during CONNECTING and RECONNECTING, flushed in
+    // order once the connection is established (open). unreliable: drops unless OPEN.
     send(message: SendMessage, options?: SendOptions): void;
 
     // register a listener for an event. returns an unsubscribe function.
@@ -115,7 +115,8 @@ export function connect(url: string): RoomConnection {
     // track the open timestamp so minUptime is checked on drop
     let openedAt: number | null = null;
 
-    // outbound reliable message buffer — messages queued during RECONNECTING
+    // outbound reliable message buffer — messages queued during CONNECTING and
+    // RECONNECTING, flushed in order once the connection is established.
     const reliableBuffer: BufferedMessage[] = [];
     let reliableBufferBytes = 0;
 
@@ -214,7 +215,9 @@ export function connect(url: string): RoomConnection {
         }
     }
 
-    // transition to CLOSED permanently
+    // transition to CLOSED permanently. any messages buffered while connecting
+    // or reconnecting are discarded — a terminal close means they will never be
+    // delivered.
     function enterClosed(code: number, reason: string): void {
         state = 'closed';
         clearTimers();
@@ -241,10 +244,9 @@ export function connect(url: string): RoomConnection {
             }
 
             if (!isReconnect) {
-                // initial connection — transition to OPEN will happen when
-                // we receive __session token, but fire 'open' now since
-                // the ws is connected. actually, per existing behavior,
-                // 'open' fires on ws open for the initial connection.
+                // initial connection — the ws is connected. transition to OPEN
+                // and flush anything the app queued while connecting, in order,
+                // before emitting open.
                 state = 'open';
                 openedAt = Date.now();
 
@@ -252,6 +254,9 @@ export function connect(url: string): RoomConnection {
                 uptimeTimer = setTimeout(() => {
                     retryCount = 0;
                 }, MIN_UPTIME);
+
+                // flush the connecting buffer before notifying user code.
+                flushReliableBuffer(socket);
 
                 emit('open');
             }
@@ -424,13 +429,14 @@ export function connect(url: string): RoomConnection {
                 return;
             }
 
-            if (state === 'reconnecting' && reliable) {
-                // disconnected, reliable — buffer
+            if ((state === 'connecting' || state === 'reconnecting') && reliable) {
+                // not yet established (or dropped), reliable — buffer and flush
+                // in order once the connection is (re)established.
                 bufferReliable(message);
                 return;
             }
 
-            // CLOSED, CONNECTING, or unreliable during RECONNECTING — silently drop
+            // CLOSED, or unreliable during CONNECTING/RECONNECTING — silently drop
         },
 
         on(event: string, callback: (...args: never[]) => void): () => void {
