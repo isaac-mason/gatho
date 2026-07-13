@@ -3,7 +3,7 @@
 // the recommended shape: define ONE ClientPacket union (client → server) and ONE
 // ServerPacket union (server → client), share this module between client and
 // server, and get compact binary encoding with full TypeScript types. adding a
-// message means adding a variant here, and both ends update in lockstep — the
+// message means adding a variant here, and both ends update in lockstep, and the
 // compiler tells you what you missed. no code generation, no IDL files.
 
 import * as p from 'packcat';
@@ -39,7 +39,7 @@ const ChatBroadcast = p.object({
     text: p.string(),
 });
 
-// one union per direction — the whole protocol surface, discriminated on `type`.
+// one union per direction: the whole protocol surface, discriminated on `type`.
 const ClientPacket = p.union('type', [Input, Chat]);
 const ServerPacket = p.union('type', [Snapshot, ChatBroadcast]);
 

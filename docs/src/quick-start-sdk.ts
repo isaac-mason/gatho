@@ -17,11 +17,11 @@ if (!target) {
 const room = await gatho.createRoom({
     type: 'counter',
     serverId: target.serverId,
-    // data and tags are optional (default {}) — pass them to seed the room's
+    // data and tags are optional (default {}). pass them to seed the room's
     // create() data or to categorize the room for later filtering.
 });
 
-// ttl is optional too (default 30000ms) — how long the reservation stays valid.
+// ttl is optional too (default 30000ms): how long the reservation stays valid.
 const seat = await gatho.join({ roomId: room.roomId });
 
 console.log(seat.url);
