@@ -9,7 +9,7 @@
 
 gatho is a javascript multiplayer toolkit for building real-time games and applications.
 
-> ⚠️ gatho is in early alpha. Browse and experiment freely, but expect breaking changes for now.
+> gatho is not done. but it's ready to use and is in production today, give it a try! an npm release is coming soon!
 
 **Features**
 
