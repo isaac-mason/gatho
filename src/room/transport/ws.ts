@@ -71,7 +71,15 @@ export function wsTransport(config?: WsTransportConfig): Transport {
                             }
                             completeUpgrade(req, socket, head, result);
                         })
-                        .catch(() => {
+                        .catch((err) => {
+                            // NEVER swallow this. It is the only place a throw from upgrade() or
+                            // from ws's own handleUpgrade can surface, and the client only ever
+                            // sees an opaque 1006 (a bare 500 during an upgrade carries nothing a
+                            // browser will show). Silent here means a room that logs `ready`,
+                            // accepts connections, and rejects every one of them with no record
+                            // on either side.
+                            console.error('[gatho] websocket upgrade failed', err);
+                            if (socket.destroyed) return;
                             socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
                             socket.destroy();
                         });
