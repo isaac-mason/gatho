@@ -35,4 +35,6 @@ export { RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES } from './types';
 // these validators from `gatho/driver` rather than relatively, so it reuses ONE
 // copy of the error classes they throw (PayloadTooLargeError, InvalidTagError) —
 // otherwise a separately-bundled copy would break `instanceof` across the split.
-export { validateTags, validateReserveData, validateReserveTagsSize } from './types';
+export { validateTags, validateReserveData, validateReserveTagsSize, validateRequestedRoomTtl } from './types';
+// same split reasoning: the shared waitForRoom algorithm throws the driver error classes.
+export { waitForRoomRunning } from './wait-for-room';

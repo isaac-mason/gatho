@@ -78,7 +78,11 @@ export async function jwtVerify(token: string, secret: string): Promise<Record<s
         return null;
     }
 
-    if (typeof payload.exp === 'number' && Date.now() > payload.exp) return null;
+    // exp comes from the minting host's clock, so tolerate skew against ours
+    if (typeof payload.exp === 'number' && Date.now() > payload.exp + JWT_CLOCK_LEEWAY_MS) return null;
 
     return payload;
 }
+
+/** tolerated clock skew between the host that mints a token and the one that verifies it */
+export const JWT_CLOCK_LEEWAY_MS = 30_000;

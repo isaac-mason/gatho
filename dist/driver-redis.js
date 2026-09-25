@@ -1,5 +1,5 @@
 import Redis from 'ioredis';
-import { ServerNotFoundError, validateTags, RoomNotFoundError, RoomNotRunningError, validateReserveData, validateReserveTagsSize, RoomTimeoutError, RoomStartError, RoomFailedError } from 'gatho/driver';
+import { ServerNotFoundError, validateTags, RoomNotFoundError, RoomNotRunningError, validateReserveData, validateReserveTagsSize, waitForRoomRunning, validateRequestedRoomTtl } from 'gatho/driver';
 
 // minimal hmac-sha256 jwt — no external deps.
 // single source of truth for sign + verify across drivers and rooms.
@@ -107,6 +107,57 @@ function createLogger(options) {
 // module-scope singleton — reads GATHO_LOG_LEVEL at import time
 const log = createLogger();
 
+/** how often a canary token is published */
+const CANARY_INTERVAL_MS = 5_000;
+/** how long after its PUBLISH resolves a token may go unreceived */
+const CANARY_TIMEOUT_MS = 10_000;
+/** how often tick() must be called */
+const CANARY_CHECK_MS = 1_000;
+/**
+ * proves a subscriber still receives by publishing tokens to a channel it listens on.
+ * a token counts as missed only once its PUBLISH has resolved, so a slow or dead
+ * publishing connection is never blamed on the subscriber.
+ */
+function createSubscriberCanary(publish, isReady, reconnect, now) {
+    let sequence = 0;
+    let lastSentAt = Number.NEGATIVE_INFINITY;
+    // publishedAt is null until the PUBLISH resolves
+    let outstanding = null;
+    return {
+        received(token) {
+            if (outstanding?.token === token)
+                outstanding = null;
+        },
+        tick() {
+            if (!isReady()) {
+                outstanding = null;
+                return;
+            }
+            const at = now();
+            if (outstanding) {
+                const { publishedAt } = outstanding;
+                if (publishedAt !== null && at - publishedAt > CANARY_TIMEOUT_MS) {
+                    outstanding = null;
+                    reconnect(at - publishedAt);
+                }
+                return;
+            }
+            if (at - lastSentAt < CANARY_INTERVAL_MS)
+                return;
+            lastSentAt = at;
+            const canary = { token: String(++sequence), publishedAt: null };
+            outstanding = canary;
+            publish(canary.token).then(() => {
+                canary.publishedAt = now();
+            }, () => {
+                // the publishing connection's trouble, not the subscriber's
+                if (outstanding === canary)
+                    outstanding = null;
+            });
+        },
+    };
+}
+
 function attachLifecycleLogging(c, name) {
     c.on('error', (err) => log.error('redis connection error', { connection: name, err }));
     c.on('end', () => log.warn('redis connection ended', { connection: name }));
@@ -130,55 +181,112 @@ function createRedisDriver(options = {}) {
     // ioredis swallows 'error' events into its own handler — without this we
     // have zero signal when the underlying socket flaps.
     attachLifecycleLogging(client, 'main');
-    // shared subscriber connection — lazily created on first waitForRoom call.
+    // shared subscriber connection, lazily created on first use.
     // ioredis requires a dedicated connection for subscriptions (subscribed
     // clients can't issue normal commands). instead of creating one per call,
     // we share a single connection and multiplex channels via a listener map.
     let subscriber = null;
     const channelListeners = new Map();
+    // in-flight SUBSCRIBE per channel, so concurrent subscribers share its outcome
+    const pendingSubscribes = new Map();
+    // a subscriber never writes, so only its own keepalive probe can discover a peer that dropped it
+    function duplicateForSubscriber() {
+        if (client instanceof Redis)
+            return client.duplicate({ keepAlive: SUBSCRIBER_KEEPALIVE_MS });
+        return client.duplicate([], { redisOptions: { keepAlive: SUBSCRIBER_KEEPALIVE_MS } });
+    }
     function getSubscriber() {
-        if (!subscriber) {
-            subscriber = client.duplicate();
-            attachLifecycleLogging(subscriber, 'subscriber');
-            subscriber.on('message', (ch, msg) => {
-                const listeners = channelListeners.get(ch);
-                if (!listeners)
-                    return;
-                for (const listener of listeners) {
-                    listener(ch, msg);
-                }
+        if (subscriber)
+            return subscriber;
+        const sub = duplicateForSubscriber();
+        subscriber = sub;
+        attachLifecycleLogging(sub, 'subscriber');
+        sub.on('message', (ch, msg) => {
+            const listeners = channelListeners.get(ch);
+            if (!listeners)
+                return;
+            for (const listener of listeners) {
+                listener(ch, msg);
+            }
+        });
+        // ioredis restores only subscriptions it saw succeed; re-issue the intended set on every ready
+        sub.on('ready', () => {
+            const channels = Array.from(channelListeners.keys());
+            if (channels.length === 0)
+                return;
+            sub.subscribe(...channels).catch((err) => {
+                log.warn('redis resubscribe failed', { channels: channels.length, err });
             });
-        }
-        return subscriber;
+        });
+        startCanary(sub);
+        return sub;
     }
     // subscribe a listener to a channel. returns an unsubscribe function.
-    // first listener for a channel subscribes, last removal unsubscribes.
+    // first listener subscribes, last removal unsubscribes; a failed SUBSCRIBE rolls back every waiter
     async function subscribeChannel(channel, listener) {
         const sub = getSubscriber();
         let listeners = channelListeners.get(channel);
-        const isNew = !listeners || listeners.size === 0;
         if (!listeners) {
             listeners = new Set();
             channelListeners.set(channel, listeners);
         }
+        const isNew = listeners.size === 0;
         listeners.add(listener);
+        const removeListener = () => {
+            const set = channelListeners.get(channel);
+            if (!set)
+                return;
+            set.delete(listener);
+            if (set.size === 0) {
+                channelListeners.delete(channel);
+                sub.unsubscribe(channel).catch((err) => {
+                    log.warn('redis unsubscribe failed', { channel, err });
+                });
+            }
+        };
+        let pending = pendingSubscribes.get(channel);
         if (isNew) {
-            await sub.subscribe(channel);
+            const subscribing = sub.subscribe(channel).then(() => undefined);
+            pending = subscribing;
+            pendingSubscribes.set(channel, subscribing);
+            // registered before any waiter's continuation, so the entry is gone before a waiter can leave the set
+            const forget = () => pendingSubscribes.delete(channel);
+            subscribing.then(forget, forget);
+        }
+        if (pending) {
+            try {
+                await pending;
+            }
+            catch (err) {
+                removeListener();
+                throw err;
+            }
         }
         let removed = false;
         return () => {
             if (removed)
                 return;
             removed = true;
-            const set = channelListeners.get(channel);
-            if (set) {
-                set.delete(listener);
-                if (set.size === 0) {
-                    channelListeners.delete(channel);
-                    sub.unsubscribe(channel).catch(() => { });
-                }
-            }
+            removeListener();
         };
+    }
+    // the subscriber proves itself by receiving a token we publish: socket, subscription and routing at once
+    const canaryChannel = keys.canary(crypto.randomUUID());
+    let canaryTimer = null;
+    function startCanary(sub) {
+        const canary = createSubscriberCanary((token) => client.publish(canaryChannel, token), () => sub.status === 'ready', (missedMs) => {
+            log.warn('subscriber canary missed, reconnecting', { missedMs });
+            sub.disconnect(true);
+        }, Date.now);
+        // permanently in the intended set, so the ready handler re-subscribes it after any failure
+        channelListeners.set(canaryChannel, new Set([(_ch, token) => canary.received(token)]));
+        canaryTimer = setInterval(() => canary.tick(), CANARY_CHECK_MS);
+        canaryTimer.unref();
+    }
+    // redis's clock: every staleness judgement uses one clock, whichever host asks
+    async function redisNowMs() {
+        const [seconds, micros] = await client.time();
+        return Number(seconds) * 1000 + Math.floor(Number(micros) / 1000);
     }
     // flush all keys with our prefix if the stored schema version doesn't
     // match. uses SCAN to avoid blocking redis on large keyspaces, and
@@ -300,30 +408,18 @@ function createRedisDriver(options = {}) {
             roomTypes: JSON.parse(data.roomTypes || '[]'),
         };
     }
-    async function registerRoom(roomId, roomType, serverId, data, tags) {
+    async function registerRoom(roomId, roomType, serverId, data, tags, ttlMs) {
         validateTags(tags);
-        // verify server exists
-        const serverData = await client.hgetall(keys.server(serverId));
-        if (!serverData || !serverData.endpoint) {
+        validateRequestedRoomTtl(ttlMs);
+        const assignment = { roomId, roomType, data, status: 'requested' };
+        const receivers = await client.eval(REGISTER_ROOM_SCRIPT, 4, keys.server(serverId), keys.room(roomId), keys.rooms, keys.roomsByServerId(serverId), roomId, roomType, serverId, JSON.stringify(data), JSON.stringify(tags), String(Date.now()), String(ttlMs), keys.roomAssigned(serverId), JSON.stringify(assignment));
+        if (receivers === REGISTER_ROOM_SERVER_MISSING) {
             throw new ServerNotFoundError(serverId);
         }
-        const key = keys.room(roomId);
-        const now = Date.now();
-        await client.hset(key, {
-            roomId,
-            roomType,
-            serverId,
-            status: 'requested',
-            data: JSON.stringify(data),
-            tags: JSON.stringify(tags),
-            createdAt: String(now),
-        });
-        // auto-expire the room hash if the worker never becomes ready
-        await client.pexpire(key, REQUESTED_ROOM_TTL_MS);
-        await client.sadd(keys.rooms, roomId);
-        await client.sadd(keys.roomsByServerId(serverId), roomId);
-        // notify the server immediately — no waiting for reconciler poll
-        await client.publish(keys.roomAssigned(serverId), JSON.stringify({ roomId, roomType, data }));
+        // on cluster, PUBLISH counts only the executing node's subscribers, so 0 proves nothing
+        if (receivers === 0 && client instanceof Redis) {
+            log.warn('room assigned but server not subscribed', { serverId, roomId });
+        }
     }
     async function unregisterRoom(roomId) {
         const data = await client.hgetall(keys.room(roomId));
@@ -340,15 +436,8 @@ function createRedisDriver(options = {}) {
         await client.srem(keys.rooms, roomId);
     }
     async function roomReady(roomId, endpoint, roomSecret) {
-        await client.hset(keys.room(roomId), {
-            status: 'running',
-            endpoint,
-            roomSecret,
-        });
-        // remove ttl — running rooms persist until explicitly unregistered
-        await client.persist(keys.room(roomId));
-        // notify waiters via pub/sub
-        await client.publish(keys.roomReady(roomId), roomId);
+        const applied = await client.eval(ROOM_READY_SCRIPT, 1, keys.room(roomId), endpoint, roomSecret, keys.roomReady(roomId), roomId);
+        return applied === 1;
     }
     async function roomFailure(roomId, reason) {
         // publish the failure BEFORE deleting the records so a waitForRoom waiter
@@ -356,73 +445,30 @@ function createRedisDriver(options = {}) {
         await client.publish(keys.roomFailed(roomId), reason);
         await unregisterRoom(roomId);
     }
-    async function waitForRoom(roomId, timeoutMs) {
-        // check if already running before subscribing
-        const existing = await getRoomInfo(roomId);
-        if (existing && existing.status === 'running')
-            return existing;
-        const readyChannel = keys.roomReady(roomId);
-        const failedChannel = keys.roomFailed(roomId);
-        return new Promise((resolve, reject) => {
-            let settled = false;
-            const unsubs = [];
-            const cleanup = () => {
-                if (settled)
-                    return;
-                settled = true;
-                clearTimeout(timer);
-                for (const u of unsubs)
-                    u();
-            };
-            const timer = setTimeout(() => {
-                cleanup();
-                reject(new RoomTimeoutError(roomId, timeoutMs));
-            }, timeoutMs);
-            const readyListener = (_ch, _msg) => {
-                cleanup();
-                // fetch full room info
-                getRoomInfo(roomId)
-                    .then((info) => {
-                    if (info) {
-                        resolve(info);
-                    }
-                    else {
-                        reject(new RoomStartError(roomId));
-                    }
-                })
-                    .catch(reject);
-            };
-            const failedListener = (_ch, msg) => {
-                cleanup();
-                reject(new RoomFailedError(roomId, msg));
-            };
-            // subscribe to both the ready and failed channels. either one settles
-            // the promise; whichever fires first wins.
-            Promise.all([subscribeChannel(readyChannel, readyListener), subscribeChannel(failedChannel, failedListener)])
-                .then(([unsubReady, unsubFailed]) => {
-                unsubs.push(unsubReady, unsubFailed);
-                // if we settled while awaiting subscribe (timeout fired), clean up
-                if (settled) {
-                    unsubReady();
-                    unsubFailed();
-                    return;
-                }
-                // re-check after subscribing — the room might have become
-                // ready between our initial check and the subscribe completing
-                getRoomInfo(roomId)
-                    .then((info) => {
-                    if (info && info.status === 'running' && !settled) {
-                        cleanup();
-                        resolve(info);
-                    }
-                })
-                    .catch(() => { });
-            })
-                .catch((err) => {
-                cleanup();
-                reject(err);
-            });
-        });
+    async function waitForRoom(roomId, timeoutMs, registered) {
+        return waitForRoomRunning(roomId, timeoutMs, registered, getRoomInfo, subscribeRoomSignals(roomId));
+    }
+    // both channels or neither; a half-subscribed pair would leak the survivor
+    function subscribeRoomSignals(roomId) {
+        return async (handlers) => {
+            const [ready, failed] = await Promise.allSettled([
+                subscribeChannel(keys.roomReady(roomId), () => handlers.ready()),
+                subscribeChannel(keys.roomFailed(roomId), (_ch, reason) => handlers.failed(reason)),
+            ]);
+            if (ready.status === 'fulfilled' && failed.status === 'fulfilled') {
+                return () => {
+                    ready.value();
+                    failed.value();
+                };
+            }
+            const outcomes = [ready, failed];
+            for (const outcome of outcomes) {
+                if (outcome.status === 'fulfilled')
+                    outcome.value();
+            }
+            const rejection = outcomes.find((outcome) => outcome.status === 'rejected');
+            throw rejection?.reason;
+        };
     }
     async function getRoomInfo(roomId) {
         const data = await client.hgetall(keys.room(roomId));
@@ -565,13 +611,31 @@ function createRedisDriver(options = {}) {
             await ensureSchemaVersion();
             schemaVersionEnsured = true;
         }
+        validateTags(options.tags);
         const key = keys.server(options.serverId);
-        const exists = (await client.exists(key)) === 1;
-        const registered = !exists;
-        if (!exists) {
-            validateTags(options.tags);
-            // evict any previous server registered on the same endpoint —
-            // handles restarts where the new process picks a fresh serverId
+        const nowMs = await redisNowMs();
+        const tx = client.multi();
+        // HSETNX recreating a reaped hash is the reliable reap signal; an EXISTS before the write can race the reap
+        tx.hsetnx(key, 'serverId', options.serverId);
+        // first-insert-only tags — preserves later add/removeServerTags writes
+        tx.hsetnx(key, 'tags', JSON.stringify(options.tags));
+        tx.hset(key, {
+            endpoint: options.endpoint,
+            roomTypes: JSON.stringify(options.roomTypes),
+            lastHeartbeat: String(nowMs),
+        });
+        tx.sadd(keys.servers, options.serverId);
+        // last command in the transaction reads the post-write tags so the
+        // caller can refresh its in-memory cache without a second round-trip.
+        tx.hget(key, 'tags');
+        const txResults = await tx.exec();
+        // tx.exec() returns null only if the transaction was discarded (e.g.,
+        // WATCH conflict — we don't use WATCH, so this should not happen).
+        const registered = txResults?.[0]?.[1] === 1;
+        const tagsRaw = (txResults?.[4]?.[1] ?? null);
+        const tags = tagsRaw ? JSON.parse(tagsRaw) : {};
+        if (registered) {
+            // evict any previous server on this endpoint: a restarted process has a fresh serverId
             const serverIds = await client.smembers(keys.servers);
             for (const id of serverIds) {
                 if (id === options.serverId)
@@ -582,24 +646,6 @@ function createRedisDriver(options = {}) {
                 }
             }
         }
-        const tx = client.multi();
-        // first-insert-only tags — preserves later add/removeServerTags writes
-        tx.hsetnx(key, 'tags', JSON.stringify(options.tags));
-        tx.hset(key, {
-            serverId: options.serverId,
-            endpoint: options.endpoint,
-            roomTypes: JSON.stringify(options.roomTypes),
-            lastHeartbeat: String(Date.now()),
-        });
-        tx.sadd(keys.servers, options.serverId);
-        // last command in the transaction reads the post-write tags so the
-        // caller can refresh its in-memory cache without a second round-trip.
-        tx.hget(key, 'tags');
-        const txResults = await tx.exec();
-        // tx.exec() returns null only if the transaction was discarded (e.g.,
-        // WATCH conflict — we don't use WATCH, so this should not happen).
-        const tagsRaw = (txResults?.[3]?.[1] ?? null);
-        const tags = tagsRaw ? JSON.parse(tagsRaw) : {};
         // collect desired rooms in the same call. paying for the second
         // round-trip here vs on a separate reconcile tick — net halves the
         // control-plane round-trip count.
@@ -615,6 +661,7 @@ function createRedisDriver(options = {}) {
                     roomId: data.roomId,
                     roomType: data.roomType,
                     data: JSON.parse(data.data || '{}'),
+                    status: (data.status || 'requested'),
                 });
             }
         }
@@ -671,7 +718,7 @@ function createRedisDriver(options = {}) {
         return { hashes, stale };
     }
     async function listServers(filter) {
-        const cutoff = Date.now() - staleServerMs;
+        const cutoff = (await redisNowMs()) - staleServerMs;
         const serverIds = await client.smembers(keys.servers);
         if (serverIds.length === 0)
             return [];
@@ -703,7 +750,7 @@ function createRedisDriver(options = {}) {
         return result;
     }
     async function listStaleServers() {
-        const cutoff = Date.now() - staleServerMs;
+        const cutoff = (await redisNowMs()) - staleServerMs;
         const serverIds = await client.smembers(keys.servers);
         if (serverIds.length === 0)
             return [];
@@ -720,6 +767,11 @@ function createRedisDriver(options = {}) {
         }));
         return servers.filter((s) => s !== null);
     }
+    async function reapServer(serverId) {
+        const cutoff = (await redisNowMs()) - staleServerMs;
+        const reaped = await client.eval(REAP_SERVER_SCRIPT, 4, keys.server(serverId), keys.roomsByServerId(serverId), keys.rooms, keys.servers, serverId, String(cutoff), keys.room(''), keys.clientsByRoom(''), keys.client(''));
+        return reaped === 1;
+    }
     async function getServer(serverId) {
         const data = await client.hgetall(keys.server(serverId));
         return hashToServerInfo(data);
@@ -735,7 +787,8 @@ function createRedisDriver(options = {}) {
                 console.error('[gatho] malformed room-assigned message, discarding', { channel, msg });
                 return;
             }
-            callback(parsed);
+            // an assignment push is only ever sent for a freshly requested room
+            callback({ roomId: parsed.roomId, roomType: parsed.roomType, data: parsed.data, status: 'requested' });
         };
         return subscribeChannel(channel, listener);
     }
@@ -754,6 +807,11 @@ function createRedisDriver(options = {}) {
         await client.eval(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`, 1, keys.leader, serverId);
     }
     return {
+        destroy() {
+            if (canaryTimer)
+                clearInterval(canaryTimer);
+            canaryTimer = null;
+        },
         _internal: {
             local: false,
             registerRoom,
@@ -774,6 +832,7 @@ function createRedisDriver(options = {}) {
             removeServerTags,
             listServers,
             listStaleServers,
+            reapServer,
             getServer,
             subscribeRoomAssignments,
             tryAcquireLeader,
@@ -784,8 +843,52 @@ function createRedisDriver(options = {}) {
 }
 // default staleness threshold — servers older than this are considered dead
 const DEFAULT_STALE_SERVER_MS = 30_000;
-// how long a 'requested' room hash lives before redis auto-expires it
-const REQUESTED_ROOM_TTL_MS = 30_000;
+// tcp keepalive idle for the subscriber connection (see duplicateForSubscriber)
+const SUBSCRIBER_KEEPALIVE_MS = 30_000;
+// REGISTER_ROOM_SCRIPT's reply when the target server has no record
+const REGISTER_ROOM_SERVER_MISSING = -1;
+// room, ttl, both indexes and the notify in one atomic step; replies with the PUBLISH receiver count
+// KEYS: server hash, room hash, rooms set, rooms-by-server set
+// ARGV: roomId, roomType, serverId, data, tags, createdAt, ttlMs, assigned channel, assignment
+const REGISTER_ROOM_SCRIPT = `
+if redis.call('HEXISTS', KEYS[1], 'endpoint') == 0 then return ${REGISTER_ROOM_SERVER_MISSING} end
+redis.call('HSET', KEYS[2], 'roomId', ARGV[1], 'roomType', ARGV[2], 'serverId', ARGV[3], 'status', 'requested', 'data', ARGV[4], 'tags', ARGV[5], 'createdAt', ARGV[6])
+redis.call('PEXPIRE', KEYS[2], ARGV[7])
+redis.call('SADD', KEYS[3], ARGV[1])
+redis.call('SADD', KEYS[4], ARGV[1])
+return redis.call('PUBLISH', ARGV[8], ARGV[9])
+`;
+// marks a room running only if its record still exists, so a late ready can't recreate a ttl-less hash
+// KEYS: room hash. ARGV: endpoint, roomSecret, ready channel, roomId
+const ROOM_READY_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('HSET', KEYS[1], 'status', 'running', 'endpoint', ARGV[1], 'roomSecret', ARGV[2])
+redis.call('PERSIST', KEYS[1])
+redis.call('PUBLISH', ARGV[3], ARGV[4])
+return 1
+`;
+// unregisters a server and everything it owns only if still stale; derived per-room keys share KEYS' hashtag slot
+// KEYS: server hash, rooms-by-server set, rooms set, servers set
+// ARGV: serverId, cutoffMs, room key prefix, clients-by-room key prefix, client key prefix
+const REAP_SERVER_SCRIPT = `
+local last = redis.call('HGET', KEYS[1], 'lastHeartbeat')
+if last and tonumber(last) >= tonumber(ARGV[2]) then return 0 end
+local roomIds = redis.call('SMEMBERS', KEYS[2])
+for _, roomId in ipairs(roomIds) do
+    local clientsKey = ARGV[4] .. roomId
+    local clientIds = redis.call('SMEMBERS', clientsKey)
+    for _, clientId in ipairs(clientIds) do
+        redis.call('DEL', ARGV[5] .. clientId)
+    end
+    redis.call('DEL', clientsKey)
+    redis.call('DEL', ARGV[3] .. roomId)
+    redis.call('SREM', KEYS[3], roomId)
+end
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[4], ARGV[1])
+return 1
+`;
 // leader lock ttl — generous enough to survive transient redis hiccups
 const LEADER_LOCK_TTL_MS = 30_000;
 // bump this when the redis schema changes. on mismatch, all prefixed keys
@@ -816,6 +919,8 @@ function createKeys(prefix) {
         roomFailed: (roomId) => `${prefix}room-failed:${roomId}`,
         // pub/sub channel for room assignment notifications (per-server)
         roomAssigned: (serverId) => `${prefix}room-assigned:${serverId}`,
+        // pub/sub channel a driver instance publishes to itself to prove its subscriber receives
+        canary: (driverInstanceId) => `${prefix}canary:${driverInstanceId}`,
         // schema version — checked on server registration
         schemaVersion: `${prefix}schema_version`,
     };

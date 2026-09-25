@@ -3,6 +3,24 @@
 ## v0.0.1 (Unreleased)
 
 - Initial release!
+- **server, driver:** room assignment no longer depends on pub/sub delivery. Every heartbeat
+  reconciles against the driver's stored desired set: rooms still `requested` are spawned
+  (a lost push costs at most one heartbeat interval), and `running` rooms with no local
+  process are reported failed after `roomStallTimeoutMs` instead of leaking forever. A room
+  is spawned at most once per server process, and the destroy sweep no longer kills rooms
+  spawned after its snapshot was taken. A `ready` that arrives after the caller gave up now
+  kills the process rather than recreating a partial record.
+- **driver (redis):** the subscriber proves itself end to end with a canary it publishes to
+  itself, and reconnects when one goes unreceived. It re-subscribes its intended channels on
+  every reconnect, never leaves a channel looking subscribed after a failed `SUBSCRIBE`, and
+  gets a 30s TCP keepalive. `registerRoom`, `roomReady` and reaping are atomic scripts;
+  staleness uses Redis's clock; an assignment published to a server nobody is listening for
+  is logged. New `driver.destroy()` stops the canary.
+- **driver:** contract changes (internal): `registerRoom` takes `ttlMs`, `roomReady`
+  returns whether the room was still wanted, `waitForRoom` takes the registration promise
+  and backs its signals with polling, `DesiredRoom` carries `status`, and `reapServer`
+  unregisters a server only if it is still stale.
+- **room:** join tokens tolerate 30s of clock skew between the minting and verifying hosts.
 - **driver:** the Postgres driver is removed (`createPostgresDriver` and
   `PostgresDriverOptions` are gone, and the `postgres` dependency is dropped). Its push-based
   room delivery relied on `LISTEN`/`NOTIFY`, whose payload limits and delivery semantics make

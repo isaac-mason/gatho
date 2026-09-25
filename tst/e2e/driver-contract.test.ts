@@ -41,7 +41,7 @@ async function setupDriverRoom(driver: Driver) {
         tags: {},
         roomTypes: ['echo'],
     });
-    await driver._internal.registerRoom(roomId, 'echo', serverId, {}, {});
+    await driver._internal.registerRoom(roomId, 'echo', serverId, {}, {}, 60_000);
     await driver._internal.roomReady(roomId, 'ws://127.0.0.1:0', 'test-secret');
 
     return { roomId, serverId };
@@ -569,7 +569,7 @@ async function setupRequestedRoom(driver: Driver) {
         tags: {},
         roomTypes: ['echo'],
     });
-    await driver._internal.registerRoom(roomId, 'echo', serverId, {}, {});
+    await driver._internal.registerRoom(roomId, 'echo', serverId, {}, {}, 60_000);
     return { roomId };
 }
 
@@ -590,7 +590,7 @@ describe.each(drivers)('room-failed signal ($name)', (setup) => {
         // signal, not the timeout backstop. capture the rejection eagerly so
         // there's no window where the promise is settled-but-unobserved (the
         // redis message can dispatch synchronously the moment we publish).
-        const settled = driver._internal.waitForRoom(roomId, 60_000).then(
+        const settled = driver._internal.waitForRoom(roomId, 60_000, Promise.resolve()).then(
             () => null,
             (e: unknown) => e,
         );
@@ -612,7 +612,7 @@ describe.each(drivers)('room-failed signal ($name)', (setup) => {
         teardownCurrent = teardown;
         const { roomId } = await setupRequestedRoom(driver);
 
-        await expect(driver._internal.waitForRoom(roomId, 100)).rejects.toBeInstanceOf(RoomTimeoutError);
+        await expect(driver._internal.waitForRoom(roomId, 100, Promise.resolve())).rejects.toBeInstanceOf(RoomTimeoutError);
     });
 
     it('resolves normally when the room becomes ready', async () => {
@@ -620,7 +620,7 @@ describe.each(drivers)('room-failed signal ($name)', (setup) => {
         teardownCurrent = teardown;
         const { roomId } = await setupRequestedRoom(driver);
 
-        const wait = driver._internal.waitForRoom(roomId, 60_000);
+        const wait = driver._internal.waitForRoom(roomId, 60_000, Promise.resolve());
         await sleep(100);
         await driver._internal.roomReady(roomId, 'ws://127.0.0.1:0', 'test-secret');
 
@@ -659,7 +659,7 @@ describe.each(drivers)('pipelined listings match per-room reads ($name)', (setup
         for (let r = 0; r < 10; r++) {
             const roomId = `room-${id}-${r}`;
             roomIds.push(roomId);
-            await d.registerRoom(roomId, 'echo', serverId, { idx: r }, { shard: `s${r}` });
+            await d.registerRoom(roomId, 'echo', serverId, { idx: r }, { shard: `s${r}` }, 60_000);
             await d.roomReady(roomId, `ws://127.0.0.1:${9000 + r}`, `secret-${r}`);
             for (let c = 0; c < 5; c++) {
                 const reservation = await d.reserveClient(roomId, 60_000, {}, { seat: `c${c}` });

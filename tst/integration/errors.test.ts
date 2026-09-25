@@ -27,7 +27,7 @@ describe('typed errors', () => {
     // -- ServerNotFoundError --
 
     it('registerRoom throws ServerNotFoundError for missing server', async () => {
-        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 'no-server', {}, {}));
+        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 'no-server', {}, {}, 60_000));
         expect(err).toBeInstanceOf(GathoError);
         expect(err).toBeInstanceOf(ServerNotFoundError);
         expect(err.code).toBe('server-not-found');
@@ -84,7 +84,7 @@ describe('typed errors', () => {
 
     it('waitForRoom throws RoomTimeoutError when room never becomes running', async () => {
         await registerServerAndRoom(driver);
-        const err = await getError(() => driver._internal.waitForRoom('r1', 50));
+        const err = await getError(() => driver._internal.waitForRoom('r1', 50, Promise.resolve()));
         expect(err).toBeInstanceOf(GathoError);
         expect(err).toBeInstanceOf(RoomTimeoutError);
         expect(err.code).toBe('room-timeout');
@@ -101,7 +101,7 @@ describe('typed errors', () => {
             tags: {},
             roomTypes: ['game'],
         });
-        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 's1', {}, { 'bad key!': 'val' }));
+        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 's1', {}, { 'bad key!': 'val' }, 60_000));
         expect(err).toBeInstanceOf(GathoError);
         expect(err).toBeInstanceOf(InvalidTagError);
         expect(err.code).toBe('invalid-tag');
@@ -114,7 +114,7 @@ describe('typed errors', () => {
             tags: {},
             roomTypes: ['game'],
         });
-        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 's1', {}, { key: 'bad value!' }));
+        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 's1', {}, { key: 'bad value!' }, 60_000));
         expect(err).toBeInstanceOf(InvalidTagError);
         expect(err.code).toBe('invalid-tag');
     });
@@ -126,7 +126,7 @@ describe('typed errors', () => {
             tags: {},
             roomTypes: ['game'],
         });
-        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 's1', {}, { _internal: 'secret' }));
+        const err = await getError(() => driver._internal.registerRoom('r1', 'game', 's1', {}, { _internal: 'secret' }, 60_000));
         expect(err).toBeInstanceOf(InvalidTagError);
         expect(err.code).toBe('invalid-tag');
         expect(err.message).toContain('reserved');
@@ -168,7 +168,7 @@ async function registerServerAndRoom(driver: Driver): Promise<void> {
         tags: {},
         roomTypes: ['game'],
     });
-    await driver._internal.registerRoom('r1', 'game', 's1', {}, {});
+    await driver._internal.registerRoom('r1', 'game', 's1', {}, {}, 60_000);
 }
 
 async function getError(fn: () => Promise<unknown>): Promise<GathoError> {

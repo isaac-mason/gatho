@@ -17,7 +17,7 @@ export type CreateServerOptions = {
     host?: string;
     /**
      * cadence of the heartbeat loop (heartbeat + room reconciliation) in milliseconds.
-     * note this does not control the timing of room startup, only teardown.
+     * bounds how late a room starts when its assignment push is lost, and how fast unwanted rooms are torn down.
      * @default 5000
      **/
     heartbeatIntervalMs?: number;
@@ -76,6 +76,8 @@ export declare function __heartbeatTickForTest(args: {
     endpoint: string;
     rooms: TestRoom[];
     previouslyRegistered: boolean;
+    ticks?: number;
+    roomStallTimeoutMs?: number;
 }): Promise<{
     killed: string[];
 }>;

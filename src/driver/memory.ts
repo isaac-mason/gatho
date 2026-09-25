@@ -4,7 +4,7 @@
 
 import { EventEmitter } from 'node:events';
 import { jwtSign } from '../common/jwt';
-import { RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomTimeoutError, ServerNotFoundError } from './errors';
+import { RoomNotFoundError, RoomNotRunningError, ServerNotFoundError } from './errors';
 import type {
     ClientInfo,
     ClientReservation,
@@ -19,7 +19,8 @@ import type {
     RoomStatus,
     ServerInfo,
 } from './types';
-import { validateTags, validateReserveData, validateReserveTagsSize } from './types';
+import { validateRequestedRoomTtl, validateTags, validateReserveData, validateReserveTagsSize } from './types';
+import { waitForRoomRunning } from './wait-for-room';
 
 type RoomRecord = {
     roomId: string;
@@ -31,6 +32,8 @@ type RoomRecord = {
     data: RoomData;
     tags: Record<string, string>;
     createdAt: number;
+    /** 0 once running; the memory analogue of PEXPIRE then PERSIST */
+    requestedExpiresAt: number;
 };
 
 type ClientRecord = {
@@ -138,29 +141,42 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
         }
     }
 
+    function deleteServer(serverId: string): void {
+        for (const [roomId, r] of rooms) {
+            if (r.serverId === serverId) {
+                deleteClientsForRoom(roomId);
+                rooms.delete(roomId);
+            }
+        }
+        servers.delete(serverId);
+    }
+
+    // lapsed requested rooms vanish on every read, as a redis ttl would
+    function sweepExpiredRequestedRooms(now: number): void {
+        for (const [roomId, r] of rooms) {
+            if (r.status === 'requested' && r.requestedExpiresAt < now) {
+                deleteClientsForRoom(roomId);
+                rooms.delete(roomId);
+            }
+        }
+    }
+
     // prune stale servers (and their rooms/clients) + expired client reservations
     function prune(): void {
         const now = Date.now();
         const staleCutoff = now - staleServerMs;
 
-        // collect stale server ids
         const staleServerIds: string[] = [];
         for (const [id, s] of servers) {
             if (s.lastHeartbeat < staleCutoff) {
                 staleServerIds.push(id);
             }
         }
-
-        // delete stale servers and their rooms + clients
         for (const serverId of staleServerIds) {
-            for (const [roomId, r] of rooms) {
-                if (r.serverId === serverId) {
-                    deleteClientsForRoom(roomId);
-                    rooms.delete(roomId);
-                }
-            }
-            servers.delete(serverId);
+            deleteServer(serverId);
         }
+
+        sweepExpiredRequestedRooms(now);
 
         // prune expired client reservations (reserved but never connected)
         for (const [id, c] of clients) {
@@ -181,9 +197,12 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
         serverId: string,
         data: RoomData,
         tags: Record<string, string>,
+        ttlMs: number,
     ): Promise<void> {
         if (!servers.has(serverId)) throw new ServerNotFoundError(serverId);
         validateTags(tags);
+        validateRequestedRoomTtl(ttlMs);
+        const now = Date.now();
         rooms.set(roomId, {
             roomId,
             roomType,
@@ -193,10 +212,12 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
             roomSecret: null,
             data,
             tags: { ...tags },
-            createdAt: Date.now(),
+            createdAt: now,
+            requestedExpiresAt: now + ttlMs,
         });
-        // notify the server immediately — no waiting for reconciler poll
-        events.emit(`room-assigned:${serverId}`, { roomId, roomType, data });
+        // fast path; the heartbeat reconcile spawns it if this is missed
+        const assignment: DesiredRoom = { roomId, roomType, data, status: 'requested' };
+        events.emit(`room-assigned:${serverId}`, assignment);
     }
 
     async function unregisterRoom(roomId: string): Promise<void> {
@@ -204,14 +225,16 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
         rooms.delete(roomId);
     }
 
-    async function roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<void> {
+    async function roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<boolean> {
+        sweepExpiredRequestedRooms(Date.now());
         const r = rooms.get(roomId);
-        if (r) {
-            r.status = 'running';
-            r.endpoint = endpoint;
-            r.roomSecret = roomSecret;
-            events.emit(`room-ready:${roomId}`, roomToInfo(r));
-        }
+        if (!r) return false;
+        r.status = 'running';
+        r.endpoint = endpoint;
+        r.roomSecret = roomSecret;
+        r.requestedExpiresAt = 0;
+        events.emit(`room-ready:${roomId}`, roomToInfo(r));
+        return true;
     }
 
     async function roomFailure(roomId: string, reason: string): Promise<void> {
@@ -222,41 +245,25 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
         rooms.delete(roomId);
     }
 
-    async function waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo> {
-        // check if already running
-        const r = rooms.get(roomId);
-        if (r && r.status === 'running') return roomToInfo(r);
-
-        return new Promise<RoomInfo>((resolve, reject) => {
-            const timer = setTimeout(() => {
-                events.removeListener(`room-ready:${roomId}`, onReady);
-                events.removeListener(`room-failed:${roomId}`, onFailed);
-                reject(new RoomTimeoutError(roomId, timeoutMs));
-            }, timeoutMs);
-
-            function onReady(info: RoomInfo) {
-                clearTimeout(timer);
-                events.removeListener(`room-failed:${roomId}`, onFailed);
-                resolve(info);
-            }
-
-            function onFailed(reason: string) {
-                clearTimeout(timer);
-                events.removeListener(`room-ready:${roomId}`, onReady);
-                reject(new RoomFailedError(roomId, reason));
-            }
-
-            events.once(`room-ready:${roomId}`, onReady);
-            events.once(`room-failed:${roomId}`, onFailed);
+    async function waitForRoom(roomId: string, timeoutMs: number, registered: Promise<void>): Promise<RoomInfo> {
+        return waitForRoomRunning(roomId, timeoutMs, registered, getRoomInfo, async (handlers) => {
+            events.on(`room-ready:${roomId}`, handlers.ready);
+            events.on(`room-failed:${roomId}`, handlers.failed);
+            return () => {
+                events.removeListener(`room-ready:${roomId}`, handlers.ready);
+                events.removeListener(`room-failed:${roomId}`, handlers.failed);
+            };
         });
     }
 
     async function getRoomInfo(roomId: string): Promise<RoomInfo | null> {
+        sweepExpiredRequestedRooms(Date.now());
         const r = rooms.get(roomId);
         return r ? roomToInfo(r) : null;
     }
 
     async function listRooms(filter?: ListRoomsFilter): Promise<RoomInfo[]> {
+        sweepExpiredRequestedRooms(Date.now());
         let result = Array.from(rooms.values());
 
         if (filter?.type) {
@@ -369,15 +376,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
 
             // evict previous servers on the same endpoint (handles restarts)
             for (const [id, s] of servers) {
-                if (s.endpoint === options.endpoint) {
-                    for (const [roomId, r] of rooms) {
-                        if (r.serverId === id) {
-                            deleteClientsForRoom(roomId);
-                            rooms.delete(roomId);
-                        }
-                    }
-                    servers.delete(id);
-                }
+                if (s.endpoint === options.endpoint) deleteServer(id);
             }
 
             servers.set(options.serverId, {
@@ -392,24 +391,25 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
         // record always exists at this point — either it already did, or we just inserted it.
         // biome-ignore lint/style/noNonNullAssertion: invariant from the branch above
         const current = servers.get(options.serverId)!;
+        sweepExpiredRequestedRooms(Date.now());
         const desiredRooms: DesiredRoom[] = [];
         for (const r of rooms.values()) {
             if (r.serverId === options.serverId) {
-                desiredRooms.push({ roomId: r.roomId, roomType: r.roomType, data: r.data });
+                desiredRooms.push({ roomId: r.roomId, roomType: r.roomType, data: r.data, status: r.status });
             }
         }
         return { tags: { ...current.tags }, desiredRooms, registered };
     }
 
     async function unregisterServer(serverId: string): Promise<void> {
-        // delete all rooms for this server
-        for (const [roomId, r] of rooms) {
-            if (r.serverId === serverId) {
-                deleteClientsForRoom(roomId);
-                rooms.delete(roomId);
-            }
-        }
-        servers.delete(serverId);
+        deleteServer(serverId);
+    }
+
+    async function reapServer(serverId: string): Promise<boolean> {
+        const s = servers.get(serverId);
+        if (!s || s.lastHeartbeat >= Date.now() - staleServerMs) return false;
+        deleteServer(serverId);
+        return true;
     }
 
     async function addServerTags(serverId: string, tags: Record<string, string>): Promise<void> {
@@ -503,6 +503,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): Driver {
             removeServerTags,
             listServers,
             listStaleServers,
+            reapServer,
             getServer,
             subscribeRoomAssignments,
             tryAcquireLeader,

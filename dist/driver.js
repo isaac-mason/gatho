@@ -188,6 +188,141 @@ function validateReserveTagsSize(tags) {
         throw new PayloadTooLargeError('tags', size, RESERVE_TAGS_MAX_BYTES);
     }
 }
+/** redis doesn't roll back a failing script, so a PEXPIRE rejecting the ttl would strand a ttl-less room. */
+function validateRequestedRoomTtl(ttlMs) {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+        throw new RangeError(`requested room ttl must be a positive integer of milliseconds, got ${ttlMs}`);
+    }
+}
+
+// structured json line logger
+// emits ndjson to stdout/stderr, supports child loggers for scoped context
+const LEVEL_VALUES = {
+    debug: 0,
+    info: 1,
+    warn: 2,
+    error: 3,
+};
+function resolveLevel() {
+    const env = (typeof process !== 'undefined' && process.env?.GATHO_LOG_LEVEL) || '';
+    const lower = env.toLowerCase();
+    if (lower in LEVEL_VALUES)
+        return lower;
+    return 'info';
+}
+// serialize a value, handling Error instances that JSON.stringify turns into {}
+function serializeValue(value) {
+    if (value instanceof Error) {
+        return { message: value.message, stack: value.stack };
+    }
+    return value;
+}
+function buildLine(level, msg, context, fields) {
+    const entry = { ts: Date.now(), level, msg };
+    for (const key in context) {
+        entry[key] = serializeValue(context[key]);
+    }
+    if (fields) {
+        for (const key in fields) {
+            entry[key] = serializeValue(fields[key]);
+        }
+    }
+    return JSON.stringify(entry);
+}
+function createLoggerInternal(minLevel, context) {
+    function log(level, msg, fields) {
+        if (LEVEL_VALUES[level] < minLevel)
+            return;
+        const line = buildLine(level, msg, context, fields);
+        if (level === 'error') {
+            process.stderr.write(`${line}\n`);
+        }
+        else {
+            process.stdout.write(`${line}\n`);
+        }
+    }
+    return {
+        debug: (msg, fields) => log('debug', msg, fields),
+        info: (msg, fields) => log('info', msg, fields),
+        warn: (msg, fields) => log('warn', msg, fields),
+        error: (msg, fields) => log('error', msg, fields),
+        child(fields) {
+            return createLoggerInternal(minLevel, { ...context, ...fields });
+        },
+    };
+}
+function createLogger(options) {
+    const level = resolveLevel();
+    return createLoggerInternal(LEVEL_VALUES[level], {});
+}
+// module-scope singleton — reads GATHO_LOG_LEVEL at import time
+const log = createLogger();
+
+// how often a waiter re-reads the room record, independent of pub/sub signals
+const WAIT_FOR_ROOM_POLL_MS = 1_000;
+/** shared waitForRoom for every driver: signals make it fast, the record poll guarantees it settles. */
+function waitForRoomRunning(roomId, timeoutMs, registered, getRoomInfo, subscribeSignals) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let isRegistered = false;
+        let unsubscribe = null;
+        const finish = (outcome) => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            clearInterval(poll);
+            unsubscribe?.();
+            if ('info' in outcome)
+                resolve(outcome.info);
+            else
+                reject(outcome.error);
+        };
+        // after a ready signal, a missing record is a start error rather than a removal
+        const check = (afterReadySignal) => {
+            // a read issued before registration can resolve after it; judge its miss by when it was issued
+            const registeredWhenIssued = isRegistered;
+            getRoomInfo(roomId).then((info) => {
+                if (settled)
+                    return;
+                if (info?.status === 'running') {
+                    finish({ info });
+                }
+                else if (!info && afterReadySignal) {
+                    finish({ error: new RoomStartError(roomId) });
+                }
+                else if (!info && registeredWhenIssued) {
+                    finish({ error: new RoomFailedError(roomId, 'room record removed') });
+                }
+            }, (err) => {
+                // a transient read failure doesn't fail the wait; the next poll or the timeout decides
+                log.warn('waitForRoom poll failed', { roomId, err });
+            });
+        };
+        const timer = setTimeout(() => finish({ error: new RoomTimeoutError(roomId, timeoutMs) }), timeoutMs);
+        const poll = setInterval(() => check(false), WAIT_FOR_ROOM_POLL_MS);
+        registered.then(() => {
+            isRegistered = true;
+            check(false);
+        }, (err) => finish({ error: err instanceof Error ? err : new Error(String(err)) }));
+        subscribeSignals({
+            ready: () => check(true),
+            failed: (reason) => finish({ error: new RoomFailedError(roomId, reason) }),
+        }).then((unsub) => {
+            if (settled) {
+                unsub();
+                return;
+            }
+            unsubscribe = unsub;
+            // a ready published before the subscription landed was missed; look now
+            check(false);
+        }, (err) => {
+            // polling still settles the wait; only the fast path is lost
+            log.warn('waitForRoom signal subscription failed, relying on polling', { roomId, err });
+        });
+        check(false);
+    });
+}
 
 // in-memory driver for dev mode
 // single-process, no persistence
@@ -257,27 +392,38 @@ function createMemoryDriver(options = {}) {
             }
         }
     }
+    function deleteServer(serverId) {
+        for (const [roomId, r] of rooms) {
+            if (r.serverId === serverId) {
+                deleteClientsForRoom(roomId);
+                rooms.delete(roomId);
+            }
+        }
+        servers.delete(serverId);
+    }
+    // lapsed requested rooms vanish on every read, as a redis ttl would
+    function sweepExpiredRequestedRooms(now) {
+        for (const [roomId, r] of rooms) {
+            if (r.status === 'requested' && r.requestedExpiresAt < now) {
+                deleteClientsForRoom(roomId);
+                rooms.delete(roomId);
+            }
+        }
+    }
     // prune stale servers (and their rooms/clients) + expired client reservations
     function prune() {
         const now = Date.now();
         const staleCutoff = now - staleServerMs;
-        // collect stale server ids
         const staleServerIds = [];
         for (const [id, s] of servers) {
             if (s.lastHeartbeat < staleCutoff) {
                 staleServerIds.push(id);
             }
         }
-        // delete stale servers and their rooms + clients
         for (const serverId of staleServerIds) {
-            for (const [roomId, r] of rooms) {
-                if (r.serverId === serverId) {
-                    deleteClientsForRoom(roomId);
-                    rooms.delete(roomId);
-                }
-            }
-            servers.delete(serverId);
+            deleteServer(serverId);
         }
+        sweepExpiredRequestedRooms(now);
         // prune expired client reservations (reserved but never connected)
         for (const [id, c] of clients) {
             if (c.status === 'reserved' && c.expiresAt > 0 && c.expiresAt < now) {
@@ -288,10 +434,12 @@ function createMemoryDriver(options = {}) {
     const pruneTimer = setInterval(prune, PRUNE_INTERVAL_MS);
     // don't hold the process open just for pruning
     pruneTimer.unref();
-    async function registerRoom(roomId, roomType, serverId, data, tags) {
+    async function registerRoom(roomId, roomType, serverId, data, tags, ttlMs) {
         if (!servers.has(serverId))
             throw new ServerNotFoundError(serverId);
         validateTags(tags);
+        validateRequestedRoomTtl(ttlMs);
+        const now = Date.now();
         rooms.set(roomId, {
             roomId,
             roomType,
@@ -301,23 +449,28 @@ function createMemoryDriver(options = {}) {
             roomSecret: null,
             data,
             tags: { ...tags },
-            createdAt: Date.now(),
+            createdAt: now,
+            requestedExpiresAt: now + ttlMs,
         });
-        // notify the server immediately — no waiting for reconciler poll
-        events.emit(`room-assigned:${serverId}`, { roomId, roomType, data });
+        // fast path; the heartbeat reconcile spawns it if this is missed
+        const assignment = { roomId, roomType, data, status: 'requested' };
+        events.emit(`room-assigned:${serverId}`, assignment);
     }
     async function unregisterRoom(roomId) {
         deleteClientsForRoom(roomId);
         rooms.delete(roomId);
     }
     async function roomReady(roomId, endpoint, roomSecret) {
+        sweepExpiredRequestedRooms(Date.now());
         const r = rooms.get(roomId);
-        if (r) {
-            r.status = 'running';
-            r.endpoint = endpoint;
-            r.roomSecret = roomSecret;
-            events.emit(`room-ready:${roomId}`, roomToInfo(r));
-        }
+        if (!r)
+            return false;
+        r.status = 'running';
+        r.endpoint = endpoint;
+        r.roomSecret = roomSecret;
+        r.requestedExpiresAt = 0;
+        events.emit(`room-ready:${roomId}`, roomToInfo(r));
+        return true;
     }
     async function roomFailure(roomId, reason) {
         // publish the failure BEFORE deleting so a waitForRoom waiter rejects
@@ -326,36 +479,23 @@ function createMemoryDriver(options = {}) {
         deleteClientsForRoom(roomId);
         rooms.delete(roomId);
     }
-    async function waitForRoom(roomId, timeoutMs) {
-        // check if already running
-        const r = rooms.get(roomId);
-        if (r && r.status === 'running')
-            return roomToInfo(r);
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                events.removeListener(`room-ready:${roomId}`, onReady);
-                events.removeListener(`room-failed:${roomId}`, onFailed);
-                reject(new RoomTimeoutError(roomId, timeoutMs));
-            }, timeoutMs);
-            function onReady(info) {
-                clearTimeout(timer);
-                events.removeListener(`room-failed:${roomId}`, onFailed);
-                resolve(info);
-            }
-            function onFailed(reason) {
-                clearTimeout(timer);
-                events.removeListener(`room-ready:${roomId}`, onReady);
-                reject(new RoomFailedError(roomId, reason));
-            }
-            events.once(`room-ready:${roomId}`, onReady);
-            events.once(`room-failed:${roomId}`, onFailed);
+    async function waitForRoom(roomId, timeoutMs, registered) {
+        return waitForRoomRunning(roomId, timeoutMs, registered, getRoomInfo, async (handlers) => {
+            events.on(`room-ready:${roomId}`, handlers.ready);
+            events.on(`room-failed:${roomId}`, handlers.failed);
+            return () => {
+                events.removeListener(`room-ready:${roomId}`, handlers.ready);
+                events.removeListener(`room-failed:${roomId}`, handlers.failed);
+            };
         });
     }
     async function getRoomInfo(roomId) {
+        sweepExpiredRequestedRooms(Date.now());
         const r = rooms.get(roomId);
         return r ? roomToInfo(r) : null;
     }
     async function listRooms(filter) {
+        sweepExpiredRequestedRooms(Date.now());
         let result = Array.from(rooms.values());
         if (filter?.type) {
             result = result.filter((r) => r.roomType === filter.type);
@@ -454,15 +594,8 @@ function createMemoryDriver(options = {}) {
             validateTags(options.tags);
             // evict previous servers on the same endpoint (handles restarts)
             for (const [id, s] of servers) {
-                if (s.endpoint === options.endpoint) {
-                    for (const [roomId, r] of rooms) {
-                        if (r.serverId === id) {
-                            deleteClientsForRoom(roomId);
-                            rooms.delete(roomId);
-                        }
-                    }
-                    servers.delete(id);
-                }
+                if (s.endpoint === options.endpoint)
+                    deleteServer(id);
             }
             servers.set(options.serverId, {
                 serverId: options.serverId,
@@ -475,23 +608,24 @@ function createMemoryDriver(options = {}) {
         // record always exists at this point — either it already did, or we just inserted it.
         // biome-ignore lint/style/noNonNullAssertion: invariant from the branch above
         const current = servers.get(options.serverId);
+        sweepExpiredRequestedRooms(Date.now());
         const desiredRooms = [];
         for (const r of rooms.values()) {
             if (r.serverId === options.serverId) {
-                desiredRooms.push({ roomId: r.roomId, roomType: r.roomType, data: r.data });
+                desiredRooms.push({ roomId: r.roomId, roomType: r.roomType, data: r.data, status: r.status });
             }
         }
         return { tags: { ...current.tags }, desiredRooms, registered };
     }
     async function unregisterServer(serverId) {
-        // delete all rooms for this server
-        for (const [roomId, r] of rooms) {
-            if (r.serverId === serverId) {
-                deleteClientsForRoom(roomId);
-                rooms.delete(roomId);
-            }
-        }
-        servers.delete(serverId);
+        deleteServer(serverId);
+    }
+    async function reapServer(serverId) {
+        const s = servers.get(serverId);
+        if (!s || s.lastHeartbeat >= Date.now() - staleServerMs)
+            return false;
+        deleteServer(serverId);
+        return true;
     }
     async function addServerTags(serverId, tags) {
         const s = servers.get(serverId);
@@ -577,6 +711,7 @@ function createMemoryDriver(options = {}) {
             removeServerTags,
             listServers,
             listStaleServers,
+            reapServer,
             getServer,
             subscribeRoomAssignments,
             tryAcquireLeader,
@@ -586,5 +721,5 @@ function createMemoryDriver(options = {}) {
     };
 }
 
-export { DriverConfigError, GathoError, InvalidTagError, PayloadTooLargeError, RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES, RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, createMemoryDriver, validateReserveData, validateReserveTagsSize, validateTags };
+export { DriverConfigError, GathoError, InvalidTagError, PayloadTooLargeError, RESERVE_DATA_MAX_BYTES, RESERVE_TAGS_MAX_BYTES, RoomFailedError, RoomNotFoundError, RoomNotRunningError, RoomStartError, RoomTimeoutError, ServerNotFoundError, createMemoryDriver, validateRequestedRoomTtl, validateReserveData, validateReserveTagsSize, validateTags, waitForRoomRunning };
 //# sourceMappingURL=driver.js.map

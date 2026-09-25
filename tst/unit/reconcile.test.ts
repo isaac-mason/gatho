@@ -21,7 +21,7 @@ async function setupRoom() {
         tags: {},
         roomTypes: ['game'],
     });
-    await driver._internal.registerRoom(roomId, 'game', serverId, {}, {});
+    await driver._internal.registerRoom(roomId, 'game', serverId, {}, {}, 60_000);
     await driver._internal.roomReady(roomId, 'ws://localhost:9000', 'secret');
 
     const reservation = await driver._internal.reserveClient(roomId, 30_000, {}, {});

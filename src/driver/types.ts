@@ -145,6 +145,8 @@ export type DesiredRoom = {
     roomId: string;
     roomType: string;
     data: RoomData;
+    /** 'requested': waiting for this server to spawn it. 'running': must have a local process. */
+    status: RoomStatus;
 };
 
 /** authoritative state returned by a heartbeat tick — used by the server's
@@ -165,8 +167,8 @@ export type HeartbeatResult = {
 /** driver interface — all methods are internal to gatho.
  *  use start() or createGathoSDK() instead of calling these directly. */
 export type Driver = {
-    /** optional cleanup hook — stops background timers, releases resources.
-     *  only relevant for drivers that run background work (e.g. memoryDriver prune interval). */
+    /** stops background work (memory prune interval, redis subscriber canary). the creator
+     *  owns it; start() never calls it, since a driver can outlive a server or serve an sdk. */
     destroy?: () => void;
 
     _internal: {
@@ -176,13 +178,14 @@ export type Driver = {
          *  peers and sdks — start() fails fast on a wildcard endpoint in that case. */
         local: boolean;
 
-        /** register a new room */
+        /** register a room and notify its server. the record expires after `ttlMs` unless it becomes running. */
         registerRoom(
             roomId: string,
             roomType: string,
             serverId: string,
             data: RoomData,
             tags: Record<string, string>,
+            ttlMs: number,
         ): Promise<void>;
 
         /** unregister a room */
@@ -201,8 +204,9 @@ export type Driver = {
         removeRoomTags(roomId: string, keys: string[]): Promise<void>;
 
         /** mark a room as running — called by the server when the worker sends 'ready'.
-         *  stores the room's client-facing endpoint and the room secret (used to mint jwts). */
-        roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<void>;
+         *  stores the room's client-facing endpoint and the room secret (used to mint jwts).
+         *  returns false, writing nothing, when the record is gone; the caller should kill the process. */
+        roomReady(roomId: string, endpoint: string, roomSecret: string): Promise<boolean>;
 
         /** report that a room failed (spawn failure, worker crash, stalled heartbeat, etc.).
          *  publishes a room-failed signal (carrying `reason`) so any waitForRoom waiter
@@ -212,8 +216,9 @@ export type Driver = {
         /** wait for a room to become 'running'. resolves with RoomInfo once ready,
          *  rejects with RoomFailedError (carrying the reason) if the room fails first,
          *  or rejects with RoomTimeoutError if neither happens within timeoutMs.
-         *  implementations should check initial state (already running) before subscribing. */
-        waitForRoom(roomId: string, timeoutMs: number): Promise<RoomInfo>;
+         *  a record missing after `registered` settles means the room failed or was destroyed.
+         *  the ready/failed signals are hints: implementations must also poll the record. */
+        waitForRoom(roomId: string, timeoutMs: number, registered: Promise<void>): Promise<RoomInfo>;
 
         /** allocates a spot for a client, mints a jwt signed with the room's secret.
          *  optional data bag is included in the jwt payload and delivered to onAuth as joinData.
@@ -253,8 +258,11 @@ export type Driver = {
         /** list servers with recent heartbeats, optionally filtered by tags/roomTypes */
         listServers(filter?: ListServersFilter): Promise<ServerInfo[]>;
 
-        /** list servers whose heartbeat is older than 30s. internal use only. */
+        /** list servers whose heartbeat is older than the staleness threshold. internal use only. */
         listStaleServers(): Promise<ServerInfo[]>;
+
+        /** unregister a server and its rooms only if still stale at deletion time. returns true if reaped. */
+        reapServer(serverId: string): Promise<boolean>;
 
         /** get a single server by id, or null if not found */
         getServer(serverId: string): Promise<ServerInfo | null>;
@@ -333,5 +341,12 @@ export function validateReserveTagsSize(tags: Record<string, string>): void {
     const size = Buffer.byteLength(JSON.stringify(tags));
     if (size > RESERVE_TAGS_MAX_BYTES) {
         throw new PayloadTooLargeError('tags', size, RESERVE_TAGS_MAX_BYTES);
+    }
+}
+
+/** redis doesn't roll back a failing script, so a PEXPIRE rejecting the ttl would strand a ttl-less room. */
+export function validateRequestedRoomTtl(ttlMs: number): void {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+        throw new RangeError(`requested room ttl must be a positive integer of milliseconds, got ${ttlMs}`);
     }
 }

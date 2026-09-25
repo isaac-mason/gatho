@@ -22,7 +22,7 @@ function makeNetworkedStub(): Driver {
             local: false,
             registerRoom: noop,
             unregisterRoom: noop,
-            roomReady: noop,
+            roomReady: async () => true,
             roomFailure: noop,
             waitForRoom: async () => {
                 throw new Error('unused');
@@ -42,6 +42,7 @@ function makeNetworkedStub(): Driver {
             removeServerTags: noop,
             listServers: async () => [],
             listStaleServers: async () => [],
+            reapServer: async () => false,
             getServer: async () => null,
             subscribeRoomAssignments: async () => () => {},
             tryAcquireLeader: async () => false,

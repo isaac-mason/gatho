@@ -14,7 +14,7 @@ import type { Socket } from 'net';
 import { log } from '../common/logger';
 import type { NotifyMessage } from '../common/notify-protocol';
 import { type Punctuator, punctuate } from '../common/punctuate';
-import type { Driver, RoomData } from '../driver/types';
+import type { DesiredRoom, Driver, RoomData } from '../driver/types';
 import type { RoomRunner } from './runner/types';
 
 /* exported types */
@@ -34,7 +34,7 @@ export type CreateServerOptions = {
     host?: string;
     /**
      * cadence of the heartbeat loop (heartbeat + room reconciliation) in milliseconds.
-     * note this does not control the timing of room startup, only teardown.
+     * bounds how late a room starts when its assignment push is lost, and how fast unwanted rooms are torn down.
      * @default 5000
      **/
     heartbeatIntervalMs?: number;
@@ -106,6 +106,10 @@ type ServerState = {
     lastHeartbeats: Map<string, number>;
     killedRoomIds: Set<string>;
     spawning: Set<string>;
+    // roomIds this process tried to spawn, with when: at-most-once spawning, and which rooms postdate a sweep's snapshot
+    attempted: Map<string, number>;
+    // 'running' rooms assigned to us with no local process, with when first noticed
+    lostSince: Map<string, number>;
     alive: boolean;
 
     // network
@@ -131,6 +135,8 @@ type ServerState = {
     heartbeatPunctuator: Punctuator | null;
     serverTags: Record<string, string>;
     lastDriverHeartbeatAt: number;
+    // set once a driver heartbeat outage has been logged, cleared by the next success
+    heartbeatOutageLogged: boolean;
     // true once the first heartbeat has succeeded — used to distinguish initial
     // registration (expected) from reap-recovery (re-registration after we've
     // already been alive, which we warn about).
@@ -143,6 +149,12 @@ const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 const LEADER_LOOP_INTERVAL_MS = 10_000;
 const LEADER_LOOP_TIMEOUT_MS = 5_000;
 const HEARTBEAT_TICK_TIMEOUT_MS = 5_000;
+
+// consecutive missed heartbeat intervals before the outage is logged as an error
+const HEARTBEAT_OUTAGE_LOG_AFTER_INTERVALS = 3;
+
+// how long a spawn attempt is remembered after its room leaves the desired set
+const ATTEMPT_RETENTION_MS = 5 * 60_000;
 
 /** default for CreateServerOptions.roomStallTimeoutMs */
 const DEFAULT_ROOM_STALL_TIMEOUT_MS = 10_000;
@@ -284,9 +296,17 @@ function handleNotifyMessage(s: ServerState, roomId: string, msg: NotifyMessage)
             const endpoint = s.options.roomEndpoint({ roomId, port: msg.port });
             proc.endpoint = endpoint;
 
-            s.driver.roomReady(roomId, endpoint, proc.roomSecret).catch((err) => {
-                log.error('failed to mark room as ready', { roomId, err });
-            });
+            s.driver.roomReady(roomId, endpoint, proc.roomSecret).then(
+                (wanted) => {
+                    if (wanted) return;
+                    // the caller gave up before it came up; nothing will route a client here
+                    log.warn('room ready but no longer wanted, destroying', { roomId });
+                    destroyWorker(s, roomId);
+                },
+                (err) => {
+                    log.error('failed to mark room as ready', { roomId, err });
+                },
+            );
 
             log.info('room ready', { roomId, roomType: proc.roomType, wsPort: msg.port, endpoint });
             break;
@@ -468,26 +488,33 @@ function checkHeartbeats(s: ServerState): void {
     }
 }
 
-/* push-based room spawning */
+/* room spawning */
+
+// the one spawn path, from the assignment push (fast) and the heartbeat reconcile (guaranteed)
+function spawnAssignedRoom(s: ServerState, room: DesiredRoom): void {
+    if (!s.alive) return;
+    if (s.processes.has(room.roomId)) return;
+    if (s.spawning.has(room.roomId)) return;
+    if (s.attempted.has(room.roomId)) return;
+
+    s.attempted.set(room.roomId, Date.now());
+    s.spawning.add(room.roomId);
+    createRoom(s, room.roomId, room.roomType, room.data)
+        .catch((err) => {
+            const reason = err instanceof Error ? err.message : String(err);
+            log.error('room failed to start', { roomId: room.roomId, reason });
+            s.driver.roomFailure(room.roomId, reason).catch((e) => {
+                log.error('failed to report room failure', { roomId: room.roomId, err: e });
+            });
+        })
+        .finally(() => {
+            s.spawning.delete(room.roomId);
+        });
+}
 
 async function startRoomSubscription(s: ServerState): Promise<void> {
     s.unsubscribeRoomAssignments = await s.driver.subscribeRoomAssignments(s.serverId, (room) => {
-        if (s.processes.has(room.roomId)) return;
-        if (s.spawning.has(room.roomId)) return;
-        if (!s.alive) return;
-
-        s.spawning.add(room.roomId);
-        createRoom(s, room.roomId, room.roomType, room.data)
-            .catch((err) => {
-                const reason = err instanceof Error ? err.message : String(err);
-                log.error('room failed to start', { roomId: room.roomId, reason });
-                s.driver.roomFailure(room.roomId, reason).catch((e) => {
-                    log.error('failed to report room failure', { roomId: room.roomId, err: e });
-                });
-            })
-            .finally(() => {
-                s.spawning.delete(room.roomId);
-            });
+        spawnAssignedRoom(s, room);
     });
 }
 
@@ -507,6 +534,10 @@ function stopRoomSubscription(s: ServerState): void {
 // assignments instantly; this loop is the safety net for missed pushes plus the
 // authoritative source for "which rooms should this server be running right now".
 async function heartbeatTick(s: ServerState, adminEndpoint: string, isCurrent: () => boolean): Promise<void> {
+    logHeartbeatOutage(s);
+
+    // rooms spawned after this point may be missing from the snapshot: newer, not unwanted
+    const snapshotRequestedAt = Date.now();
     const result = await s.driver.heartbeat({
         serverId: s.serverId,
         endpoint: adminEndpoint,
@@ -525,6 +556,10 @@ async function heartbeatTick(s: ServerState, adminEndpoint: string, isCurrent: (
 
     s.serverTags = result.tags;
     s.lastDriverHeartbeatAt = Date.now();
+    if (s.heartbeatOutageLogged) {
+        s.heartbeatOutageLogged = false;
+        log.info('driver heartbeat recovered', { serverId: s.serverId });
+    }
 
     checkHeartbeats(s);
 
@@ -560,7 +595,9 @@ async function heartbeatTick(s: ServerState, adminEndpoint: string, isCurrent: (
             // on the RoomProcess, so they cannot be restored here — re-register
             // with empty tags. building tag persistence is out of scope; we warn.
             try {
-                await s.driver.registerRoom(proc.roomId, proc.roomType, s.serverId, proc.data, {});
+                // the ttl only has to bridge the roomReady right below, which persists the record
+                const ttlMs = s.options.roomStartupTimeoutMs ?? DEFAULT_ROOM_STARTUP_TIMEOUT_MS;
+                await s.driver.registerRoom(proc.roomId, proc.roomType, s.serverId, proc.data, {}, ttlMs);
                 await s.driver.roomReady(proc.roomId, proc.endpoint, proc.roomSecret);
                 reasserted.add(proc.roomId);
                 restoredRoomIds.push(proc.roomId);
@@ -585,10 +622,72 @@ async function heartbeatTick(s: ServerState, adminEndpoint: string, isCurrent: (
     // rooms we just restored.
     for (const roomId of s.processes.keys()) {
         if (reasserted.has(roomId)) continue;
+        if (spawnedAfter(s, roomId, snapshotRequestedAt)) continue;
         if (!desiredIds.has(roomId)) {
             destroyWorker(s, roomId);
         }
     }
+
+    // reap-recovery above awaits the driver; a newer tick may own the state by now
+    if (!isCurrent()) return;
+    reconcileDesiredRooms(s, result.desiredRooms, snapshotRequestedAt);
+}
+
+function spawnedAfter(s: ServerState, roomId: string, at: number): boolean {
+    const attemptedAt = s.attempted.get(roomId);
+    return attemptedAt !== undefined && attemptedAt >= at;
+}
+
+// level-triggered spawning: the stored desired set is the truth, whatever the push delivered or lost
+function reconcileDesiredRooms(s: ServerState, desiredRooms: DesiredRoom[], snapshotRequestedAt: number): void {
+    const now = Date.now();
+    const lostGraceMs = s.options.roomStallTimeoutMs ?? DEFAULT_ROOM_STALL_TIMEOUT_MS;
+    const desiredIds = new Set<string>();
+
+    for (const room of desiredRooms) {
+        desiredIds.add(room.roomId);
+        if (s.processes.has(room.roomId) || s.spawning.has(room.roomId)) {
+            s.lostSince.delete(room.roomId);
+            continue;
+        }
+        if (room.status === 'requested') {
+            spawnAssignedRoom(s, room);
+            continue;
+        }
+        const lostAt = s.lostSince.get(room.roomId);
+        if (lostAt === undefined) {
+            s.lostSince.set(room.roomId, now);
+            continue;
+        }
+        if (now - lostAt < lostGraceMs) continue;
+        s.lostSince.delete(room.roomId);
+        log.warn('room running in driver but not on this server, reporting failure', {
+            roomId: room.roomId,
+            lostMs: now - lostAt,
+        });
+        s.driver.roomFailure(room.roomId, 'room process lost').catch((err) => {
+            log.error('failed to report room failure', { roomId: room.roomId, err });
+        });
+    }
+
+    for (const roomId of s.lostSince.keys()) {
+        if (!desiredIds.has(roomId)) s.lostSince.delete(roomId);
+    }
+    // roomIds are never reused; forgetting an attempt early could respawn a room whose failure is in flight
+    for (const [roomId, attemptedAt] of s.attempted) {
+        if (desiredIds.has(roomId) || spawnedAfter(s, roomId, snapshotRequestedAt)) continue;
+        if (now - attemptedAt > ATTEMPT_RETENTION_MS) s.attempted.delete(roomId);
+    }
+}
+
+// the driver outage itself shows up as generic tick timeouts; name it once
+function logHeartbeatOutage(s: ServerState): void {
+    if (s.heartbeatOutageLogged) return;
+    const intervalMs = s.options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    const sinceLastSuccessMs = Date.now() - s.lastDriverHeartbeatAt;
+    if (sinceLastSuccessMs <= HEARTBEAT_OUTAGE_LOG_AFTER_INTERVALS * intervalMs) return;
+    s.heartbeatOutageLogged = true;
+    log.error('driver heartbeat failing', { serverId: s.serverId, sinceLastSuccessMs });
 }
 
 async function startHeartbeatLoop(s: ServerState, adminEndpoint: string, intervalMs: number): Promise<void> {
@@ -613,9 +712,10 @@ function stopHeartbeatLoop(s: ServerState): void {
 async function reapStaleServers(s: ServerState): Promise<void> {
     const stale = await s.driver.listStaleServers();
     await Promise.all(
-        stale.map((server) => {
-            log.info('reaping stale server', { staleServerId: server.serverId, endpoint: server.endpoint });
-            return s.driver.unregisterServer(server.serverId);
+        stale.map(async (server) => {
+            // re-checked atomically: a heartbeat that landed since the listing wins
+            const reaped = await s.driver.reapServer(server.serverId);
+            if (reaped) log.info('reaped stale server', { staleServerId: server.serverId, endpoint: server.endpoint });
         }),
     );
 }
@@ -891,6 +991,8 @@ export async function start(options: CreateServerOptions): Promise<Server> {
         lastHeartbeats: new Map(),
         killedRoomIds: new Set(),
         spawning: new Set(),
+        attempted: new Map(),
+        lostSince: new Map(),
         alive: true,
 
         openSockets: new Set(),
@@ -907,6 +1009,7 @@ export async function start(options: CreateServerOptions): Promise<Server> {
         httpServer: null,
         currentAddress: null,
         lastDriverHeartbeatAt: Date.now(),
+        heartbeatOutageLogged: false,
     };
 
     await startInternal(s);
@@ -934,16 +1037,15 @@ export type TestRoom = {
     status: 'starting' | 'ready' | 'stopped';
 };
 
-// run a single heartbeatTick against a driver with the given local rooms already
-// running. used by unit tests to assert the reap-recovery ordering (re-assert
-// before destroy) deterministically, without the interval-driven loop. returns
-// which rooms had kill() invoked so tests can assert nothing was destroyed.
+// runs heartbeatTick `ticks` times (default 1) over one server state holding these local rooms; returns which were killed
 export async function __heartbeatTickForTest(args: {
     driver: Driver['_internal'];
     serverId: string;
     endpoint: string;
     rooms: TestRoom[];
     previouslyRegistered: boolean;
+    ticks?: number;
+    roomStallTimeoutMs?: number;
 }): Promise<{ killed: string[] }> {
     const killed: string[] = [];
     const processes = new Map<string, RoomProcess>();
@@ -966,6 +1068,7 @@ export async function __heartbeatTickForTest(args: {
             rooms: {},
             roomEndpoint: ({ port }) => `ws://localhost:${port}`,
             driver: { _internal: args.driver },
+            roomStallTimeoutMs: args.roomStallTimeoutMs,
         },
         driver: args.driver,
         runners: new Map(),
@@ -977,6 +1080,8 @@ export async function __heartbeatTickForTest(args: {
         lastHeartbeats: new Map(),
         killedRoomIds: new Set(),
         spawning: new Set(),
+        attempted: new Map(),
+        lostSince: new Map(),
         alive: true,
         openSockets: new Set(),
         unsubscribeRoomAssignments: null,
@@ -987,10 +1092,13 @@ export async function __heartbeatTickForTest(args: {
         heartbeatPunctuator: null,
         serverTags: {},
         lastDriverHeartbeatAt: Date.now(),
+        heartbeatOutageLogged: false,
         previouslyRegistered: args.previouslyRegistered,
     };
 
-    await heartbeatTick(s, args.endpoint, () => true);
+    for (let tick = 0; tick < (args.ticks ?? 1); tick++) {
+        await heartbeatTick(s, args.endpoint, () => true);
+    }
 
     return { killed };
 }

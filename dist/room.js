@@ -1999,10 +1999,13 @@ async function jwtVerify(token, secret) {
     catch {
         return null;
     }
-    if (typeof payload.exp === 'number' && Date.now() > payload.exp)
+    // exp comes from the minting host's clock, so tolerate skew against ours
+    if (typeof payload.exp === 'number' && Date.now() > payload.exp + JWT_CLOCK_LEEWAY_MS)
         return null;
     return payload;
 }
+/** tolerated clock skew between the host that mints a token and the one that verifies it */
+const JWT_CLOCK_LEEWAY_MS = 30_000;
 
 // structured json line logger
 // emits ndjson to stdout/stderr, supports child loggers for scoped context
@@ -2293,7 +2296,16 @@ function wsTransport(config) {
                         }
                         completeUpgrade(req, socket, head, result);
                     })
-                        .catch(() => {
+                        .catch((err) => {
+                        // NEVER swallow this. It is the only place a throw from upgrade() or
+                        // from ws's own handleUpgrade can surface, and the client only ever
+                        // sees an opaque 1006 (a bare 500 during an upgrade carries nothing a
+                        // browser will show). Silent here means a room that logs `ready`,
+                        // accepts connections, and rejects every one of them with no record
+                        // on either side.
+                        console.error('[gatho] websocket upgrade failed', err);
+                        if (socket.destroyed)
+                            return;
                         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
                         socket.destroy();
                     });

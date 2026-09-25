@@ -115,6 +115,9 @@ export {
     ServerNotFoundError,
 } from 'gatho/driver';
 
+// how much longer than the caller's wait a requested room record lives
+const REQUESTED_ROOM_TTL_MARGIN_MS = 10_000;
+
 /** create a new gatho sdk instance with the given options */
 export function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK {
     const { _internal: driver } = options.driver;
@@ -123,18 +126,28 @@ export function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK {
         const roomId = crypto.randomUUID();
         const timeoutMs = opts.timeoutMs ?? 10_000;
 
-        // start waiting before registering — the listener is in place before
-        // the room even exists, so there's zero chance of missing the ready event
-        const waitPromise = driver.waitForRoom(roomId, timeoutMs);
+        // listen before registering so a fast ready can't be missed
+        let settleRegistration!: { resolve: () => void; reject: (err: unknown) => void };
+        const registered = new Promise<void>((resolve, reject) => {
+            settleRegistration = { resolve, reject };
+        });
+        const waitPromise = driver.waitForRoom(roomId, timeoutMs, registered);
 
-        await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data ?? {}, opts.tags ?? {});
+        // outlives the wait, so a spawn started near the deadline still finds its record
+        const ttlMs = Math.ceil(timeoutMs) + REQUESTED_ROOM_TTL_MARGIN_MS;
+        try {
+            await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data ?? {}, opts.tags ?? {}, ttlMs);
+        } catch (err) {
+            settleRegistration.reject(err);
+            await waitPromise.catch(() => undefined);
+            throw err;
+        }
+        settleRegistration.resolve();
 
-        const info = await waitPromise.catch(async (err) => {
-            await driver.unregisterRoom(roomId).catch(() => {});
+        return waitPromise.catch(async (err: unknown) => {
+            await driver.unregisterRoom(roomId).catch(() => undefined);
             throw err;
         });
-
-        return info;
     }
 
     async function destroyRoom(roomId: string): Promise<void> {

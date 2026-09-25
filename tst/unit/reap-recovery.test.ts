@@ -17,7 +17,7 @@ import { __heartbeatTickForTest, type TestRoom } from '../../src/server/server';
 
 async function seedRunningRoom(driver: ReturnType<typeof createMemoryDriver>, serverId: string, roomId: string) {
     await driver._internal.heartbeat({ serverId, endpoint: 'http://10.0.0.5:3000', tags: {}, roomTypes: ['game'] });
-    await driver._internal.registerRoom(roomId, 'game', serverId, { level: 3 }, {});
+    await driver._internal.registerRoom(roomId, 'game', serverId, { level: 3 }, {}, 60_000);
     await driver._internal.roomReady(roomId, 'ws://10.0.0.5:9000', 'secret-1');
 }
 

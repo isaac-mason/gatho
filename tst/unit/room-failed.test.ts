@@ -20,7 +20,7 @@ async function setupRequestedRoom() {
         tags: {},
         roomTypes: ['game'],
     });
-    await driver._internal.registerRoom(roomId, 'game', serverId, {}, {});
+    await driver._internal.registerRoom(roomId, 'game', serverId, {}, {}, 60_000);
     return { driver, roomId };
 }
 
@@ -30,7 +30,7 @@ describe('memory driver room-failed', () => {
 
         // long timeout — the failure must reject well before it, proving the
         // rejection is driven by the failed signal not the timeout backstop.
-        const wait = driver._internal.waitForRoom(roomId, 60_000);
+        const wait = driver._internal.waitForRoom(roomId, 60_000, Promise.resolve());
         await driver._internal.roomFailure(roomId, 'bad image');
 
         await expect(wait).rejects.toBeInstanceOf(RoomFailedError);
@@ -43,12 +43,12 @@ describe('memory driver room-failed', () => {
 
     it('still rejects with RoomTimeoutError when neither ready nor failed fires', async () => {
         const { driver, roomId } = await setupRequestedRoom();
-        await expect(driver._internal.waitForRoom(roomId, 20)).rejects.toBeInstanceOf(RoomTimeoutError);
+        await expect(driver._internal.waitForRoom(roomId, 20, Promise.resolve())).rejects.toBeInstanceOf(RoomTimeoutError);
     });
 
     it('resolves normally when the room becomes ready', async () => {
         const { driver, roomId } = await setupRequestedRoom();
-        const wait = driver._internal.waitForRoom(roomId, 60_000);
+        const wait = driver._internal.waitForRoom(roomId, 60_000, Promise.resolve());
         await driver._internal.roomReady(roomId, 'ws://localhost:9000', 'secret');
         const info = await wait;
         expect(info.status).toBe('running');

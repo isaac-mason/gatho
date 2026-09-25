@@ -633,6 +633,10 @@ Drivers provide the shared state backend used by the server and SDK.
 - `createMemoryDriver()` (from `gatho/driver`): useful for local dev, tests, and onebox deployments
 - `createRedisDriver({ url })` (from `gatho/driver/redis`): requires Redis. `ioredis` is an optional peer dependency. Install it (`npm i ioredis`) only when you use this driver; `gatho/driver` (memory driver, types, errors) never pulls it in.
 
-Both drivers accept `staleServerMs` (default `30000`), which sets how long a server may go without a heartbeat before its peers treat it as dead and prune it. Raise it if your servers legitimately pause longer than 30s (heavy GC, migration windows); lower it for faster failover.
+Both drivers accept `staleServerMs` (default `30000`), which sets how long a server may go without a heartbeat before its peers treat it as dead and prune it. Raise it if your servers legitimately pause longer than 30s (heavy GC, migration windows); lower it for faster failover. The Redis driver judges staleness by Redis's own clock, so clock skew between your hosts can't get a live server pruned or keep a dead one alive.
+
+Room assignment doesn't depend on pub/sub delivery. A server normally hears about a new room through a push, but every heartbeat also reconciles against the rooms Redis says it should be running, so a lost push costs at most one heartbeat interval. The Redis driver checks its subscriber connection end to end: it publishes to itself every few seconds and reconnects if a message doesn't come back, which catches connections that died without either side noticing (NAT or firewall state loss, a half-open socket).
+
+Whoever creates a driver owns `driver.destroy()`, which stops its background work. `start()` doesn't call it, because a driver can outlive a server or be shared with an SDK.
 
 `createRoom()` rejects fast on failure. If the room's process fails to boot (a bad argv, a missing container image, a crash on startup), the driver publishes a room-failure signal and `createRoom()` rejects with a typed **`RoomFailedError`** carrying the real reason, rather than burning the full `timeoutMs`. The timeout remains only as a backstop for a room that goes silent without reporting.

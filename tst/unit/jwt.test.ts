@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { jwtSign, jwtVerify } from '../../src/common/jwt';
+import { JWT_CLOCK_LEEWAY_MS, jwtSign, jwtVerify } from '../../src/common/jwt';
 
 describe('jwt sign/verify', () => {
     it('round-trips a payload', async () => {
@@ -36,9 +36,13 @@ describe('jwt sign/verify', () => {
         expect(await jwtVerify('', 'secret')).toBeNull();
     });
 
-    it('honors the exp claim', async () => {
-        const past = await jwtSign({ exp: Date.now() - 1000 }, 'secret');
+    it('honors the exp claim, allowing JWT_CLOCK_LEEWAY_MS of skew between minting and verifying hosts', async () => {
+        const past = await jwtSign({ exp: Date.now() - JWT_CLOCK_LEEWAY_MS - 1000 }, 'secret');
         expect(await jwtVerify(past, 'secret')).toBeNull();
+
+        // minted by a host whose clock runs behind the verifier's by less than the leeway
+        const skewed = await jwtSign({ exp: Date.now() - JWT_CLOCK_LEEWAY_MS + 1000 }, 'secret');
+        expect(await jwtVerify(skewed, 'secret')).toEqual({ exp: expect.any(Number) });
 
         const future = await jwtSign({ exp: Date.now() + 60_000, sub: 'x' }, 'secret');
         expect(await jwtVerify(future, 'secret')).toEqual({ exp: expect.any(Number), sub: 'x' });

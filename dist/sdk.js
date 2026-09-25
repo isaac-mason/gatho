@@ -2,21 +2,35 @@ export { GathoError, InvalidTagError, RoomFailedError, RoomNotFoundError, RoomNo
 
 // errors thrown by sdk calls — re-exported from `gatho/driver` (canonical home)
 // so consumers don't have to import the driver module just to `instanceof` them.
+// how much longer than the caller's wait a requested room record lives
+const REQUESTED_ROOM_TTL_MARGIN_MS = 10_000;
 /** create a new gatho sdk instance with the given options */
 function createGathoSDK(options) {
     const { _internal: driver } = options.driver;
     async function createRoom(opts) {
         const roomId = crypto.randomUUID();
         const timeoutMs = opts.timeoutMs ?? 10_000;
-        // start waiting before registering — the listener is in place before
-        // the room even exists, so there's zero chance of missing the ready event
-        const waitPromise = driver.waitForRoom(roomId, timeoutMs);
-        await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data ?? {}, opts.tags ?? {});
-        const info = await waitPromise.catch(async (err) => {
-            await driver.unregisterRoom(roomId).catch(() => { });
+        // listen before registering so a fast ready can't be missed
+        let settleRegistration;
+        const registered = new Promise((resolve, reject) => {
+            settleRegistration = { resolve, reject };
+        });
+        const waitPromise = driver.waitForRoom(roomId, timeoutMs, registered);
+        // outlives the wait, so a spawn started near the deadline still finds its record
+        const ttlMs = Math.ceil(timeoutMs) + REQUESTED_ROOM_TTL_MARGIN_MS;
+        try {
+            await driver.registerRoom(roomId, opts.type, opts.serverId, opts.data ?? {}, opts.tags ?? {}, ttlMs);
+        }
+        catch (err) {
+            settleRegistration.reject(err);
+            await waitPromise.catch(() => undefined);
+            throw err;
+        }
+        settleRegistration.resolve();
+        return waitPromise.catch(async (err) => {
+            await driver.unregisterRoom(roomId).catch(() => undefined);
             throw err;
         });
-        return info;
     }
     async function destroyRoom(roomId) {
         await driver.unregisterRoom(roomId);

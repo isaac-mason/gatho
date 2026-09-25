@@ -31,7 +31,7 @@ describe('memoryDriver prune', () => {
         });
 
         // register a room on that server
-        await driver._internal.registerRoom('r1', 'game', 's1', {}, {});
+        await driver._internal.registerRoom('r1', 'game', 's1', {}, {}, 60_000);
 
         // server is alive — should be visible
         const before = await driver._internal.listServers();
@@ -79,7 +79,7 @@ describe('memoryDriver prune', () => {
             tags: {},
             roomTypes: ['game'],
         });
-        await driver._internal.registerRoom('r1', 'game', 's1', {}, {});
+        await driver._internal.registerRoom('r1', 'game', 's1', {}, {}, 60_000);
         await driver._internal.roomReady('r1', 'ws://localhost:9001', 'secret123');
 
         // reserve a client with a 5s ttl
@@ -114,7 +114,7 @@ describe('memoryDriver prune', () => {
             tags: {},
             roomTypes: ['game'],
         });
-        await driver._internal.registerRoom('r1', 'game', 's1', {}, {});
+        await driver._internal.registerRoom('r1', 'game', 's1', {}, {}, 60_000);
         await driver._internal.roomReady('r1', 'ws://localhost:9001', 'secret123');
 
         const reservation = await driver._internal.reserveClient('r1', 5_000);
@@ -145,7 +145,7 @@ describe('memoryDriver prune', () => {
             tags: {},
             roomTypes: ['game'],
         });
-        await driver._internal.registerRoom('r1', 'game', 's1', {}, {});
+        await driver._internal.registerRoom('r1', 'game', 's1', {}, {}, 60_000);
         await driver._internal.roomReady('r1', 'ws://localhost:9001', 'secret123');
 
         const reservation = await driver._internal.reserveClient('r1', 60_000);
