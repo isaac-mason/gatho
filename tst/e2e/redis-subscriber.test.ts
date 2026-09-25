@@ -148,6 +148,24 @@ describe('redis subscriber liveness', () => {
         expect(proxy.connections.length).toBe(2);
     }, 40_000);
 
+    it('closes its own subscriber on destroy, releasing every subscription', async () => {
+        const client = new Redis(redisPort, redisHost, { db });
+        const driver = createRedisDriver({ client, prefix, staleServerMs });
+        cleanups.push(() => client.disconnect());
+        const admin = new Redis(redisPort, redisHost, { db });
+        cleanups.push(() => admin.disconnect());
+        const channel = `${prefix}room-assigned:srv-destroy`;
+        const subscribers = async () => Number((await admin.pubsub('NUMSUB', channel))[1]);
+
+        await driver._internal.subscribeRoomAssignments('srv-destroy', () => {});
+        expect(await subscribers()).toBe(1);
+
+        driver.destroy?.();
+        await waitUntil(async () => (await subscribers()) === 0, 2_000);
+        // the caller's client is untouched
+        expect(await client.ping()).toBe('PONG');
+    });
+
     it('keeps a healthy subscriber connected', async () => {
         const { proxy } = await hostBehindProxy();
         // three canary rounds with nothing broken

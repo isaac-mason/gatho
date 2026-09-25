@@ -817,6 +817,11 @@ export function createRedisDriver(options: RedisDriverOptions = {}): Driver {
         destroy() {
             if (canaryTimer) clearInterval(canaryTimer);
             canaryTimer = null;
+            // the subscriber is ours (a duplicate); the caller's client is theirs to close
+            subscriber?.disconnect();
+            subscriber = null;
+            channelListeners.clear();
+            pendingSubscribes.clear();
         },
         _internal: {
             local: false,

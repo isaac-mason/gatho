@@ -15,7 +15,8 @@
   every reconnect, never leaves a channel looking subscribed after a failed `SUBSCRIBE`, and
   gets a 30s TCP keepalive. `registerRoom`, `roomReady` and reaping are atomic scripts;
   staleness uses Redis's clock; an assignment published to a server nobody is listening for
-  is logged. New `driver.destroy()` stops the canary.
+  is logged. `driver.destroy()` stops the canary and closes the subscriber connection the
+  driver opened itself (it used to be left open, keeping the process alive).
 - **driver:** contract changes (internal): `registerRoom` takes `ttlMs`, `roomReady`
   returns whether the room was still wanted, `waitForRoom` takes the registration promise
   and backs its signals with polling, `DesiredRoom` carries `status`, and `reapServer`

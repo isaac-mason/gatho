@@ -167,8 +167,8 @@ export type HeartbeatResult = {
 /** driver interface — all methods are internal to gatho.
  *  use start() or createGathoSDK() instead of calling these directly. */
 export type Driver = {
-    /** stops background work (memory prune interval, redis subscriber canary). the creator
-     *  owns it; start() never calls it, since a driver can outlive a server or serve an sdk. */
+    /** stops background work and closes connections the driver opened itself (never the caller's
+     *  client). the creator owns it; start() never calls it, since a driver can outlive a server. */
     destroy?: () => void;
 
     _internal: {
