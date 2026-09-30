@@ -7,7 +7,7 @@
     },
     "dependencies": {
         "gatho": "workspace:*",
-        "packcat": "0.3.0"
+        "packcat": "0.4.0"
     },
     "devDependencies": {
         "@types/bun": "^1.3.12",

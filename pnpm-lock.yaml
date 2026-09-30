@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       packcat:
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.4.0
+        version: 0.4.0
       ws:
         specifier: ^8.20.0
         version: 8.20.0
@@ -154,8 +154,8 @@ importers:
         specifier: workspace:*
         version: link:../..
       packcat:
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.4.0
+        version: 0.4.0
       ws:
         specifier: ^8.20.0
         version: 8.20.0
@@ -182,8 +182,8 @@ importers:
         specifier: workspace:*
         version: link:../../..
       packcat:
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.4.0
+        version: 0.4.0
       react:
         specifier: ^19.1.0
         version: 19.2.4
@@ -213,8 +213,8 @@ importers:
         specifier: workspace:*
         version: link:../..
       packcat:
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.4.0
+        version: 0.4.0
     devDependencies:
       '@types/bun':
         specifier: ^1.3.12
@@ -229,8 +229,8 @@ importers:
         specifier: workspace:*
         version: link:../..
       packcat:
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.4.0
+        version: 0.4.0
       react:
         specifier: ^19.1.0
         version: 19.2.4
@@ -3086,8 +3086,8 @@ packages:
     resolution: {integrity: sha512-UEZIS3/by4OC8vL3P2dTXRETpebLI2NiI5vIrjaD/5UtrkFX/tNbwjTSRAGC/+7CAo2pIcBaRgWmcBBHcsaCIw==}
     dev: true
 
-  /packcat@0.3.0:
-    resolution: {integrity: sha512-5LfyKTxoyCIFuRIjF9+sr0JtJtLYviQj1NbBlz+EsZli+t12dY1Dx18hHwDM3/9ry39F4lIhUlfuSncPNYQ8Ig==}
+  /packcat@0.4.0:
+    resolution: {integrity: sha512-B2zy9yYfHJcnUNk5QQUGMW00nOY4RxH7CUt/xIxZHYqkPpOXzQdPcC7LOc82Y4QjovNl7ftPgoyi2MUEzIjq1w==}
     dev: false
 
   /pacote@15.2.0:

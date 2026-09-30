@@ -316,7 +316,38 @@ export declare const notifyCodec: {
         message: string;
     } | {
         type: "stopped";
-    }, u8: Uint8Array, offset: number) => pack.PackIntoResult;
+    }, u8: Uint8Array, offset: number) => number;
+    size: (value: {
+        type: "ready";
+        port: number;
+    } | {
+        type: "heartbeat";
+        timestamp: number;
+        metrics: {
+            memoryRss: number;
+            memoryHeapUsed: number;
+            memoryHeapTotal: number;
+            cpuUser: number;
+            cpuSystem: number;
+        } | undefined;
+        clients: {
+            clientId: string;
+            tags: Record<string, string>;
+        }[];
+    } | {
+        type: "client-connected";
+        clientId: string;
+        roomId: string;
+        tags: Record<string, string>;
+    } | {
+        type: "client-disconnected";
+        clientId: string;
+    } | {
+        type: "error";
+        message: string;
+    } | {
+        type: "stopped";
+    }) => number;
     unpack: (u8: Uint8Array) => {
         type: "ready";
         port: number;
@@ -384,6 +415,7 @@ export declare const notifyCodec: {
         unpack: string;
         validate: string;
         packInto: string;
+        size: string;
     };
 };
 export type NotifyMessage = pack.SchemaType<typeof NotifyMessageSchema>;
