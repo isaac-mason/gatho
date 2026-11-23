@@ -11,13 +11,13 @@
     "dependencies": {
         "gatho": "workspace:*",
         "packcat": "0.4.0",
-        "ws": "^8.20.0"
+        "ws": "^8.23.0"
     },
     "devDependencies": {
-        "@types/node": "^25.6.0",
-        "@types/ws": "^8.18.1",
-        "esbuild": "^0.25.0",
-        "typescript": "^5.9.2",
-        "workerd": "^1.20250712.0"
+        "@types/node": "^26.6.6",
+        "@types/ws": "^8.18.2",
+        "esbuild": "^0.28.2",
+        "typescript": "^6.0.3",
+        "workerd": "^1.20261121.1"
     }
 }

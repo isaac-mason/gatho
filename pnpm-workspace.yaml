@@ -4,3 +4,7 @@ packages:
   - 'examples/**/*'
   - 'website'
   - 'website/*'
+
+allowBuilds:
+  esbuild: true
+  workerd: true

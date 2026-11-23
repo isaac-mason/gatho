@@ -63,13 +63,13 @@
         "docs": "(cd docs && node ./build.js)",
         "typedoc": "typedoc --tsconfig ./tsconfig.json --name \"gatho docs\" --out ./dist-typedoc ./src/sdk/index.ts ./src/room/index.ts ./src/server/index.ts ./src/driver/index.ts ./src/driver/redis.ts ./src/client/index.ts"
     },
-    "packageManager": "pnpm@8.15.2+sha1.798034f615aa211c6c2ae00010cc20be5fc102ee",
+    "packageManager": "pnpm@12.21.0",
     "dependencies": {
         "packcat": "0.4.0",
-        "ws": "^8.20.0"
+        "ws": "^8.23.0"
     },
     "peerDependencies": {
-        "ioredis": "^5.10.1"
+        "ioredis": "^5.10.1 || ^6.0.0"
     },
     "peerDependenciesMeta": {
         "ioredis": {
@@ -77,20 +77,19 @@
         }
     },
     "devDependencies": {
-        "@biomejs/biome": "^2.4.12",
-        "@playwright/test": "^1.59.1",
+        "@biomejs/biome": "^2.6.8",
+        "@playwright/test": "^1.65.1",
         "@rollup/plugin-node-resolve": "^16.0.3",
-        "@rollup/plugin-typescript": "^12.3.0",
-        "@types/bun": "^1.3.12",
-        "@types/node": "^25.6.0",
-        "@types/ws": "^8.18.1",
-        "ioredis": "^5.10.1",
-        "rollup": "^4.60.1",
+        "@rollup/plugin-typescript": "^12.3.1",
+        "@types/bun": "^1.4.5",
+        "@types/node": "^26.6.6",
+        "@types/ws": "^8.18.2",
+        "ioredis": "^6.0.0",
+        "rollup": "^4.68.8",
         "rollup-plugin-copy": "^3.5.0",
-        "rollup-plugin-filesize": "^10.0.0",
-        "tslib": "^2.8.1",
-        "typedoc": "^0.28.19",
-        "typescript": "^6.0.2",
-        "vitest": "^4.1.4"
+        "tslib": "^2.9.1",
+        "typedoc": "^0.28.20",
+        "typescript": "^6.0.3",
+        "vitest": "^5.1.1"
     }
 }
