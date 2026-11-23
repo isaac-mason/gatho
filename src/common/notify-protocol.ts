@@ -9,75 +9,250 @@
 // deno, bun) can use the codec + frame helpers to speak the same protocol.
 //
 // frame format: length(4 bytes, uint32 BE) + payload(length bytes).
-// notify frames carry a packcat-encoded NotifyMessage payload. the tcp channel
+// notify frames carry a hand-encoded NotifyMessage payload (see the wire layout below). the tcp channel
 // additionally sends one raw frame first: the utf-8 auth token.
 
-import * as pack from 'packcat';
+import { Reader, Writer } from './wire';
 
-// --- message schema ---
+// --- message types ---
 
-const ProcessMetrics = pack.object({
-    memoryRss: pack.float64(),
-    memoryHeapUsed: pack.float64(),
-    memoryHeapTotal: pack.float64(),
-    cpuUser: pack.float64(),
-    cpuSystem: pack.float64(),
-});
+export type ProcessMetricsMessage = {
+    memoryRss: number;
+    memoryHeapUsed: number;
+    memoryHeapTotal: number;
+    cpuUser: number;
+    cpuSystem: number;
+};
 
-const Ready = pack.object({
-    type: pack.literal('ready'),
-    port: pack.uint16(),
-});
+export type ReadyMessage = {
+    type: 'ready';
+    /** uint16 */
+    port: number;
+};
 
-const HeartbeatClient = pack.object({
-    clientId: pack.string(),
-    tags: pack.record(pack.string()),
-});
-
-const Heartbeat = pack.object({
-    type: pack.literal('heartbeat'),
-    timestamp: pack.float64(),
+export type HeartbeatMessage = {
+    type: 'heartbeat';
+    timestamp: number;
     // optional: not every room runtime can report process metrics (e.g. a
     // workerd isolate has no process.memoryUsage)
-    metrics: pack.optional(ProcessMetrics),
-    clients: pack.list(HeartbeatClient),
-});
+    metrics: ProcessMetricsMessage | undefined;
+    clients: { clientId: string; tags: Record<string, string> }[];
+};
 
-const ClientConnected = pack.object({
-    type: pack.literal('client-connected'),
-    clientId: pack.string(),
-    roomId: pack.string(),
-    tags: pack.record(pack.string()),
-});
+export type ClientConnectedMessage = {
+    type: 'client-connected';
+    clientId: string;
+    roomId: string;
+    tags: Record<string, string>;
+};
 
-const ClientDisconnected = pack.object({
-    type: pack.literal('client-disconnected'),
-    clientId: pack.string(),
-});
+export type ClientDisconnectedMessage = {
+    type: 'client-disconnected';
+    clientId: string;
+};
 
-const ErrorMsg = pack.object({
-    type: pack.literal('error'),
-    message: pack.string(),
-});
+export type ErrorMessage = {
+    type: 'error';
+    message: string;
+};
 
-const Stopped = pack.object({
-    type: pack.literal('stopped'),
-});
+export type StoppedMessage = {
+    type: 'stopped';
+};
 
-const NotifyMessageSchema = pack.union('type', [Ready, Heartbeat, ClientConnected, ClientDisconnected, ErrorMsg, Stopped]);
+export type NotifyMessage =
+    | ReadyMessage
+    | HeartbeatMessage
+    | ClientConnectedMessage
+    | ClientDisconnectedMessage
+    | ErrorMessage
+    | StoppedMessage;
 
-export const notifyCodec = pack.build(NotifyMessageSchema);
+// --- wire layout ---
+//
+// payload: u8 format, u8 tag, then the fields for the tag. numbers are little
+// endian, str is a varint byte length plus utf-8, record is a varint entry
+// count followed by (str key, str value) entries.
+//
+//   0 ready:               u16 port
+//   1 heartbeat:           f64 timestamp, u8 hasMetrics (0 or 1),
+//                          5 x f64 (rss, heapUsed, heapTotal, cpuUser, cpuSystem) when hasMetrics,
+//                          varint clientCount, clientCount x (str clientId, record tags)
+//   2 client-connected:    str clientId, str roomId, record tags
+//   3 client-disconnected: str clientId
+//   4 error:               str message
+//   5 stopped:             no fields
+//
+// the pipe has no version handshake, so the format byte is how a server and
+// room built from different gatho versions notice each other. it is above 0x7f
+// so it cannot be mistaken for a tag from the older packcat encoding. bump it
+// on any breaking change to the layout above.
 
-export type NotifyMessage = pack.SchemaType<typeof NotifyMessageSchema>;
+const NOTIFY_FORMAT = 0x81;
 
-// re-derive sub-types for convenience at call sites
-export type ReadyMessage = pack.SchemaType<typeof Ready>;
-export type HeartbeatMessage = pack.SchemaType<typeof Heartbeat>;
-export type ProcessMetricsMessage = pack.SchemaType<typeof ProcessMetrics>;
-export type ClientConnectedMessage = pack.SchemaType<typeof ClientConnected>;
-export type ClientDisconnectedMessage = pack.SchemaType<typeof ClientDisconnected>;
-export type ErrorMessage = pack.SchemaType<typeof ErrorMsg>;
-export type StoppedMessage = pack.SchemaType<typeof Stopped>;
+const TAG_READY = 0;
+const TAG_HEARTBEAT = 1;
+const TAG_CLIENT_CONNECTED = 2;
+const TAG_CLIENT_DISCONNECTED = 3;
+const TAG_ERROR = 4;
+const TAG_STOPPED = 5;
+
+// smallest encodings, used to reject counts the remaining input cannot hold
+const MIN_HEARTBEAT_CLIENT_BYTES = 2; // empty clientId length + empty tags count
+const MIN_RECORD_ENTRY_BYTES = 2; // empty key length + empty value length
+
+const writer = new Writer();
+const reader = new Reader();
+
+function writeTags(tags: Record<string, string>): void {
+    const countAt = writer.reserveCount();
+    let count = 0;
+    for (const key in tags) {
+        writer.str(key);
+        writer.str(tags[key]);
+        count++;
+    }
+    writer.patchCount(countAt, count);
+}
+
+function readTags(): Record<string, string> {
+    const count = reader.count(MIN_RECORD_ENTRY_BYTES);
+    const tags: Record<string, string> = {};
+    for (let i = 0; i < count; i++) {
+        const key = reader.str();
+        const value = reader.str();
+        if (key === '__proto__') {
+            Object.defineProperty(tags, key, { value, writable: true, enumerable: true, configurable: true });
+        } else {
+            tags[key] = value;
+        }
+    }
+    return tags;
+}
+
+// write format byte, tag and fields for `msg` at the writer's position
+function writeMessage(msg: NotifyMessage): void {
+    writer.u8(NOTIFY_FORMAT);
+    switch (msg.type) {
+        case 'ready':
+            writer.u8(TAG_READY);
+            writer.u16(msg.port);
+            break;
+        case 'heartbeat': {
+            writer.u8(TAG_HEARTBEAT);
+            writer.f64(msg.timestamp);
+            const metrics = msg.metrics;
+            if (metrics === undefined) {
+                writer.u8(0);
+            } else {
+                writer.u8(1);
+                writer.f64(metrics.memoryRss);
+                writer.f64(metrics.memoryHeapUsed);
+                writer.f64(metrics.memoryHeapTotal);
+                writer.f64(metrics.cpuUser);
+                writer.f64(metrics.cpuSystem);
+            }
+            const clients = msg.clients;
+            writer.varint(clients.length);
+            for (let i = 0; i < clients.length; i++) {
+                const client = clients[i];
+                writer.str(client.clientId);
+                writeTags(client.tags);
+            }
+            break;
+        }
+        case 'client-connected':
+            writer.u8(TAG_CLIENT_CONNECTED);
+            writer.str(msg.clientId);
+            writer.str(msg.roomId);
+            writeTags(msg.tags);
+            break;
+        case 'client-disconnected':
+            writer.u8(TAG_CLIENT_DISCONNECTED);
+            writer.str(msg.clientId);
+            break;
+        case 'error':
+            writer.u8(TAG_ERROR);
+            writer.str(msg.message);
+            break;
+        case 'stopped':
+            writer.u8(TAG_STOPPED);
+            break;
+        default:
+            throw new Error(`unknown notify message type: ${String((msg as { type?: unknown }).type)}`);
+    }
+}
+
+function readMessage(): NotifyMessage {
+    const format = reader.u8();
+    if (format !== NOTIFY_FORMAT) {
+        throw new Error(
+            `notify format mismatch (got 0x${format.toString(16).padStart(2, '0')}, expected 0x${NOTIFY_FORMAT.toString(16)}), is the room built from a different gatho version?`,
+        );
+    }
+    const tag = reader.u8();
+    switch (tag) {
+        case TAG_READY:
+            return { type: 'ready', port: reader.u16() };
+        case TAG_HEARTBEAT: {
+            const timestamp = reader.f64();
+            const hasMetrics = reader.u8();
+            let metrics: ProcessMetricsMessage | undefined;
+            if (hasMetrics === 1) {
+                const memoryRss = reader.f64();
+                const memoryHeapUsed = reader.f64();
+                const memoryHeapTotal = reader.f64();
+                const cpuUser = reader.f64();
+                const cpuSystem = reader.f64();
+                metrics = { memoryRss, memoryHeapUsed, memoryHeapTotal, cpuUser, cpuSystem };
+            } else if (hasMetrics !== 0) {
+                throw new Error(`invalid heartbeat metrics flag: ${hasMetrics}`);
+            }
+            const count = reader.count(MIN_HEARTBEAT_CLIENT_BYTES);
+            const clients: HeartbeatMessage['clients'] = [];
+            for (let i = 0; i < count; i++) {
+                const clientId = reader.str();
+                const tags = readTags();
+                clients.push({ clientId, tags });
+            }
+            return { type: 'heartbeat', timestamp, metrics, clients };
+        }
+        case TAG_CLIENT_CONNECTED: {
+            const clientId = reader.str();
+            const roomId = reader.str();
+            const tags = readTags();
+            return { type: 'client-connected', clientId, roomId, tags };
+        }
+        case TAG_CLIENT_DISCONNECTED:
+            return { type: 'client-disconnected', clientId: reader.str() };
+        case TAG_ERROR:
+            return { type: 'error', message: reader.str() };
+        case TAG_STOPPED:
+            return { type: 'stopped' };
+        default:
+            throw new Error(`unknown notify message tag: 0x${tag.toString(16).padStart(2, '0')}`);
+    }
+}
+
+/** encoder and decoder for the notify payload (no length framing) */
+export const notifyCodec = {
+    pack(msg: NotifyMessage): Uint8Array<ArrayBuffer> {
+        writer.begin();
+        writeMessage(msg);
+        return writer.finish();
+    },
+    /** decode one payload. throws an Error on anything malformed. */
+    unpack(payload: Uint8Array): NotifyMessage {
+        reader.reset(payload, 0);
+        try {
+            const msg = readMessage();
+            reader.finish();
+            return msg;
+        } finally {
+            reader.release();
+        }
+    },
+};
 
 // --- room-side handle ---
 
@@ -104,7 +279,17 @@ export function encodeRawFrame(payload: Uint8Array): Uint8Array {
 
 /** encode a notify message as a length-prefixed frame, ready to write to any pipe */
 export function encodeNotifyFrame(msg: NotifyMessage): Uint8Array {
-    return encodeRawFrame(notifyCodec.pack(msg));
+    writer.begin();
+    writer.ensure(HEADER_SIZE);
+    writer.pos = HEADER_SIZE;
+    writeMessage(msg);
+    const payloadLength = writer.pos - HEADER_SIZE;
+    const frame = writer.finish();
+    frame[0] = payloadLength >>> 24;
+    frame[1] = (payloadLength >>> 16) & 0xff;
+    frame[2] = (payloadLength >>> 8) & 0xff;
+    frame[3] = payloadLength & 0xff;
+    return frame;
 }
 
 /** streaming frame parser — handles partial reads and buffering across chunks.

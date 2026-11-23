@@ -4,7 +4,7 @@ import { packProtocol, PROTOCOL_VERSION, unpackFrame } from '../../src/common/pr
 describe('protocol', () => {
     it('exposes a numeric PROTOCOL_VERSION', () => {
         expect(typeof PROTOCOL_VERSION).toBe('number');
-        expect(PROTOCOL_VERSION).toBe(1);
+        expect(PROTOCOL_VERSION).toBe(2);
     });
 
     it('roundtrips a session message carrying token and clientId', () => {

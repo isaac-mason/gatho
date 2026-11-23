@@ -223,7 +223,7 @@ export type TcpNotifyChannel = {
 
 /**
  * tcp notify channel: loopback listener carrying the same length-prefixed
- * packcat frames as uds. where uds gets isolation from filesystem permissions,
+ * frames as uds. where uds gets isolation from filesystem permissions,
  * tcp gets it from a per-room bearer token: the room must send the token as its
  * first frame or the connection is dropped.
  *
