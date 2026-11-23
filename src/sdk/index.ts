@@ -132,6 +132,8 @@ export function createGathoSDK(options: CreateGathoSDKOptions): GathoSDK {
             settleRegistration = { resolve, reject };
         });
         const waitPromise = driver.waitForRoom(roomId, timeoutMs, registered);
+        // the deadline can pass while registerRoom is in flight, before either handler below attaches
+        waitPromise.catch(() => undefined);
 
         // outlives the wait, so a spawn started near the deadline still finds its record
         const ttlMs = Math.ceil(timeoutMs) + REQUESTED_ROOM_TTL_MARGIN_MS;
