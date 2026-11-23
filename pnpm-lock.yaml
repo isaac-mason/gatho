@@ -175,9 +175,6 @@ importers:
 
   .:
     dependencies:
-      packcat:
-        specifier: 0.4.0
-        version: 0.4.0
       ws:
         specifier: ^8.23.0
         version: 8.23.0
@@ -230,6 +227,9 @@ importers:
       gatho:
         specifier: workspace:^
         version: link:..
+      packcat:
+        specifier: 0.4.0
+        version: 0.4.0
 
   examples/chat/backend:
     dependencies:

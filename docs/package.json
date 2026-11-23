@@ -3,6 +3,7 @@
     "private": true,
     "type": "module",
     "dependencies": {
-        "gatho": "workspace:^"
+        "gatho": "workspace:^",
+        "packcat": "0.4.0"
     }
 }
